@@ -33,6 +33,10 @@ htmlcov/
 audit*.png
 audit*.json
 
+# Validation harness output — overlays, JSON results and REPORT.md are
+# regenerated from the drawings, and the drawings themselves are confidential.
+validation/
+
 # OS / editor cruft
 .DS_Store
 .idea/
