@@ -13,7 +13,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Callable
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,18 @@ logger = logging.getLogger("projected_area")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VIEWER_HTML = os.path.join(PROJECT_ROOT, "cad-area-meter.html")
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Application lifespan: nothing to set up, everything to clean up.
+
+    Uploaded drawings are proprietary (§35), so the temporary store is emptied
+    when the process stops. The teardown sits after the ``yield``; the store is
+    created lazily on first upload, so there is no startup half.
+    """
+    yield
+    STORE.shutdown()
+
+
 app = FastAPI(
     title="Projected Area Analyzer",
     version=ENGINE_VERSION,
@@ -39,6 +52,7 @@ app = FastAPI(
         "Engineering-drawing PDF to verified projected area. Vector geometry "
         "first, explicit scale, auditable overlay."
     ),
+    lifespan=lifespan,
 )
 
 # The viewer is served from this origin; CORS is opened only for local
@@ -72,9 +86,3 @@ def viewer() -> Any:
     if not os.path.exists(VIEWER_HTML):
         return JSONResponse({"error": f"Viewer not found at {VIEWER_HTML}"}, status_code=404)
     return FileResponse(VIEWER_HTML, media_type="text/html")
-
-
-@app.on_event("shutdown")
-def _shutdown() -> None:
-    """Remove every uploaded drawing on exit. §35."""
-    STORE.shutdown()

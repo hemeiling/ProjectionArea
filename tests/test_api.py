@@ -303,3 +303,27 @@ def test_manual_correction_counts_as_user_verification(client, uploaded):
     ).json()
     assert corrected["confidence"]["percent"] >= baseline["confidence"]["percent"]
     assert any("reviewed and corrected" in n for n in corrected["confidence"]["notes"])
+
+
+def test_uploads_are_cleaned_up_when_the_app_shuts_down(monkeypatch):
+    """The lifespan teardown must actually run.
+
+    Uploaded drawings are proprietary and are deleted when the process stops
+    (§35). That guarantee is one decorator away from silently disappearing —
+    swapping `@app.on_event("shutdown")` for a lifespan handler is exactly the
+    kind of change that can drop it without a single test noticing — so the
+    teardown is asserted rather than assumed.
+    """
+    calls = []
+
+    class RecordingStore:
+        def shutdown(self) -> None:
+            calls.append("shutdown")
+
+    monkeypatch.setattr("backend.main.STORE", RecordingStore())
+
+    with TestClient(app) as probe:
+        assert probe.get("/api/health").status_code == 200
+        assert calls == [], "the store must survive while the app is serving"
+
+    assert calls == ["shutdown"], "lifespan teardown did not empty the upload store"
