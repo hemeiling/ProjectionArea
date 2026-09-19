@@ -14,6 +14,17 @@ samples/*
 # Generated test drawings — rebuilt by `python -m tests.fixtures samples/generated`
 samples/generated/
 
+# ---------------------------------------------------------------------------
+# Secrets — NEVER commit. Checked by tests/test_secrets_hygiene.py.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
 # Python
 .venv/
 venv/
