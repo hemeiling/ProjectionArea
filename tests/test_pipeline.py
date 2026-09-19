@@ -25,7 +25,7 @@ from backend.models import (
 from backend.pdf.space import map_point, page_space_matrix
 from backend.pdf.text import extract_text_items
 from backend.pipeline import prepare_page, region_scale
-from tests.fixtures import build_rotated_plate
+from backend.demo.drawings import build_rotated_plate
 
 
 def measure(path, region_label=None, **kwargs):

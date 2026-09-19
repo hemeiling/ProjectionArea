@@ -327,3 +327,90 @@ def test_uploads_are_cleaned_up_when_the_app_shuts_down(monkeypatch):
         assert calls == [], "the store must survive while the app is serving"
 
     assert calls == ["shutdown"], "lifespan teardown did not empty the upload store"
+
+
+# ── the built-in demo, and what it may hand back ─────────────────────────────
+
+
+def test_demo_catalogue_describes_what_each_drawing_exercises(client):
+    drawings = client.get("/api/demo").json()["drawings"]
+    assert len(drawings) >= 5
+    ids = {d["id"] for d in drawings}
+    assert {"plate_with_holes", "layout_1_100", "raster_plate"} <= ids
+    for entry in drawings:
+        for field in ("id", "title", "summary", "exercises", "expected", "file_name"):
+            assert entry[field], f"{entry['id']} is missing {field}"
+    # The tour opens on the clean case, not the refusal.
+    assert drawings[0]["id"] == "plate_with_holes"
+
+
+def test_a_demo_runs_the_real_pipeline_rather_than_returning_a_stored_answer(client, drawings):
+    """The demo's number must come out of the engine, matching known truth."""
+    opened = client.post("/api/demo/plate_with_holes")
+    assert opened.status_code == 200
+    payload = opened.json()
+    document_id = payload["document_id"]
+    assert payload["overall_drawing_type"] == "vector"
+    assert payload["demo"]["expected"]
+
+    try:
+        analysis = client.get(f"/api/documents/{document_id}/pages/1/analyze").json()
+        area = client.post(
+            f"/api/documents/{document_id}/pages/1/area",
+            json={"region_id": analysis["default_region_id"]},
+        ).json()
+
+        truth = drawings["plate_with_holes"]["net_area_mm2"]
+        assert area["projected_area"]["verified"] is True
+        assert area["projected_area"]["net"]["mm2"] == pytest.approx(truth, rel=2e-3)
+        assert area["confidence"]["percent"] >= 80
+        # And it carries the interpretations the UI is built on.
+        types = [i["type"] for i in area["footprint_interpretations"]]
+        assert "equipment_union" in types and "bounding_rectangle" in types
+        assert [p["type"] for p in area["pending_interpretations"]] == [
+            "conveyor_footprint", "guarded_area", "line_footprint",
+        ]
+    finally:
+        client.delete(f"/api/documents/{document_id}")
+
+
+def test_unknown_demo_is_a_clear_404(client):
+    response = client.post("/api/demo/not-a-drawing")
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "not-a-drawing" in detail
+    assert "plate_with_holes" in detail, "the error must list what is available"
+
+
+def test_demo_bytes_are_served_but_uploads_are_not(client, drawings):
+    """§35: the viewer needs demo bytes; a user's own drawing stays private."""
+    demo = client.post("/api/demo/plate_with_holes").json()
+    try:
+        served = client.get(f"/api/documents/{demo['document_id']}/file")
+        assert served.status_code == 200
+        assert served.content[:4] == b"%PDF"
+    finally:
+        client.delete(f"/api/documents/{demo['document_id']}")
+
+    with open(drawings["plate_with_holes"]["path"], "rb") as handle:
+        uploaded = client.post(
+            "/api/documents",
+            files={"file": ("mine.pdf", handle.read(), "application/pdf")},
+        ).json()
+    try:
+        refused = client.get(f"/api/documents/{uploaded['document_id']}/file")
+        assert refused.status_code == 403
+        assert "never served" in refused.json()["detail"]
+    finally:
+        client.delete(f"/api/documents/{uploaded['document_id']}")
+
+
+def test_analyze_reports_ambiguities_for_the_ui(client, uploaded):
+    """The UI's "review recommended" banner is fed by the API, not re-derived."""
+    analysis = client.get(
+        f"/api/documents/{uploaded['document_id']}/pages/1/analyze"
+    ).json()
+    assert "ambiguities" in analysis
+    assert isinstance(analysis["ambiguities"], list)
+    # A clean plate drawing has nothing ambiguous about it.
+    assert analysis["ambiguities"] == []

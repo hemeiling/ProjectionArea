@@ -328,7 +328,7 @@ def test_title_block_ambiguity_is_flagged_when_a_dense_cluster_is_labelled_one(
     so* loudly rather than quietly measuring the wrong region — the classifier
     itself is deliberately left untouched until real drawings say how to fix it.
     """
-    from tests.fixtures import build_rotated_plate
+    from backend.demo.drawings import build_rotated_plate
 
     upside_down = build_rotated_plate(
         str(tmp_path / "rot180.pdf"), drawings["plate_with_holes"]["path"], 180

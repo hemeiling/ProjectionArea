@@ -1,8 +1,14 @@
 """Synthetic engineering drawings with exact ground truth.
 
+These serve two purposes and are therefore part of the application rather than
+the test suite: they are the regression fixtures *and* the drawings behind the
+one-click demo, so anyone can exercise the real pipeline without hunting for a
+file. The demo runs these through the same backend as an upload — nothing about
+a demo result is pre-computed or mocked.
+
 CONSTITUTION.md §25/§26: synthetic fixtures are necessary but not sufficient.
 They exist so geometry correctness can be validated independently of drawing
-interpretation — every fixture here has an analytically known area.
+interpretation — every drawing here has an analytically known area.
 
 Each drawing is generated the way a CAD package exports one: a sheet border, a
 title block, real dimension lines with arrowheads and extension lines, dashed

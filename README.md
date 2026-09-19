@@ -1406,18 +1406,35 @@ established, it says so and reports nothing in millimetres.
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r backend/requirements.txt
-.venv/bin/python -m uvicorn backend.main:app --reload --port 8000
+.venv/bin/python run.py
 ```
+
+That is the whole thing — one command, one process, viewer and API on the same
+origin. It prints the URL it actually bound to:
+
+```
+  Projected Area Analyzer · engine 0.3.0
+  ----------------------------------------------------
+  Open: http://localhost:8000/
+  API docs: http://localhost:8000/docs
+  7 demo drawings ready — click "试用样例图纸" to start
+```
+
+If 8000 is busy it moves to the next free port and says so. `--port`, `--open`,
+`--no-reload` and `--no-demo` are there if you want them.
+
+**No drawing to hand?** Click **试用样例图纸** on the landing page. The demo
+drawings run through the *real* pipeline — generated server-side, ingested by the
+same store an upload uses, measured by the same geometry code. Nothing about a
+demo result is pre-computed, which is why the browser tests can check the numbers
+against analytically known areas.
+
+With your own file: **打开文件** → **分析图纸** → pick a view → read the result card.
 
 > Always invoke tools as `.venv/bin/python -m <tool>`. The venv's console
 > scripts (`.venv/bin/uvicorn`, `.venv/bin/pytest`) hard-code the interpreter
 > path they were installed with, so they break if the project directory is ever
 > renamed — as this one was. The module form has no such dependency.
-
-Open <http://localhost:8000/> — the viewer is served from the same origin, so
-there is no CORS hop and no `file://` restrictions.
-
-Then: **打开文件** → **分析图纸** → pick a view → read the result card.
 
 Headless, no browser — one drawing:
 
@@ -1434,12 +1451,14 @@ Or a whole set, with a comparison table and an overlay per page:
 Tests:
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 130 tests, ~16 s
+.venv/bin/python -m pytest tests -q      # 140 tests, ~42 s
 ```
 
-The two browser tests drive the real page in Chromium and are skipped
-automatically if Playwright or a Chromium build is missing; the other 128 run in
-about a second.
+Seven of those drive the real page in Chromium — the demo click-through, the
+three footprint readings and the overlay switching between them, the layer
+toggles, Explain Calculation, and the refusal path. They try the bundled
+headless shell, then the bundled Chromium, then a system Chrome, and skip only if
+none exists. The other 133 run in about a second.
 
 ---
 
@@ -1739,9 +1758,11 @@ Backend   FastAPI
             raster/          Path B
             api/             routes + request schemas
             pdf/space.py     canonical page space, /Rotate normalisation
+            demo/            synthetic drawings + the demo catalogue
+run.py      one-command launcher — serves viewer + API, pre-builds demos
 tools/      audit_overlay.py    headless overlay renderer, one page
             validate_drawings.py whole-set validation harness + report
-tests/      fixtures.py + 128 tests
+tests/      133 unit/integration + 7 browser tests
 ```
 
 ### Why this stack
@@ -1846,6 +1867,36 @@ it is not a property of the outline and will not be guessed.
 A file it cannot open is reported as **BLOCKED** with a reason and a suggested
 action; it never becomes a measured `0 mm²`. Pages that fail are isolated, so one
 bad page does not lose the rest of the set.
+
+### Using it in the browser
+
+The result card is built around the question *which* area you are being shown:
+
+- **The headline names its reading.** "设备几何并集 · 54.46 m²", not a bare number,
+  with the equivalent units under it and one sentence saying what physical region
+  that is.
+- **Three cards, one per reading.** Click one and the headline, the units, the
+  explanation and the drawing overlay all switch to *that* interpretation's own
+  geometry. The union keeps its holes; the bounding rectangle is a rectangle.
+- **The CAD-only readings are shown greyed out**, each saying "需要 CAD 图层/块语义"
+  and what it would mean. Unavailable is not the same as absent, and neither is an
+  error.
+- **Nine overlay layers** toggle independently: source geometry, measured,
+  excluded, dimensions/annotation, holes, the selected footprint, the convex
+  envelope, the bounding rectangle, and warning regions. Envelope and rectangle
+  draw as dashed outlines *alongside* the selection, so the three can be compared
+  on the drawing at once.
+- **说明这次计算 · Explain Calculation** traces the real path — source, view,
+  scale, units, classification, footprint definition, polygon and holes, union,
+  unit conversion, result — followed by the selected reading's own `evidence`,
+  `assumptions` and `warnings`, taken from the backend rather than re-derived in
+  the browser.
+- **工程细节 · Engineering Details** keeps method, region, scale source, segment
+  and component counts and the repair log one click away, so the default view
+  stays readable.
+- **Review recommended** appears when the engine reports an ambiguity — today
+  that is the title-block confusion. It says what looks wrong, and "显示该区域"
+  outlines the region that triggered it. It never silently corrects anything.
 
 ### Auditability
 

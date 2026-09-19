@@ -10,13 +10,15 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend.api.schemas import AreaRequest, PolygonMeasureRequest, ScaleSpec
 from backend.area.projected import compute_projected_area
 from backend.calibration.scale import scale_from_ratio, scale_from_two_points
 from backend.config import ENGINE_VERSION
+from backend.demo.catalogue import CATALOGUE, BY_ID, ensure_drawing, ground_truth
 from backend.geometry.polygons import ring_to_polygon, union_polygons
+from backend.geometry.regions import detect_title_block_ambiguity
 from backend.models import BBox, GeometryRole, Region, Scale, ScaleSource, ViewSource
 from backend.pdf.document import document_summary
 from backend.pipeline import PreparedPage, region_scale
@@ -27,6 +29,12 @@ router = APIRouter(prefix="/api")
 
 #: Refuse implausibly large uploads rather than exhausting memory.
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+#: Documents created from the built-in demo catalogue. Only these may be read
+#: back over HTTP: the viewer needs the bytes to render a demo it did not choose
+#: from disk, whereas a user's own drawing is proprietary and must not become
+#: downloadable just because its id is known (§35).
+_DEMO_DOCUMENTS: Set[str] = set()
 
 
 @router.get("/health")
@@ -55,6 +63,67 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     return summary
 
 
+@router.get("/demo")
+def list_demo_drawings() -> Dict[str, Any]:
+    """The demo drawings the UI offers, so nobody has to find a file first.
+
+    Each runs through the real pipeline when opened; nothing is pre-computed.
+    ``expected`` records what the drawing was *constructed* to contain, for
+    comparison against the measurement — it is never fed to the engine (§3).
+    """
+    return {"drawings": [d.as_dict() for d in CATALOGUE]}
+
+
+@router.post("/demo/{demo_id}")
+def open_demo_drawing(demo_id: str) -> Dict[str, Any]:
+    """Ingest a demo drawing exactly as if it had been uploaded.
+
+    Generates the PDF once, caches it, then hands it to the same store and the
+    same ``document_summary`` an upload goes through — so a demo result is
+    produced by the real engine or not at all.
+    """
+    demo = BY_ID.get(demo_id)
+    if demo is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown demo drawing {demo_id!r}; available: {sorted(BY_ID)}",
+        )
+
+    path = ensure_drawing(demo_id)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    stored = STORE.add(data, demo.as_dict()["file_name"])
+    _DEMO_DOCUMENTS.add(stored.id)
+
+    summary = document_summary(stored.doc, stored.file_name)
+    summary["document_id"] = stored.id
+    summary["demo"] = demo.as_dict()
+    summary["demo"]["ground_truth"] = {
+        key: value for key, value in ground_truth(demo_id).items() if key != "path"
+    }
+    return summary
+
+
+@router.get("/documents/{document_id}/file")
+def document_file(document_id: str):
+    """Serve a **demo** document's bytes back, so the viewer can render it.
+
+    Deliberately refuses anything else. An uploaded drawing is proprietary; the
+    browser already holds the copy it uploaded, so there is no reason for this
+    endpoint to hand one out and every reason not to (§35).
+    """
+    if document_id not in _DEMO_DOCUMENTS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only built-in demo drawings can be read back. An uploaded drawing "
+                "stays on the server and is never served over HTTP."
+            ),
+        )
+    stored = STORE.get(document_id)
+    return FileResponse(stored.path, media_type="application/pdf", filename=stored.file_name)
+
+
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str) -> Dict[str, Any]:
     """Delete an upload and its temporary file immediately."""
@@ -65,7 +134,22 @@ def delete_document(document_id: str) -> Dict[str, Any]:
 def analyze(document_id: str, page_number: int) -> Dict[str, Any]:
     """Classify a page, detect candidate views, and attempt auto-calibration."""
     _stored, prepared = _prepared(document_id, page_number)
-    return prepared.summary()
+    summary = prepared.summary()
+    # Surfaced so the UI can say "review recommended" and point at the region.
+    # Reported, never corrected (§7) — see detect_title_block_ambiguity.
+    summary["ambiguities"] = [
+        a
+        for a in [
+            detect_title_block_ambiguity(
+                prepared.regions,
+                prepared.analysis.primitives,
+                prepared.analysis.page_bbox,
+                measured_label=None,
+            )
+        ]
+        if a
+    ]
+    return summary
 
 
 @router.get("/documents/{document_id}/pages/{page_number}/geometry")

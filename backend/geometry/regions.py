@@ -15,7 +15,7 @@ on that label (§7: AI and text understand, geometry measures).
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -340,3 +340,88 @@ def detect_regions_from_page_image(
         region.id = f"r{index + 1}"
         region.label = f"Region {index + 1} (raster)"
     return regions
+
+
+#: A cluster labelled `title_block` carrying at least this many primitives is
+#: more linework than sheet furniture needs, so it may be a view in the corner.
+_TITLE_BLOCK_DENSE_PRIMITIVES = 20
+
+
+def detect_title_block_ambiguity(
+    regions: Sequence[Region],
+    primitives: Sequence[Primitive],
+    page_bbox: BBox,
+    measured_label: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Report the known bottom-right / title-block confusion, without fixing it.
+
+    :func:`_classify_region` calls any bottom-right cluster carrying >= 2 text
+    spans a title block, and its ``sparse`` ink guard does not discriminate — a
+    plain plate scores 1.108 against a threshold of 2.5. On a real layout sheet
+    that can hide a genuine view, so two symptoms are worth surfacing:
+
+    * a cluster labelled ``title_block`` that carries a lot of linework;
+    * more than one ``title_block`` on one page, which no sheet has.
+
+    This **reports only**. Retuning the classifier needs evidence from real
+    drawings, and guessing from shape is what §7 forbids — so the user is told
+    what looks wrong and can override the region by hand.
+
+    Args:
+        regions: Detected regions.
+        primitives: Page primitives, for measuring what sits inside each block.
+        page_bbox: The page, for the area share.
+        measured_label: Label of the region actually measured, if any.
+
+    Returns:
+        A findings dict, or ``None`` when nothing looks ambiguous.
+    """
+    blocks = [r for r in regions if r.kind == "title_block"]
+    if not blocks:
+        return None
+
+    findings: List[Dict[str, Any]] = []
+    for block in blocks:
+        inside = [
+            p
+            for p in primitives
+            if block.bbox.x0 <= p.bbox.center[0] <= block.bbox.x1
+            and block.bbox.y0 <= p.bbox.center[1] <= block.bbox.y1
+        ]
+        ink = sum(p.length for p in inside)
+        perimeter = max(2 * (block.bbox.width + block.bbox.height), 1e-9)
+        findings.append(
+            {
+                "region_id": block.id,
+                "label": block.label,
+                "bbox": block.bbox.as_dict(),
+                "primitives_inside": len(inside),
+                "ink_units": round(ink, 1),
+                "ink_ratio": round(ink / perimeter, 3),
+                "area_share_of_page": round(block.bbox.area / max(page_bbox.area, 1e-9), 4),
+            }
+        )
+
+    dense = [f for f in findings if f["primitives_inside"] >= _TITLE_BLOCK_DENSE_PRIMITIVES]
+    if not dense and len(blocks) <= 1:
+        return None
+
+    return {
+        "kind": "title_block_ambiguity",
+        "headline": "Review recommended",
+        "reason": (
+            "More than one region was classified as a title block."
+            if len(blocks) > 1
+            else "A dense bottom-right region may have been classified as a title block."
+        ),
+        "regions": findings,
+        "suspect_region_ids": [f["region_id"] for f in dense] or [f["region_id"] for f in findings],
+        "measured_region_was_a_title_block": bool(
+            measured_label and any(b.label == measured_label for b in blocks)
+        ),
+        "note": (
+            "The classifier's sparse-ink guard does not discriminate here "
+            "(threshold 2.5; a plain plate scores 1.108). Reported, not corrected — "
+            "select the region manually to override it."
+        ),
+    }

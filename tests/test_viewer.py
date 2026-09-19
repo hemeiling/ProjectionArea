@@ -11,6 +11,7 @@ never blocks the core suite.
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 import time
@@ -29,15 +30,30 @@ _CHROME_PATHS = [
 
 
 def _launch(pw):
-    try:
-        return pw.chromium.launch()
-    except Exception:
-        import os
+    """Any Chromium this machine has, in order of preference.
 
-        for path in _CHROME_PATHS:
-            if os.path.exists(path):
-                return pw.chromium.launch(executable_path=path)
-        pytest.skip("no Chromium build available for Playwright")
+    Playwright's default wants the ``chrome-headless-shell`` download; a machine
+    may instead have the full bundled Chromium, or only a system Chrome. Trying
+    all three means the browser tests actually run on a normal dev machine rather
+    than silently skipping — a skipped UI test proves nothing (§42).
+    """
+    import os
+
+    attempts = [
+        lambda: pw.chromium.launch(),
+        lambda: pw.chromium.launch(channel="chromium"),
+    ]
+    attempts += [
+        (lambda p=path: pw.chromium.launch(executable_path=p))
+        for path in _CHROME_PATHS
+        if os.path.exists(path)
+    ]
+    for attempt in attempts:
+        try:
+            return attempt()
+        except Exception:
+            continue
+    pytest.skip("no Chromium build available for Playwright")
 
 
 @pytest.fixture(scope="module")
@@ -68,6 +84,17 @@ def viewer_url():
     yield f"http://127.0.0.1:{port}/"
     server.should_exit = True
     thread.join(timeout=5)
+
+
+def _headline_number(text: str) -> float:
+    """The numeric value out of the result card, which also carries a label.
+
+    The card reads e.g. "设备几何并集 / 23,057.6mm²" — the label is asserted
+    separately, so this only has to find the magnitude.
+    """
+    match = re.search(r"([\d,]+(?:\.\d+)?)", text.replace("\n", " "))
+    assert match, f"no number in the result card: {text!r}"
+    return float(match.group(1).replace(",", ""))
 
 
 def test_viewer_measures_a_drawing_end_to_end(viewer_url, drawings):
@@ -112,7 +139,10 @@ def test_viewer_measures_a_drawing_end_to_end(viewer_url, drawings):
 
     assert errors == [], f"the page logged errors: {errors}"
 
-    measured = float(headline.split("mm")[0].replace(",", "").strip())
+    assert "设备几何并集" in headline, (
+        "the headline must name which physical region it measured, not just a number"
+    )
+    measured = _headline_number(headline)
     assert measured == pytest.approx(truth["net_area_mm2"], rel=2e-3)
     # The signature readout must carry the authoritative number, not a dash.
     assert readout.replace(",", "").strip().startswith("23")
@@ -147,3 +177,231 @@ def test_viewer_refuses_to_show_an_area_without_scale(viewer_url, drawings):
     assert "不是制造尺寸" in alt, alt
     assert "未建立" in scale or "人工标定" in scale
     assert "扫描" in chips or "位图" in chips
+
+
+# ── Milestone A: the product is usable in a browser without finding a file ───
+
+
+def _open_demo(page, viewer_url, demo_id="plate_with_holes"):
+    """Click the demo drawing through, exactly as a user would."""
+    page.goto(viewer_url)
+    page.wait_for_selector(f"#demoGrid button[data-demo={demo_id}]", timeout=30000)
+    page.click(f"#demoGrid button[data-demo={demo_id}]")
+    page.wait_for_selector("#srvResultSect", state="visible", timeout=90000)
+    page.wait_for_timeout(900)
+
+
+def test_demo_drawing_runs_the_real_pipeline_from_one_click(viewer_url, drawings):
+    """"Try demo drawing" must produce a measured result, computed not canned.
+
+    The number is compared against the fixture's analytically known area, so a
+    hard-coded or stale answer fails here.
+    """
+    truth = drawings["plate_with_holes"]
+    errors = []
+
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 940})
+        page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+        page.on(
+            "console",
+            lambda m: errors.append(f"console.error: {m.text}") if m.type == "error" else None,
+        )
+
+        # The landing page must offer the demo before anything is loaded.
+        page.goto(viewer_url)
+        page.wait_for_selector("#demoGrid button[data-demo]", timeout=30000)
+        offered = page.eval_on_selector_all("#demoGrid button[data-demo]", "els => els.length")
+        first_label = page.inner_text("#demoGrid button[data-demo]")
+
+        _open_demo(page, viewer_url)
+        page.select_option("#unit", "mm2")
+        page.wait_for_timeout(400)
+
+        headline = page.inner_text("#rcMain")
+        sheet_visible = page.is_visible("#sheet")
+        overlay_paths = page.eval_on_selector_all("#vec path", "els => els.length")
+        browser.close()
+
+    assert errors == [], f"the page logged errors: {errors}"
+    assert offered >= 3, "the landing page must offer several demo drawings"
+    assert "试用样例图纸" in first_label
+    assert sheet_visible, "the drawing itself must render, not just the numbers"
+    assert overlay_paths > 5, "the audit overlay must draw"
+    assert _headline_number(headline) == pytest.approx(truth["net_area_mm2"], rel=2e-3)
+
+
+def test_three_footprint_interpretations_are_offered_and_switchable(viewer_url, drawings):
+    """The core product concept: three readings, and the overlay follows them.
+
+    Uses the L-shaped layout, where the three differ by 32 % — on a rectangle
+    they nearly coincide and a broken switch would not show up.
+    """
+    errors = []
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 940})
+        page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+
+        _open_demo(page, viewer_url, "layout_1_100")
+        page.select_option("#unit", "m2")
+        page.wait_for_timeout(400)
+
+        available = page.eval_on_selector_all(
+            "#rcFootprints button[data-fp]", "els => els.map(e => e.dataset.fp)"
+        )
+        blocked = page.eval_on_selector_all(
+            "#rcFootprints button[data-fp-pending]",
+            "els => els.map(e => e.dataset.fpPending)",
+        )
+        blocked_disabled = page.eval_on_selector_all(
+            "#rcFootprints button[data-fp-pending]", "els => els.every(e => e.disabled)"
+        )
+        blocked_text = page.inner_text("#rcFootprints")
+
+        def shape_area():
+            """The drawn footprint path: its type and its vertex count.
+
+            Vertex count is the discriminator, not the bounding box — a union and
+            its own bounding rectangle share a bounding box by definition, so
+            comparing extents would pass even if the switch did nothing.
+            """
+            return page.evaluate(
+                """() => {
+                    const el = document.querySelector('#vec path[data-fp-shape]');
+                    if (!el) return null;
+                    const d = el.getAttribute('d') || '';
+                    const b = el.getBBox();
+                    return {
+                        type: el.dataset.fpShape,
+                        vertices: (d.match(/[\\d.]+,[\\d.]+/g) || []).length,
+                        w: +b.width.toFixed(2),
+                        h: +b.height.toFixed(2),
+                    };
+                }"""
+            )
+
+        union_head = page.inner_text("#rcMain")
+        union_shape = shape_area()
+
+        page.click("#rcFootprints button[data-fp=bounding_rectangle]")
+        page.wait_for_timeout(500)
+        box_head = page.inner_text("#rcMain")
+        box_shape = shape_area()
+        box_pressed = page.get_attribute(
+            "#rcFootprints button[data-fp=bounding_rectangle]", "aria-pressed"
+        )
+
+        page.click("#rcFootprints button[data-fp=convex_envelope]")
+        page.wait_for_timeout(500)
+        hull_head = page.inner_text("#rcMain")
+        hull_shape = shape_area()
+        browser.close()
+
+    assert errors == [], errors
+    assert {"equipment_union", "convex_envelope", "bounding_rectangle"} <= set(available)
+    assert set(blocked) == {"conveyor_footprint", "guarded_area", "line_footprint"}
+    assert blocked_disabled, "unavailable readings must not look clickable"
+    assert "需要 CAD 图层/块语义" in blocked_text, "say why they are unavailable"
+
+    # Each reading names itself and reports its own number.
+    assert "设备几何并集" in union_head and "54.46" in union_head.replace(",", "")
+    assert "外接矩形" in box_head and "72.00" in box_head.replace(",", "")
+    assert "凸包外廓" in hull_head and "64.00" in hull_head.replace(",", "")
+    assert box_pressed == "true", "the selected card must be visibly selected"
+
+    # The overlay is drawn from the selected interpretation's own geometry.
+    assert union_shape and box_shape and hull_shape
+    assert union_shape["type"] == "equipment_union"
+    assert box_shape["type"] == "bounding_rectangle"
+    assert hull_shape["type"] == "convex_envelope"
+    # The L-shaped plan has a 6-vertex outline; its bounding rectangle has 5
+    # points (4 corners plus the closing repeat). If switching did nothing, the
+    # vertex count would not change.
+    assert box_shape["vertices"] == 5, box_shape
+    assert union_shape["vertices"] > box_shape["vertices"], (union_shape, box_shape)
+    assert hull_shape["vertices"] != box_shape["vertices"], (hull_shape, box_shape)
+    # And the rectangle must still bound the union it was derived from.
+    assert box_shape["w"] >= union_shape["w"] - 0.5
+    assert box_shape["h"] >= union_shape["h"] - 0.5
+
+
+def test_explain_calculation_shows_the_real_path_and_evidence(viewer_url, drawings):
+    """Explain Calculation must trace the actual stages, from backend fields."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 940})
+        _open_demo(page, viewer_url)
+
+        collapsed = page.eval_on_selector("#rcExplain", "el => el.open")
+        page.click("#rcExplainSummary")
+        page.wait_for_timeout(400)
+        opened = page.eval_on_selector("#rcExplain", "el => el.open")
+        flow = page.inner_text("#rcFlow")
+
+        page.click("#rcEngineering > summary")
+        page.wait_for_timeout(300)
+        details = page.inner_text("#rcEngineering")
+        browser.close()
+
+    assert collapsed is False, "deep detail stays out of the way until asked for"
+    assert opened is True
+
+    # The documented calculation path, stage by stage.
+    for stage in ("来源", "视图", "比例", "单位", "图元分类", "footprint 定义",
+                  "多边形与孔洞", "并集", "单位换算", "结果"):
+        assert stage in flow, f"missing stage {stage!r} in the explanation"
+    assert "mm/unit" in flow, "the detected scale must be shown"
+    assert "1 : 2" in flow, "the implied ratio must be shown"
+    assert "该定义的证据" in flow, "interpretation-specific evidence must appear"
+    # Evidence comes from FootprintInterpretation, not re-derived in the browser.
+    assert "union of" in flow or "并集" in flow
+
+    assert "方法" in details and "几何" in details, details[:200]
+
+
+def test_overlay_layers_can_be_toggled(viewer_url, drawings):
+    """Visual verification: each class of geometry can be shown or hidden."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 940})
+        _open_demo(page, viewer_url)
+
+        toggles = page.eval_on_selector_all(
+            "#rcLayers input[data-layer]", "els => els.map(e => e.dataset.layer)"
+        )
+        before = page.eval_on_selector_all("#vec path", "els => els.length")
+
+        # Turning the footprint off must remove its shape from the overlay.
+        page.uncheck("#rcLayers input[data-layer=footprint]")
+        page.wait_for_timeout(350)
+        without_footprint = page.eval_on_selector_all(
+            "#vec path[data-fp-shape]", "els => els.length"
+        )
+
+        page.check("#rcLayers input[data-layer=footprint]")
+        page.check("#rcLayers input[data-layer=boundingRect]")
+        page.wait_for_timeout(350)
+        after = page.eval_on_selector_all("#vec path", "els => els.length")
+        browser.close()
+
+    for layer in ("source", "measured", "excluded", "dimensions", "holes",
+                  "footprint", "envelope", "boundingRect", "warnings"):
+        assert layer in toggles, f"missing overlay toggle {layer!r}"
+    assert without_footprint == 0, "unchecking the footprint must hide it"
+    assert after > before, "adding the bounding-rectangle layer must draw more"
+
+
+def test_a_scanned_demo_still_refuses_to_invent_an_area(viewer_url, drawings):
+    """The refusal survives the new UI: no reading may show millimetres."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 940})
+        _open_demo(page, viewer_url, "raster_plate")
+        headline = page.inner_text("#rcMain")
+        means = page.inner_text("#rcMeans")
+        browser.close()
+
+    assert "未标定" in headline, headline
+    assert "毫米" in means or "比例" in means, means

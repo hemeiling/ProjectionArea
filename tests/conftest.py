@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests.fixtures import build_all  # noqa: E402
+from backend.demo.drawings import build_all  # noqa: E402
 
 
 @pytest.fixture(scope="session")

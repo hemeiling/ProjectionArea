@@ -203,6 +203,42 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
   .rail{border-right:0; border-bottom:1px solid var(--rule); max-height:46vh}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+/* ── Milestone A: footprint interpretations, layer toggles, explanation ──── */
+.fp{display:grid; gap:7px; margin:2px 0 12px}
+.fp button{display:block; width:100%; text-align:left; padding:9px 11px; border:1px solid var(--rule);
+  background:var(--paper); border-radius:8px; cursor:pointer; font:inherit; color:inherit}
+.fp button:hover{border-color:var(--rule-2)}
+.fp button[aria-pressed=true]{border-color:var(--verdigris); background:#EEF6F4; box-shadow:inset 0 0 0 1px var(--verdigris-lit)}
+.fp button[disabled]{cursor:default; opacity:.72; background:repeating-linear-gradient(135deg,transparent,transparent 6px,rgba(0,0,0,.025) 6px,rgba(0,0,0,.025) 12px)}
+.fp .fpTop{display:flex; align-items:baseline; justify-content:space-between; gap:8px}
+.fp .fpName{font-size:12.5px; font-weight:600}
+.fp .fpVal{font-variant-numeric:tabular-nums; font-size:13px; font-weight:600; white-space:nowrap}
+.fp .fpWhy{margin:3px 0 0; font-size:11px; line-height:1.45; color:var(--ink-2)}
+.fp .fpTag{display:inline-block; margin-top:4px; font-size:10px; letter-spacing:.04em;
+  text-transform:uppercase; color:var(--ink-2); border:1px solid var(--rule); border-radius:3px; padding:1px 5px}
+.layers{display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; margin-top:8px}
+.layers label{display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ink-2); cursor:pointer}
+.layers input{margin:0}
+.layers i{width:10px; height:10px; border-radius:2px; flex:none}
+.warnbox{border:1px solid #C08A2E; background:#FDF6E7; border-radius:8px; padding:10px 11px; margin:0 0 12px}
+.warnbox h4{margin:0 0 4px; font-size:12.5px; color:#7A5410}
+.warnbox p{margin:0 0 6px; font-size:11.5px; line-height:1.5; color:#6B4E14}
+.warnbox button{font-size:11.5px; padding:5px 9px}
+.explain{margin-top:10px}
+.explain > summary{cursor:pointer; font-size:12px; font-weight:600; padding:7px 0}
+.flow{display:grid; gap:0; margin:6px 0 10px; font-size:11.5px}
+.flow .step{display:grid; grid-template-columns:132px 1fr; gap:8px; padding:6px 0; border-top:1px dashed var(--rule)}
+.flow .step:first-child{border-top:0}
+.flow .sk{color:var(--ink-2); font-weight:600}
+.flow .sv{color:var(--ink)}
+.flow .sv code{font-size:11px; background:var(--panel); padding:1px 4px; border-radius:3px}
+.evl{margin:4px 0 0; padding-left:16px; font-size:11px; color:var(--ink-2)}
+.evl li{margin:2px 0}
+.demoGrid{display:grid; gap:6px; margin-top:12px; text-align:left}
+.demoGrid button{display:block; width:100%; text-align:left; padding:8px 10px; font-size:12px}
+.demoGrid .dTitle{font-weight:600}
+.demoGrid .dWhat{display:block; margin-top:2px; font-size:10.5px; color:var(--ink-2); line-height:1.4}
 </style>
 
 <div class="app">
@@ -331,8 +367,15 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
     <div class="sect" id="srvResultSect" style="display:none">
       <h2>投影面积结果</h2>
       <div class="card">
+        <div class="warnbox" id="rcAmbiguity" style="display:none">
+          <h4 id="rcAmbHead">建议人工复核</h4>
+          <p id="rcAmbBody"></p>
+          <button id="rcAmbShow">显示该区域</button>
+        </div>
+
         <div class="big" id="rcMain">—</div>
         <div class="alt" id="rcAlt"></div>
+        <p class="fixnote" id="rcMeans" style="margin-bottom:10px"></p>
 
         <div class="conf" id="rcConf">
           <div class="top"><span>置信度</span><span class="pct" id="rcConfPct">—</span></div>
@@ -340,17 +383,25 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
           <div class="parts" id="rcConfParts"></div>
         </div>
 
-        <div class="kv" id="rcKv"></div>
-        <ul class="rlist" id="rcComponents" style="margin-top:10px"></ul>
-        <ul class="notes" id="rcNotes"></ul>
-        <details class="ev" id="rcRepairs" style="display:none"><summary>几何修复记录</summary><ul></ul></details>
+        <h3 style="font-size:12px; margin:14px 0 6px; letter-spacing:.03em">测得的footprint · 选一种定义</h3>
+        <div class="fp" id="rcFootprints"></div>
 
-        <div class="legend">
-          <span><i style="background:rgba(62,154,141,.55)"></i>计入轮廓</span>
-          <span><i style="background:rgba(154,52,18,.55)"></i>孔洞/扣除</span>
-          <span><i style="background:rgba(180,128,42,.55)"></i>存疑</span>
-          <span><i style="background:rgba(74,88,95,.35)"></i>已忽略</span>
-        </div>
+        <ul class="notes" id="rcNotes"></ul>
+
+        <details class="explain" id="rcExplain">
+          <summary id="rcExplainSummary">说明这次计算 · Explain Calculation</summary>
+          <div class="flow" id="rcFlow"></div>
+        </details>
+
+        <details class="explain" id="rcEngineering">
+          <summary>工程细节 · Engineering Details</summary>
+          <div class="kv" id="rcKv"></div>
+          <ul class="rlist" id="rcComponents" style="margin-top:10px"></ul>
+          <details class="ev" id="rcRepairs" style="display:none"><summary>几何修复记录</summary><ul></ul></details>
+        </details>
+
+        <h3 style="font-size:12px; margin:14px 0 4px; letter-spacing:.03em">叠加图层</h3>
+        <div class="layers" id="rcLayers"></div>
       </div>
     </div>
 
@@ -396,8 +447,10 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
       <div class="card">
         <div class="mark">Planimeter</div>
         <h3>把 PDF 图纸拖进来</h3>
-        <p>支持矢量导出的 CAD 图，也支持扫描件和图片。文件只在你的浏览器里处理，不会上传。</p>
+        <p>支持矢量导出的 CAD 图，也支持扫描件和图片。上传的文件只留在本机，不会发往任何外部服务。</p>
         <button class="primary" id="openBtn2">选择文件</button>
+        <p style="margin-top:16px; font-size:12px">没有图纸？用内置样例试一遍完整流程 —— 走的是同一套后端计算，结果不是写死的。</p>
+        <div class="demoGrid" id="demoGrid"></div>
       </div>
     </div>
     <div class="busy" id="busy">正在渲染…</div>
@@ -540,7 +593,7 @@ $("mPoly").onclick=()=>setMode("poly");
 $("mCal").onclick =()=>{ $("calMode").value="pick"; $("calMode").onchange({target:$("calMode")}); setMode("cal"); };
 $("tol").oninput = e=>{ S.tol=+e.target.value; $("tolVal").textContent=e.target.value; };
 $("sign").onchange = e=>S.sign=+e.target.value;
-$("unit").onchange = e=>{ S.unit=e.target.value; paint(); };
+$("unit").onchange = e=>{ S.unit=e.target.value; S.unitPinned = true; paint(); };
 
 /* ── 画布交互 ───────────────────────────────── */
 function pos(ev){
@@ -737,8 +790,42 @@ const SRV = (() => {
     ignored:[], allPrims:[], regionId:null, regionBox:null, customBox:null,
     scaleSpec:{mode:"auto"}, busy:false, dragging:null,
     // 人工修正：图元改判、补画/擦除的边界。
-    overrides:{}, manualAdd:[], manualSub:[], review:false, polyTarget:null
+    overrides:{}, manualAdd:[], manualSub:[], review:false, polyTarget:null,
+    // Milestone A：当前选中的 footprint 定义，以及叠加层开关。
+    fpType:"equipment_union", ambiguity:null,
+    layers:{source:true, measured:true, excluded:true, dimensions:true, holes:true,
+            footprint:true, envelope:false, boundingRect:false, warnings:true}
   };
+
+  /* ── footprint 定义 ─────────────────────────────────────────
+     每一种都是"投影面积"的一个成立读法，后端按几何各自算出并带上自己的
+     几何、证据、假设。前端只负责展示与切换，不重算任何数字。 */
+  const FP_CN = {
+    equipment_union:   {name:"设备几何并集",   short:"并集"},
+    convex_envelope:   {name:"凸包外廓",       short:"凸包"},
+    bounding_rectangle:{name:"外接矩形",       short:"外接矩形"},
+    largest_body:      {name:"最大单体",       short:"最大单体"},
+    conveyor_footprint:{name:"输送线占地",     short:"输送线"},
+    guarded_area:      {name:"安全围栏内面积", short:"围栏"},
+    line_footprint:    {name:"整线占地",       short:"整线"}
+  };
+  const FP_COLOUR = {
+    equipment_union:   "#2C6B62",
+    convex_envelope:   "#5B7C99",
+    bounding_rectangle:"#8A6BA8",
+    largest_body:      "#2C6B62"
+  };
+  const LAYER_CN = [
+    ["source",       "原始图元",   "rgba(74,88,95,.30)"],
+    ["measured",     "计入几何",   "rgba(62,154,141,.55)"],
+    ["excluded",     "已排除几何", "rgba(74,88,95,.55)"],
+    ["dimensions",   "尺寸/注释",  "rgba(74,88,95,.22)"],
+    ["holes",        "孔洞",       "rgba(154,52,18,.55)"],
+    ["footprint",    "所选 footprint", "rgba(62,154,141,.30)"],
+    ["envelope",     "凸包外廓",   "rgba(91,124,153,.35)"],
+    ["boundingRect", "外接矩形",   "rgba(138,107,168,.35)"],
+    ["warnings",     "存疑/告警区", "rgba(180,128,42,.55)"]
+  ];
 
   const AREA_LABEL = {mm2:"mm²", cm2:"cm²", m2:"m²", in2:"in²", ft2:"ft²"};
   const ROLE_CN = {
@@ -774,6 +861,53 @@ const SRV = (() => {
   function chips(list) {
     $("srvChips").innerHTML = list
       .map(c => `<span class="chip ${c.cls || ""}">${esc(c.text)}</span>`).join("");
+  }
+
+  /* ── 内置样例 ─────────────────────────────────────────────
+     样例图纸由后端生成并走同一条流水线：没有任何写死的结果。 */
+
+  async function loadDemoCatalogue() {
+    const grid = $("demoGrid");
+    if (!grid) return;
+    try {
+      const data = await call("/api/demo");
+      grid.innerHTML = (data.drawings || []).map((d, i) => `
+        <button type="button" class="${i === 0 ? "primary" : ""}" data-demo="${esc(d.id)}">
+          <span class="dTitle">${i === 0 ? "试用样例图纸 · " : ""}${esc(d.title)}</span>
+          <span class="dWhat">${esc(d.exercises)}<br>预期：${esc(d.expected)}</span>
+        </button>`).join("");
+      [...grid.querySelectorAll("button[data-demo]")].forEach(b =>
+        b.onclick = () => openDemo(b.dataset.demo));
+    } catch (err) {
+      grid.innerHTML = `<p class="fixnote">后端未启动，样例不可用。请运行 <code>python run.py</code>。（${esc(err.message)}）</p>`;
+    }
+  }
+
+  /* 样例走的是真实上传路径：后端生成 PDF → 存入同一个 store → 前端取回
+     字节渲染 → 再跑一次 analyze/area。与用户自己传文件完全同一条路。 */
+  async function openDemo(demoId) {
+    if (st.busy) return;
+    st.busy = true; busy(true);
+    try {
+      const doc = await call(`/api/demo/${demoId}`, {method:"POST"});
+      const bytes = await fetch(API + `/api/documents/${doc.document_id}/file`);
+      if (!bytes.ok) throw new Error("无法取回样例文件");
+      const blob = await bytes.blob();
+      const file = new File([blob], doc.demo.file_name, {type:"application/pdf"});
+
+      st.busy = false; busy(false);
+      await load(file);                 // 正常渲染路径
+      st.docId = doc.document_id;       // 复用后端已经存好的那一份
+      st.file = file;
+      st.demo = doc.demo;
+      $("fname").textContent = doc.demo.title;
+      await analyze();
+      if (!$("srvCalc").disabled) await calc();
+    } catch (err) {
+      alert("样例载入失败：" + err.message);
+    } finally {
+      st.busy = false; busy(false);
+    }
   }
 
   /* ── 上传与分析 ───────────────────────────────────────────── */
@@ -817,6 +951,9 @@ const SRV = (() => {
       await ensureDoc();
       const a = await call(`/api/documents/${st.docId}/pages/${S.pageNum}/analyze`);
       st.analysis = a; st.page = S.pageNum;
+      // 后端检测到的歧义（已知的标题栏/右下角混淆）——只报告，不自动改。
+      st.ambiguity = (a.ambiguities || [])[0] || null;
+      renderAmbiguity();
 
       const roles = "dimension,annotation,centerline,hidden,sheet,hatch,uncertain";
       const g = await call(
@@ -945,24 +1082,198 @@ const SRV = (() => {
     }
   }
 
+  /* ── footprint 定义：选择、渲染、叠加 ───────────────────── */
+
+  function interpretations() {
+    return (st.result && st.result.footprint_interpretations) || [];
+  }
+
+  function selectedFp() {
+    const list = interpretations();
+    if (!list.length) return null;
+    return list.find(i => i.type === st.fpType) || list[0];
+  }
+
+  function chooseFp(type) {
+    st.fpType = type;
+    renderFootprints();
+    paintReadout();
+    renderMainValue();
+    renderFlow();
+    paintOverlay();
+  }
+
+  /* 主读数跟着所选定义走——数字与它代表的物理区域必须一起出现。 */
+  function renderMainValue() {
+    const r = st.result; if (!r) return;
+    const unit = S.unit, fp = selectedFp(), pa = r.projected_area;
+
+    if (!pa.verified) {
+      $("rcMain").innerHTML = `未标定<small>无法给出物理面积</small>`;
+      $("rcAlt").textContent = `图面面积 ${fmtArea(r.area_pdf_units2.net)} PDF 单位²（不是制造尺寸）`;
+      $("rcMeans").textContent = "没有可信比例时不给出任何毫米数值，这是有意的。";
+      return;
+    }
+    if (!fp || !fp.units) { paintReadout(); return; }
+
+    const label = (FP_CN[fp.type] || {}).name || fp.name;
+    $("rcMain").innerHTML =
+      `<span style="display:block; font-size:12px; font-weight:600; letter-spacing:.03em; color:var(--ink-2)">${esc(label)}</span>` +
+      `${fmtArea(fp.units[unit])}<small>${AREA_LABEL[unit]}</small>`;
+    const others = ["mm2","cm2","m2","ft2"].filter(u => u !== unit)
+      .map(u => `${fmtArea(fp.units[u])} ${AREA_LABEL[u]}`).join("　·　");
+    const gross = fp.type === "equipment_union" && r.subtract_holes && r.area_pdf_units2.holes > 0
+      ? `<br>外轮廓（含孔）${fmtArea(pa.gross[unit])} ${AREA_LABEL[unit]}　·　孔洞 ${fmtArea(pa.holes[unit])} ${AREA_LABEL[unit]}`
+      : "";
+    $("rcAlt").innerHTML = others + gross;
+    $("rcMeans").textContent = fp.means;
+  }
+
+  /* 一块 200×120 的板读作 "0.0231 m²" 没有意义；一条产线读作 "54,460,800 mm²"
+     同样没有意义。首次出结果时按量级挑一个好读的单位，但只要用户自己选过，
+     就再也不去改它。 */
+  function autoUnit() {
+    if (S.unitPinned) return;
+    const r = st.result, pa = r && r.projected_area;
+    if (!pa || !pa.verified) return;
+    const mm2 = pa.net.mm2;
+    const unit = mm2 >= 1e7 ? "m2" : mm2 >= 1e4 ? "mm2" : "mm2";
+    if (unit !== S.unit) {
+      S.unit = unit;
+      $("unit").value = unit;
+      paint();
+    }
+  }
+
+  function renderFootprints() {
+    const r = st.result; if (!r) return;
+    const unit = S.unit, box = $("rcFootprints");
+    const available = interpretations();
+    const pending = r.pending_interpretations || [];
+    const current = selectedFp();
+
+    const rows = available.map(fp => {
+      const label = (FP_CN[fp.type] || {}).name || fp.name;
+      const value = fp.units ? `${fmtArea(fp.units[unit])} ${AREA_LABEL[unit]}`
+                             : `${Math.round(fp.area_units2)} 单位²`;
+      const on = current && fp.type === current.type;
+      const swatch = FP_COLOUR[fp.type] || "#2C6B62";
+      return `<button type="button" data-fp="${esc(fp.type)}" aria-pressed="${on}">
+        <span class="fpTop">
+          <span class="fpName"><i style="display:inline-block;width:9px;height:9px;border-radius:2px;
+            background:${swatch};margin-right:6px"></i>${esc(label)}</span>
+          <span class="fpVal">${value}</span>
+        </span>
+        <span class="fpWhy">${esc(fp.means)}</span>
+      </button>`;
+    });
+
+    /* 不可用的读法照样列出来，并说明为什么——缺失要看得见，而不是悄悄消失。 */
+    const blocked = pending.map(p => {
+      const label = (FP_CN[p.type] || {}).name || p.name;
+      return `<button type="button" disabled data-fp-pending="${esc(p.type)}">
+        <span class="fpTop"><span class="fpName">${esc(label)}</span><span class="fpVal">—</span></span>
+        <span class="fpWhy">${esc(p.means)}</span>
+        <span class="fpTag">需要 CAD 图层/块语义</span>
+      </button>`;
+    });
+
+    box.innerHTML = rows.join("") + blocked.join("");
+    [...box.querySelectorAll("button[data-fp]")].forEach(b =>
+      b.onclick = () => chooseFp(b.dataset.fp));
+  }
+
+  function renderLayers() {
+    const box = $("rcLayers");
+    box.innerHTML = LAYER_CN.map(([key, label, colour]) =>
+      `<label><input type="checkbox" data-layer="${key}" ${st.layers[key] ? "checked" : ""}>
+        <i style="background:${colour}"></i>${esc(label)}</label>`).join("");
+    [...box.querySelectorAll("input[data-layer]")].forEach(input =>
+      input.onchange = () => { st.layers[input.dataset.layer] = input.checked; paintOverlay(); });
+  }
+
+  /* ── 计算说明：直接用后端给的证据，不在前端另算一套 ────── */
+
+  function renderFlow() {
+    const r = st.result; if (!r) return;
+    const fp = selectedFp(), g = r.geometry, unit = S.unit;
+    const ignored = Object.entries(g.role_counts || {})
+      .filter(([k]) => k !== "profile")
+      .map(([k, v]) => `${ROLE_CN[k] || k}×${v}`).join("、") || "无";
+
+    const steps = [
+      ["来源 Source", `${({vector:"原生矢量",raster:"栅格/扫描",mixed:"混合",unknown:"未知"})[r.drawing_type] || r.drawing_type}` +
+        ` · 第 ${r.page} 页` + (st.analysis ? ` · 页面旋转 ${st.analysis.rotation}°` : "")],
+      ["视图 View", `${esc(r.view.label)}（${r.view.source === "user_selected" ? "已选定" :
+        r.view.source === "auto_detected" ? "自动识别" : "整页"}）`],
+      ["比例 Scale", r.scale.verified
+        ? `<code>${r.scale.mm_per_unit.toFixed(6)} mm/unit</code> · ${r.scale.implied_ratio}<br>` +
+          `来源：${SCALE_CN[r.scale.source] || r.scale.source}<br>${esc(r.scale.detail || "")}`
+        : "未建立 —— 因此不报告任何毫米数值"],
+      ["单位 Units", st.analysis && st.analysis.sheet_unit
+        ? `图纸声明 ${esc(st.analysis.sheet_unit)}` : "图纸未声明单位（按 mm 假设，已记入假设项）"],
+      ["图元分类 Classification", `共 ${g.raw_primitives} 个图元 · 计入 ${g.profile_primitives} · 排除 ${g.ignored_primitives}<br>已忽略：${ignored}`],
+      ["footprint 定义", fp ? `<b>${esc((FP_CN[fp.type] || {}).name || fp.name)}</b><br>${esc(fp.means)}` : "—"],
+      ["多边形与孔洞 Polygon", `${g.outer_contours} 个外轮廓 · ${g.holes} 个孔 · ${g.faces} 个面 · ${g.segments} 段线`],
+      ["并集 Union", `${METHOD_CN[r.method] || r.method} · ${g.components} 个连通体`],
+      ["单位换算 Conversion", fp && fp.units
+        ? `<code>${fmtArea(fp.area_units2)} 单位² × (${r.scale.mm_per_unit.toFixed(6)} mm/unit)²</code><br>` +
+          `= ${fmtArea(fp.units.mm2)} mm² = ${fmtArea(fp.units.m2)} m² = ${fmtArea(fp.units.ft2)} ft²`
+        : "比例未建立，无法换算"],
+      ["结果 Result", fp && fp.units
+        ? `<b>${fmtArea(fp.units[unit])} ${AREA_LABEL[unit]}</b> · 置信度 ${r.confidence.percent}%（${r.confidence.band}）`
+        : `置信度 ${r.confidence.percent}%`]
+    ];
+
+    let html = steps.map(([k, v]) =>
+      `<div class="step"><span class="sk">${esc(k)}</span><span class="sv">${v}</span></div>`).join("");
+
+    /* 这一段刻意取自 FootprintInterpretation 自己的字段。 */
+    if (fp) {
+      const list = (items, cls) => items && items.length
+        ? `<ul class="evl ${cls}">` + items.map(x => `<li>${esc(x)}</li>`).join("") + "</ul>" : "";
+      html += `<div class="step"><span class="sk">该定义的证据</span><span class="sv">
+        ${list(fp.evidence, "")}${fp.confidence != null
+          ? `<div style="margin-top:4px">置信度 ${Math.round(fp.confidence * 100)}% —— 继承自其下的几何与比例；
+             凸包与外接矩形本身是精确算术，不额外增加确定性。</div>` : ""}
+        ${fp.assumptions && fp.assumptions.length ? "<div style=\"margin-top:4px\">假设：</div>" + list(fp.assumptions, "") : ""}
+        ${fp.warnings && fp.warnings.length ? "<div style=\"margin-top:4px\">告警：</div>" + list(fp.warnings, "") : ""}
+      </span></div>`;
+    }
+    $("rcFlow").innerHTML = html;
+  }
+
+  function renderAmbiguity() {
+    const amb = st.ambiguity, boxEl = $("rcAmbiguity");
+    if (!amb || !st.layers.warnings) { boxEl.style.display = "none"; return; }
+    boxEl.style.display = "block";
+    $("rcAmbHead").textContent = amb.headline === "Review recommended" ? "建议人工复核" : amb.headline;
+    $("rcAmbBody").innerHTML = `${esc(amb.reason)}<br><span style="opacity:.85">${esc(amb.note)}</span>`;
+    $("rcAmbShow").onclick = () => {
+      st.layers.warnings = true;
+      renderLayers();
+      paintOverlay();
+      const first = (amb.regions || [])[0];
+      if (first && first.bbox) {
+        const el = $("holder");
+        el.scrollTo({left: first.bbox.x0 * S.scale - 60, top: first.bbox.y0 * S.scale - 60, behavior:"smooth"});
+      }
+    };
+  }
+
   function renderResult() {
     const r = st.result; if (!r) return;
     $("srvResultSect").style.display = "block";
     paintReadout();
-    const unit = S.unit, pa = r.projected_area;
+    const unit = S.unit;
 
-    if (pa.verified) {
-      $("rcMain").innerHTML = `${fmtArea(pa.net[unit])}<small>${AREA_LABEL[unit]}</small>`;
-      const others = ["mm2","cm2","m2","in2"].filter(u => u !== unit)
-        .map(u => `${fmtArea(pa.net[u])} ${AREA_LABEL[u]}`).join("　·　");
-      const gross = r.subtract_holes && r.area_pdf_units2.holes > 0
-        ? `<br>外轮廓（含孔）${fmtArea(pa.gross[unit])} ${AREA_LABEL[unit]}　·　孔洞 ${fmtArea(pa.holes[unit])} ${AREA_LABEL[unit]}`
-        : "";
-      $("rcAlt").innerHTML = others + gross;
-    } else {
-      $("rcMain").innerHTML = `未标定<small>无法给出物理面积</small>`;
-      $("rcAlt").textContent = `图面面积 ${fmtArea(r.area_pdf_units2.net)} PDF 单位²（不是制造尺寸）`;
-    }
+    // 所选定义若已不在结果里（例如只剩一个连通体），退回主定义。
+    if (!interpretations().some(i => i.type === st.fpType)) st.fpType = "equipment_union";
+    autoUnit();
+    renderFootprints();
+    renderMainValue();
+    renderLayers();
+    renderAmbiguity();
 
     const c = r.confidence;
     $("rcConf").className = "conf " + c.band;
@@ -1011,6 +1322,8 @@ const SRV = (() => {
     $("rcRepairs").style.display = repairs.length ? "block" : "none";
     $("rcRepairs").querySelector("ul").innerHTML =
       repairs.map(x => `<li>${esc(x.type)} ×${x.count} — ${esc(x.detail)}</li>`).join("");
+
+    renderFlow();
   }
 
   /* ── 叠加层 ───────────────────────────────────────────────── */
@@ -1027,9 +1340,16 @@ const SRV = (() => {
     const out = [];
 
     const source = st.review ? st.allPrims : st.ignored;
+    const DIM_ROLES = {dimension:1, annotation:1, sheet:1, hatch:1};
     for (const prim of source) {
       const role = st.overrides[prim.index] || prim.role;
       const counted = role === "profile";
+      // 图层开关：每一类线都能单独关掉，便于核对遮挡处。
+      if (role === "uncertain") { if (!st.layers.warnings) continue; }
+      else if (DIM_ROLES[role]) { if (!st.layers.dimensions) continue; }
+      else if (counted) { if (!st.layers.measured) continue; }
+      else if (!st.layers.excluded) continue;
+      if (!st.review && !st.layers.source) continue;
       const d = "M" + prim.points.map(p => `${p[0]},${p[1]}`).join("L") + (prim.closed ? "Z" : "");
       const colour = role === "uncertain" ? "#B4802A" : counted ? "#2C6B62" : "#4A585F";
       if (st.review) {
@@ -1046,18 +1366,51 @@ const SRV = (() => {
 
     const r = st.result;
     if (r) {
-      for (const comp of r.components) {
-        const d = [ringPath(comp.outer)].concat(comp.holes.map(ringPath)).join(" ");
-        if (comp.included) {
-          out.push(`<path d="${d}" fill-rule="evenodd" fill="rgba(62,154,141,.30)"
-            stroke="#2C6B62" stroke-width="${hair * 1.7}"/>`);
-          for (const hole of comp.holes) {
+      /* 参考读法：凸包与外接矩形可以和所选定义同时显示，便于比较大小差异。 */
+      const ref = type => (r.footprint_interpretations || []).find(i => i.type === type);
+      const drawRef = (fp, colour) => {
+        if (!fp) return;
+        for (const ring of fp.outer || []) {
+          out.push(`<path d="${ringPath(ring)}" fill="none" stroke="${colour}"
+            stroke-width="${hair * 1.3}" stroke-dasharray="${hair*5} ${hair*3.5}" stroke-opacity=".9"/>`);
+        }
+      };
+      if (st.layers.envelope) drawRef(ref("convex_envelope"), FP_COLOUR.convex_envelope);
+      if (st.layers.boundingRect) drawRef(ref("bounding_rectangle"), FP_COLOUR.bounding_rectangle);
+
+      /* 所选 footprint：用它自己的几何填充，所以切换定义时图形跟着变。 */
+      const fp = selectedFp();
+      if (st.layers.footprint && fp && (fp.outer || []).length) {
+        const rings = (fp.outer || []).map(ringPath)
+          .concat(st.layers.holes ? (fp.holes || []).map(ringPath) : []);
+        const tint = FP_COLOUR[fp.type] || "#2C6B62";
+        out.push(`<path d="${rings.join(" ")}" fill-rule="evenodd" fill="${tint}" fill-opacity=".26"
+          stroke="${tint}" stroke-width="${hair * 2.1}" data-fp-shape="${esc(fp.type)}"/>`);
+        if (st.layers.holes) {
+          for (const hole of fp.holes || []) {
             out.push(`<path d="${ringPath(hole)}" fill="rgba(154,52,18,.30)"
               stroke="#9A3412" stroke-width="${hair * 1.4}"/>`);
           }
-        } else {
+        }
+      }
+
+      /* 未计入的连通体仍然画出来，让"排除了什么"看得见。 */
+      if (st.layers.excluded) {
+        for (const comp of r.components) {
+          if (comp.included) continue;
+          const d = [ringPath(comp.outer)].concat(comp.holes.map(ringPath)).join(" ");
           out.push(`<path d="${d}" fill-rule="evenodd" fill="none" stroke="#4A585F"
             stroke-opacity=".55" stroke-width="${hair}" stroke-dasharray="${hair*4} ${hair*3}"/>`);
+        }
+      }
+
+      /* 触发告警的区域：描出来，点"显示该区域"时能直接看到是哪一块。 */
+      if (st.layers.warnings && st.ambiguity) {
+        for (const finding of st.ambiguity.regions || []) {
+          const b = finding.bbox; if (!b) continue;
+          out.push(`<rect x="${b.x0}" y="${b.y0}" width="${b.x1-b.x0}" height="${b.y1-b.y0}"
+            fill="rgba(180,128,42,.10)" stroke="#B4802A" stroke-width="${hair*1.6}"
+            stroke-dasharray="${hair*3} ${hair*2}" data-ambiguity="${esc(finding.region_id)}"/>`);
         }
       }
     }
@@ -1228,9 +1581,15 @@ const SRV = (() => {
 
   renderFixNote();
 
+  loadDemoCatalogue();
+
   return {
     reset,
     paintReadout,
+    openDemo,
+    chooseFp,
+    selectedFp,
+    layers: () => st.layers,
     hasResult: () => !!st.result,
     onRender() {
       $("srvRun").disabled = !S.pdf;

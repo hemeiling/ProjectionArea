@@ -47,6 +47,7 @@ import fitz
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.area.interpretations import body_breakdown, bounding_extent
+from backend.geometry.regions import detect_title_block_ambiguity
 from backend.models import AreaResult, BBox, ViewSource
 from backend.pdf.document import document_summary
 from backend.pipeline import prepare_page, region_scale
@@ -115,69 +116,17 @@ def _count_kinds(regions: Sequence[Any]) -> Dict[str, int]:
 
 
 def _title_block_ambiguity(prepared: Any, result: AreaResult) -> Optional[Dict[str, Any]]:
-    """Flag the known bottom-right / title-block confusion when it shows up.
+    """The known title-block confusion, detected by the engine, not re-derived here.
 
-    `_classify_region` calls any bottom-right cluster carrying >= 2 text spans a
-    title block, and its `sparse` ink guard does not discriminate (README
-    limitation 6). On a real layout sheet that can hide a genuine view. Two
-    symptoms are worth reporting, and neither is inferred from shape alone:
-
-    * a cluster labelled `title_block` that carries a *lot* of linework, so it
-      may be a view that merely sits in the corner;
-    * more than one `title_block` on the page, which no sheet has.
-
-    Returns None when nothing looks ambiguous. This only ever *reports* — the
-    classifier is left alone until real drawings say how to change it.
+    Shares one implementation with the API so the report and the UI can never
+    disagree about whether a sheet looks ambiguous.
     """
-    blocks = [r for r in prepared.regions if r.kind == "title_block"]
-    if not blocks:
-        return None
-
-    primitives = prepared.analysis.primitives
-    findings: List[Dict[str, Any]] = []
-    for block in blocks:
-        inside = [
-            p
-            for p in primitives
-            if block.bbox.x0 <= p.bbox.center[0] <= block.bbox.x1
-            and block.bbox.y0 <= p.bbox.center[1] <= block.bbox.y1
-        ]
-        ink = sum(p.length for p in inside)
-        perimeter = max(2 * (block.bbox.width + block.bbox.height), 1e-9)
-        findings.append(
-            {
-                "region_id": block.id,
-                "label": block.label,
-                "primitives_inside": len(inside),
-                "ink_units": round(ink, 1),
-                "ink_ratio": round(ink / perimeter, 3),
-                "area_share_of_page": round(
-                    block.bbox.area / max(prepared.analysis.page_bbox.area, 1e-9), 4
-                ),
-            }
-        )
-
-    suspicious = [f for f in findings if f["primitives_inside"] >= 20]
-    if not suspicious and len(blocks) <= 1:
-        return None
-
-    return {
-        "reason": (
-            "more than one region was called a title block"
-            if len(blocks) > 1
-            else "a region called a title block carries a lot of linework, so it may be "
-            "a view that happens to sit in the bottom-right corner"
-        ),
-        "regions": findings,
-        "measured_region_was_a_title_block": any(
-            b.label == result.view_label for b in blocks
-        ),
-        "note": (
-            "Known limitation: the classifier's `sparse` ink guard does not "
-            "discriminate (threshold 2.5; a plain plate scores 1.108). Reported, "
-            "not corrected — select the region manually to override."
-        ),
-    }
+    return detect_title_block_ambiguity(
+        prepared.regions,
+        prepared.analysis.primitives,
+        prepared.analysis.page_bbox,
+        measured_label=result.view_label,
+    )
 
 
 def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
