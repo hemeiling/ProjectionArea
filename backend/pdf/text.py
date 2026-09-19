@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.models import BBox, TextItem
+from backend.pdf.space import is_identity, map_bbox, map_direction, page_space_matrix
 
 #: ``SCALE 1:2``, ``比例 1：100``, ``SCALE 2:1``, ``M 1:50``.
 SCALE_RE = re.compile(
@@ -104,8 +105,17 @@ class DimensionText:
 
 
 def extract_text_items(page: Any) -> List[TextItem]:
-    """Collect every text span on the page with its bounding box and direction."""
+    """Collect every text span on the page with its bounding box and direction.
+
+    Like ``get_drawings()``, ``get_text()`` ignores the page's ``/Rotate``, so
+    spans are mapped into canonical page space (:mod:`backend.pdf.space`). Text
+    and linework must share one space or dimension matching — which decides the
+    scale by pairing an annotation with nearby geometry — pairs them against
+    coordinates that do not correspond.
+    """
     items: List[TextItem] = []
+    matrix = page_space_matrix(page)
+    rotated = not is_identity(matrix)
     data = page.get_text("dict")
     for block in data.get("blocks", []):
         if block.get("type") != 0:
@@ -117,12 +127,17 @@ def extract_text_items(page: Any) -> List[TextItem]:
                 if not text.strip():
                     continue
                 x0, y0, x1, y1 = span["bbox"]
+                bbox = BBox(x0, y0, x1, y1)
+                span_direction = (float(direction[0]), float(direction[1]))
+                if rotated:
+                    bbox = map_bbox(bbox, matrix)
+                    span_direction = map_direction(span_direction, matrix)
                 items.append(
                     TextItem(
                         text=text,
-                        bbox=BBox(x0, y0, x1, y1),
+                        bbox=bbox,
                         size=float(span.get("size", 0.0)),
-                        direction=(float(direction[0]), float(direction[1])),
+                        direction=span_direction,
                     )
                 )
     return items

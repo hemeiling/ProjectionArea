@@ -447,6 +447,41 @@ def build_raster_plate(path: str, source_pdf: str, dpi: int = 200) -> Dict[str, 
     return {"path": path, "dpi": dpi}
 
 
+def build_rotated_plate(path: str, source_pdf: str, rotation: int) -> Dict[str, object]:
+    """The plate drawing re-issued with a ``/Rotate`` entry on the page.
+
+    This is the everyday rotated sheet: identical page content and media box,
+    plus the ``/Rotate`` any CAD exporter or "rotate pages" command writes. The
+    measurement must not notice. ``get_drawings()`` and ``get_text()`` ignore
+    ``/Rotate`` while ``page.rect`` honours it, so an engine that does not
+    normalise the two believes an A3 landscape sheet is portrait and measures
+    the sheet frame as if it were the part (see ``backend/pdf/space.py``).
+
+    Note the drawing then *displays* sideways, exactly as it does in any viewer,
+    so region labels follow the rotated page while every number stays put.
+
+    Args:
+        path: Where to write the rotated copy.
+        source_pdf: The unrotated plate drawing to copy.
+        rotation: 90, 180 or 270.
+    """
+    doc = fitz.open(source_pdf)
+    doc.load_page(0).set_rotation(rotation)
+    doc.save(path)
+    doc.close()
+
+    width_mm, height_mm, hole_r = 200.0, 120.0, 10.0
+    return {
+        "path": path,
+        "rotation": rotation,
+        "mm_per_unit": MM_PER_PDF_UNIT_AT_1_1 * 2.0,
+        "net_area_mm2": width_mm * height_mm - 3 * math.pi * hole_r ** 2,
+        "gross_area_mm2": width_mm * height_mm,
+        "hole_count": 3,
+        "ratio_denominator": 2.0,
+    }
+
+
 def build_all(directory: str) -> Dict[str, Dict[str, object]]:
     """Generate every fixture into ``directory`` and return their ground truth."""
     os.makedirs(directory, exist_ok=True)
@@ -460,6 +495,9 @@ def build_all(directory: str) -> Dict[str, Dict[str, object]]:
     )
     truth["raster_plate"] = build_raster_plate(
         os.path.join(directory, "raster_plate.pdf"), truth["plate_with_holes"]["path"]
+    )
+    truth["rotated_plate_90"] = build_rotated_plate(
+        os.path.join(directory, "rotated_plate_90.pdf"), truth["plate_with_holes"]["path"], 90
     )
     return truth
 

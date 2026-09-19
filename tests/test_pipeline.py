@@ -13,8 +13,19 @@ import fitz
 import pytest
 
 from backend.area.projected import compute_projected_area
-from backend.models import DrawingType, GeometryRole, Method, Scale, ScaleSource, ViewSource
+from backend.models import (
+    DrawingType,
+    GeometryRole,
+    Method,
+    Scale,
+    ScaleSource,
+    ViewSource,
+    median_glyph_height,
+)
+from backend.pdf.space import map_point, page_space_matrix
+from backend.pdf.text import extract_text_items
 from backend.pipeline import prepare_page, region_scale
+from tests.fixtures import build_rotated_plate
 
 
 def measure(path, region_label=None, **kwargs):
@@ -286,3 +297,221 @@ def test_parallel_evenly_spaced_lines_are_read_as_hatching():
     prepared = prepare_page(doc, 1)
     doc.close()
     assert prepared.role_counts.get("hatch", 0) >= 18
+
+
+# ── page rotation (/Rotate) ──────────────────────────────────────────────────
+#
+# `get_drawings()` and `get_text()` report unrotated media-box coordinates while
+# `page.rect` reports rotated ones. Mixing the two silently reinterprets an A3
+# landscape sheet as portrait: the sheet frame then spans 138 % of the believed
+# page width but only 68 % of its height, fails the "spans most of the page"
+# test, keeps the `profile` role and is measured as if it were the part. The
+# annotation-height yardstick breaks the same way, because a rotated span's
+# `bbox.height` is the length of the string rather than the height of its
+# letters. backend/pdf/space.py normalises both at the source-adapter seam.
+#
+# The invariant asserted here: rotating a sheet must not move a single number.
+
+
+def _rotated(tmp_path, drawings, rotation):
+    """The plate drawing re-issued with ``/Rotate rotation``."""
+    target = tmp_path / f"rotated_{rotation}.pdf"
+    return build_rotated_plate(str(target), drawings["plate_with_holes"]["path"], rotation)
+
+
+def measure_densest_region(path, **kwargs):
+    """Measure the region holding the most linework, ignoring its label.
+
+    Region *labels* are deliberately orientation-dependent — a title block is
+    recognised by sitting at the bottom-right of the displayed sheet — and a
+    ``/Rotate 180`` page displays upside-down, which legitimately puts the part
+    where the title block belongs. The measurement must not depend on that, so
+    these tests pick the part by geometry and assert only the numbers.
+    """
+    doc = fitz.open(path)
+    prepared = prepare_page(doc, 1)
+
+    def linework(region):
+        return sum(
+            1
+            for prim in prepared.analysis.primitives
+            if region.bbox.x0 <= prim.bbox.center[0] <= region.bbox.x1
+            and region.bbox.y0 <= prim.bbox.center[1] <= region.bbox.y1
+        )
+
+    region = max(prepared.regions, key=linework)
+    scale, warnings = region_scale(prepared, region)
+    result = compute_projected_area(
+        analysis=prepared.analysis,
+        fitz_page=doc.load_page(0),
+        document_id="test",
+        file_name=path.split("/")[-1],
+        scale=scale,
+        region_bbox=region.bbox,
+        view_source=ViewSource.USER_SELECTED,
+        view_label=region.label,
+        extra_warnings=warnings,
+        **kwargs,
+    )
+    doc.close()
+    return result, prepared, region
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_rotated_page_measures_the_same_area(drawings, tmp_path, rotation):
+    """Scale, geometry and area are invariant under /Rotate. 90° is the case
+    that actually regressed; 180/270 come free, and 180 keeps the page portrait
+    so it isolates the coordinate fix from the width/height swap."""
+    truth = _rotated(tmp_path, drawings, rotation)
+    result, prepared, _region = measure_densest_region(truth["path"])
+
+    assert prepared.analysis.rotation == rotation
+    assert prepared.analysis.drawing_type is DrawingType.VECTOR
+    assert result.method is Method.VECTOR_EXACT
+    assert result.scale.verified
+    assert result.scale.source is ScaleSource.DIMENSION_CONSENSUS
+    assert result.scale.mm_per_unit == pytest.approx(truth["mm_per_unit"], rel=1e-3)
+    assert result.geometry.holes == truth["hole_count"]
+    assert result.area_mm2 == pytest.approx(truth["net_area_mm2"], rel=2e-3)
+    assert result.gross_area_mm2 == pytest.approx(truth["gross_area_mm2"], rel=2e-3)
+    assert result.confidence.band == "high"
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_rotated_page_is_bit_identical_to_the_unrotated_sheet(drawings, tmp_path, rotation):
+    """The strongest form of the invariant: same area, same scale, same roles.
+
+    Rotation by a multiple of 90° is rigid, so there is no floating-point excuse
+    for the numbers to drift — they must match exactly, not approximately.
+    """
+    upright, upright_prepared, _ = measure_densest_region(drawings["plate_with_holes"]["path"])
+    rotated, rotated_prepared, _ = measure_densest_region(
+        _rotated(tmp_path, drawings, rotation)["path"]
+    )
+
+    assert rotated.area_mm2 == upright.area_mm2
+    assert rotated.area_units2 == upright.area_units2
+    assert rotated.scale.mm_per_unit == upright.scale.mm_per_unit
+    assert rotated.geometry.holes == upright.geometry.holes
+    assert rotated.geometry.component_count == upright.geometry.component_count
+    assert rotated.geometry.face_count == upright.geometry.face_count
+    assert rotated.confidence.overall == upright.confidence.overall
+    # Role classification must not drift either: the sheet frame stays demoted
+    # and the dimension yardstick stays the height of the letters.
+    assert rotated_prepared.role_counts == upright_prepared.role_counts
+    assert rotated_prepared.role_counts.get("sheet", 0) >= 1, (
+        "the sheet frame must still be recognised on a rotated page, or it gets "
+        "measured as if it were the part"
+    )
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_rotated_geometry_is_normalised_into_the_displayed_page_box(
+    drawings, tmp_path, rotation
+):
+    """Coordinates must land in `page.rect` space — the space PDF.js paints.
+
+    Without this the audit overlay is drawn in a different coordinate system
+    than the viewer, so every green/red region on a rotated sheet is misplaced
+    and the result stops being auditable at all.
+    """
+    if rotation == 0:
+        path = drawings["plate_with_holes"]["path"]
+    else:
+        path = _rotated(tmp_path, drawings, rotation)["path"]
+
+    doc = fitz.open(path)
+    page = doc.load_page(0)
+    analysis = prepare_page(doc, 1).analysis
+
+    assert (analysis.width, analysis.height) == (page.rect.width, page.rect.height)
+
+    points = [p for prim in analysis.primitives for p in prim.points]
+    assert points
+    pad = 1.0
+    assert min(p[0] for p in points) >= -pad
+    assert min(p[1] for p in points) >= -pad
+    assert max(p[0] for p in points) <= analysis.width + pad
+    assert max(p[1] for p in points) <= analysis.height + pad
+
+    # Text must share that space, or dimension matching pairs an annotation with
+    # linework that is nowhere near it and the scale is recovered from nonsense.
+    boxes = [t.bbox for t in analysis.text_items]
+    assert boxes
+    assert max(b.x1 for b in boxes) <= analysis.width + pad
+    assert max(b.y1 for b in boxes) <= analysis.height + pad
+
+    doc.close()
+
+
+def test_rotated_coordinates_are_exactly_the_rotation_of_the_originals(drawings, tmp_path):
+    """Not merely in-bounds: each point is the /Rotate image of its original."""
+    upright = fitz.open(drawings["plate_with_holes"]["path"])
+    rotated = fitz.open(_rotated(tmp_path, drawings, 90)["path"])
+    matrix = page_space_matrix(rotated.load_page(0))
+
+    a = prepare_page(upright, 1).analysis
+    b = prepare_page(rotated, 1).analysis
+    assert len(a.primitives) == len(b.primitives)
+
+    for original, moved in zip(a.primitives, b.primitives):
+        assert original.kind is moved.kind
+        assert len(original.points) == len(moved.points)
+        for src, dst in zip(original.points, moved.points):
+            expected = map_point(src, matrix)
+            assert dst[0] == pytest.approx(expected[0], abs=1e-9)
+            assert dst[1] == pytest.approx(expected[1], abs=1e-9)
+
+    upright.close()
+    rotated.close()
+
+
+def test_annotation_height_yardstick_is_rotation_invariant():
+    """The median glyph height must not become the length of the string.
+
+    A 90°-rotated span has a tall, narrow bounding box. Reading its height as
+    the annotation size inflated the dimension-matching reach by the text's
+    aspect ratio — on the plate fixture from 33 to 147 units — which swept the
+    dimension *extension* lines into the dimension role and out of the profile.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.insert_text(fitz.Point(50, 100), "DIMENSION 200", fontsize=9)
+    horizontal = extract_text_items(page)
+    doc.close()
+
+    rotated_doc = fitz.open()
+    rotated_page = rotated_doc.new_page(width=400, height=400)
+    rotated_page.insert_text(fitz.Point(50, 100), "DIMENSION 200", fontsize=9)
+    rotated_page.set_rotation(90)
+    rotated = extract_text_items(rotated_page)
+    rotated_doc.close()
+
+    assert horizontal and rotated
+    span, rotated_span = horizontal[0], rotated[0]
+
+    # The bounding box genuinely flips: that is the trap being guarded.
+    assert rotated_span.bbox.height == pytest.approx(span.bbox.width, abs=1e-6)
+    assert rotated_span.bbox.width == pytest.approx(span.bbox.height, abs=1e-6)
+    # The yardstick does not.
+    assert rotated_span.glyph_height == pytest.approx(span.glyph_height, abs=1e-6)
+    assert median_glyph_height(rotated) == pytest.approx(median_glyph_height(horizontal), abs=1e-6)
+
+
+def test_rotate_90_sheet_still_offers_the_captioned_view_and_its_title_block(
+    drawings, tmp_path
+):
+    """On the required 90° case the caption and the sheet furniture survive.
+
+    A `/Rotate 90` sheet displays sideways but stays the right way up, so view
+    captions still attach to their linework and the part is still selectable by
+    name — the ordinary path a user takes through the UI.
+    """
+    result, prepared, region = measure(_rotated(tmp_path, drawings, 90)["path"], "TOP VIEW")
+
+    assert region.kind == "view"
+    assert prepared.role_counts.get("sheet", 0) >= 1
+    assert result.geometry.holes == 3
+    assert result.area_mm2 == pytest.approx(
+        drawings["plate_with_holes"]["net_area_mm2"], rel=2e-3
+    )

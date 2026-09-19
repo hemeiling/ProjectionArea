@@ -211,6 +211,23 @@ class TextItem:
     size: float
     direction: Tuple[float, float] = (1.0, 0.0)
 
+    @property
+    def glyph_height(self) -> float:
+        """Cap height of the text, measured across the reading direction.
+
+        The bounding box alone is not this number: rotate a page 90° and a
+        span's ``bbox.height`` becomes the length of the *string* instead of the
+        height of its letters. That matters because this height is the engine's
+        yardstick for "small" — arrowhead size, annotation masking reach and the
+        calibration search radius are all multiples of it — so on a rotated
+        sheet the yardstick would inflate by the aspect ratio of the text.
+
+        Taking the extent perpendicular to the reading direction is invariant
+        under rotation, and for ordinary horizontal text it *is* ``bbox.height``.
+        """
+        dx, dy = self.direction
+        return self.bbox.height if abs(dx) >= abs(dy) else self.bbox.width
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "text": self.text,
@@ -218,6 +235,22 @@ class TextItem:
             "size": self.size,
             "direction": list(self.direction),
         }
+
+
+def median_glyph_height(text_items: Sequence["TextItem"], fallback: float = 7.0) -> float:
+    """Typical annotation height on a page — the engine's yardstick for "small".
+
+    Single definition shared by classification, region detection, calibration
+    and the area stage, so the four of them can never drift apart on what counts
+    as a "text-sized" length. Rotation-invariant via
+    :attr:`TextItem.glyph_height`.
+
+    Args:
+        text_items: Spans read off the page.
+        fallback: Returned when the page carries no measurable text.
+    """
+    heights = sorted(t.glyph_height for t in text_items if t.glyph_height > 0.1)
+    return heights[len(heights) // 2] if heights else fallback
 
 
 @dataclass

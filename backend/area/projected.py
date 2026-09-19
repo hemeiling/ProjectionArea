@@ -485,7 +485,7 @@ def _reconstruct_vector(contributing, tolerances, roles, close_gaps, ink_bbox, r
 
 
 def _median_text_height(analysis) -> float:
-    heights = [t.bbox.height for t in analysis.text_items if t.bbox.height > 0.1]
+    heights = [t.glyph_height for t in analysis.text_items if t.glyph_height > 0.1]
     if not heights:
         return 7.0
     heights.sort()

@@ -17,7 +17,7 @@ import statistics
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from backend.models import BBox, GeometryRole, Point, Primitive, TextItem
+from backend.models import BBox, GeometryRole, Point, Primitive, TextItem, median_glyph_height
 
 #: A primitive counts as "inside text" when this fraction of its bounding box
 #: overlaps a padded text box.
@@ -40,10 +40,7 @@ _HATCH_SPACING_CV = 0.30  # coefficient of variation of spacings
 
 def _median_text_height(text_items: Sequence[TextItem]) -> float:
     """Typical annotation size, used as the yardstick for 'small'."""
-    heights = [t.bbox.height for t in text_items if t.bbox.height > 0.1]
-    if not heights:
-        return 7.0
-    return float(statistics.median(heights))
+    return median_glyph_height(text_items)
 
 
 def _overlap_fraction(box: BBox, boxes: Sequence[BBox]) -> float:

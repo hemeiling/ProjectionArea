@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.config import Tolerances
 from backend.models import Point, Primitive, PrimitiveKind
+from backend.pdf.space import is_identity, map_points, page_space_matrix
 
 #: Tolerance for deciding that two path items are actually connected. This is
 #: about PDF coordinate round-tripping, not about drawing gaps, so it is a tiny
@@ -308,11 +309,20 @@ def path_to_primitives(
 
 
 def extract_primitives(page: Any, tolerances: Tolerances) -> List[Primitive]:
-    """Extract every vector primitive on a page, in page coordinates.
+    """Extract every vector primitive on a page, in canonical page space.
 
     Coordinates come back in PyMuPDF page space: origin top-left, y increasing
     downwards, units of 1/72 inch. This matches PDF.js viewport coordinates at
     ``scale = 1``, so overlays align with no axis flip.
+
+    ``get_drawings()`` ignores the page's ``/Rotate``, so its output is mapped
+    through :func:`~backend.pdf.space.page_space_matrix` to agree with
+    ``page.rect`` — see :mod:`backend.pdf.space` for why that matters. The
+    matrix is the identity on an unrotated page and is then skipped entirely.
+
+    Rotation by a multiple of 90° is rigid (determinant +1), so it commutes with
+    Bézier flattening and preserves winding: mapping the finished polylines is
+    equivalent to mapping the control points first.
 
     Args:
         page: A ``fitz.Page``.
@@ -324,4 +334,9 @@ def extract_primitives(page: Any, tolerances: Tolerances) -> List[Primitive]:
     primitives: List[Primitive] = []
     for path_index, path in enumerate(page.get_drawings()):
         primitives.extend(path_to_primitives(path, tolerances, path_index, len(primitives)))
+
+    matrix = page_space_matrix(page)
+    if not is_identity(matrix):
+        for primitive in primitives:
+            primitive.points = map_points(primitive.points, matrix)
     return primitives

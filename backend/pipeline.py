@@ -14,7 +14,7 @@ from backend.calibration.scale import resolve_scale
 from backend.config import REGIONS
 from backend.geometry.classify import classify_primitives, mark_dimension_linework
 from backend.geometry.regions import detect_regions, detect_regions_from_page_image
-from backend.models import BBox, Region, Scale, ScaleCandidate
+from backend.models import BBox, Region, Scale, ScaleCandidate, median_glyph_height
 from backend.pdf.document import PageAnalysis, analyze_page
 from backend.pdf.text import text_mask_boxes
 
@@ -36,8 +36,8 @@ class PreparedPage:
 
     @property
     def text_height(self) -> float:
-        heights = sorted(t.bbox.height for t in self.analysis.text_items if t.bbox.height > 0.1)
-        return heights[len(heights) // 2] if heights else 7.0
+        """The page's annotation-height yardstick (§ rotation-invariant)."""
+        return median_glyph_height(self.analysis.text_items)
 
     def default_region(self) -> Optional[Region]:
         """The region the UI should preselect: the strongest actual view."""
@@ -81,10 +81,8 @@ def prepare_page(doc: Any, page_number: int) -> PreparedPage:
 
     # Dimension linework is a page-level judgement; resolve it here so the
     # cached roles are final and no later stage has to mutate shared state.
-    text_heights = sorted(t.bbox.height for t in analysis.text_items if t.bbox.height > 0.1)
-    median_text_height = text_heights[len(text_heights) // 2] if text_heights else 7.0
     demoted = mark_dimension_linework(
-        analysis.primitives, analysis.dimension_texts, median_text_height
+        analysis.primitives, analysis.dimension_texts, median_glyph_height(analysis.text_items)
     )
     if demoted:
         role_counts = {}
