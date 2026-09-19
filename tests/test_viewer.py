@@ -139,7 +139,7 @@ def test_viewer_measures_a_drawing_end_to_end(viewer_url, drawings):
 
     assert errors == [], f"the page logged errors: {errors}"
 
-    assert "设备几何并集" in headline, (
+    assert "已计入几何并集" in headline, (
         "the headline must name which physical region it measured, not just a number"
     )
     measured = _headline_number(headline)
@@ -300,20 +300,20 @@ def test_three_footprint_interpretations_are_offered_and_switchable(viewer_url, 
         browser.close()
 
     assert errors == [], errors
-    assert {"equipment_union", "convex_envelope", "bounding_rectangle"} <= set(available)
+    assert {"geometry_union", "convex_envelope", "bounding_rectangle"} <= set(available)
     assert set(blocked) == {"conveyor_footprint", "guarded_area", "line_footprint"}
     assert blocked_disabled, "unavailable readings must not look clickable"
     assert "需要 CAD 图层/块语义" in blocked_text, "say why they are unavailable"
 
     # Each reading names itself and reports its own number.
-    assert "设备几何并集" in union_head and "54.46" in union_head.replace(",", "")
+    assert "已计入几何并集" in union_head and "54.46" in union_head.replace(",", "")
     assert "外接矩形" in box_head and "72.00" in box_head.replace(",", "")
     assert "凸包外廓" in hull_head and "64.00" in hull_head.replace(",", "")
     assert box_pressed == "true", "the selected card must be visibly selected"
 
     # The overlay is drawn from the selected interpretation's own geometry.
     assert union_shape and box_shape and hull_shape
-    assert union_shape["type"] == "equipment_union"
+    assert union_shape["type"] == "geometry_union"
     assert box_shape["type"] == "bounding_rectangle"
     assert hull_shape["type"] == "convex_envelope"
     # The L-shaped plan has a 6-vertex outline; its bounding rectangle has 5

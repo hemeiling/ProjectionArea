@@ -792,7 +792,7 @@ const SRV = (() => {
     // 人工修正：图元改判、补画/擦除的边界。
     overrides:{}, manualAdd:[], manualSub:[], review:false, polyTarget:null,
     // Milestone A：当前选中的 footprint 定义，以及叠加层开关。
-    fpType:"equipment_union", ambiguity:null,
+    fpType:"geometry_union", ambiguity:null,
     layers:{source:true, measured:true, excluded:true, dimensions:true, holes:true,
             footprint:true, envelope:false, boundingRect:false, warnings:true}
   };
@@ -801,19 +801,21 @@ const SRV = (() => {
      每一种都是"投影面积"的一个成立读法，后端按几何各自算出并带上自己的
      几何、证据、假设。前端只负责展示与切换，不重算任何数字。 */
   const FP_CN = {
-    equipment_union:   {name:"设备几何并集",   short:"并集"},
+    geometry_union:    {name:"已计入几何并集", short:"并集"},
+    enclosing_boundary:{name:"外围闭合边界（语义待确认）", short:"外围边界"},
+    internal_union:    {name:"边界内部几何并集", short:"内部并集"},
     convex_envelope:   {name:"凸包外廓",       short:"凸包"},
     bounding_rectangle:{name:"外接矩形",       short:"外接矩形"},
-    largest_body:      {name:"最大单体",       short:"最大单体"},
     conveyor_footprint:{name:"输送线占地",     short:"输送线"},
     guarded_area:      {name:"安全围栏内面积", short:"围栏"},
     line_footprint:    {name:"整线占地",       short:"整线"}
   };
   const FP_COLOUR = {
-    equipment_union:   "#2C6B62",
+    geometry_union:    "#2C6B62",
+    enclosing_boundary:"#B4802A",
+    internal_union:    "#3E9A8D",
     convex_envelope:   "#5B7C99",
-    bounding_rectangle:"#8A6BA8",
-    largest_body:      "#2C6B62"
+    bounding_rectangle:"#8A6BA8"
   };
   const LAYER_CN = [
     ["source",       "原始图元",   "rgba(74,88,95,.30)"],
@@ -1122,7 +1124,7 @@ const SRV = (() => {
       `${fmtArea(fp.units[unit])}<small>${AREA_LABEL[unit]}</small>`;
     const others = ["mm2","cm2","m2","ft2"].filter(u => u !== unit)
       .map(u => `${fmtArea(fp.units[u])} ${AREA_LABEL[u]}`).join("　·　");
-    const gross = fp.type === "equipment_union" && r.subtract_holes && r.area_pdf_units2.holes > 0
+    const gross = fp.type === "geometry_union" && r.subtract_holes && r.area_pdf_units2.holes > 0
       ? `<br>外轮廓（含孔）${fmtArea(pa.gross[unit])} ${AREA_LABEL[unit]}　·　孔洞 ${fmtArea(pa.holes[unit])} ${AREA_LABEL[unit]}`
       : "";
     $("rcAlt").innerHTML = others + gross;
@@ -1268,7 +1270,7 @@ const SRV = (() => {
     const unit = S.unit;
 
     // 所选定义若已不在结果里（例如只剩一个连通体），退回主定义。
-    if (!interpretations().some(i => i.type === st.fpType)) st.fpType = "equipment_union";
+    if (!interpretations().some(i => i.type === st.fpType)) st.fpType = "geometry_union";
     autoUnit();
     renderFootprints();
     renderMainValue();

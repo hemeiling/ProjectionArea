@@ -495,7 +495,7 @@ def interpretation_table(row: PageRow) -> str:
         "| --- | ---: | ---: | ---: | --- |",
     ]
     union = next(
-        (i for i in row.interpretations if i["type"] == "equipment_union"), None
+        (i for i in row.interpretations if i["type"] == "geometry_union"), None
     )
     base = (union or {}).get("area_units2") or 0.0
     for item in row.interpretations:

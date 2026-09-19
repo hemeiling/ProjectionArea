@@ -1839,15 +1839,25 @@ Each reading carries its own geometry, evidence, confidence, assumptions and
 warnings, so the UI can draw it and a CAD-derived definition can be added without
 touching the area engine.
 
-| `FootprintType` | What it is | Source |
+| `FootprintType` | What it is | Semantics |
 |---|---|---|
-| `equipment_union` | material actually occupied; overlaps counted once, holes removed | geometry |
-| `convex_envelope` | what a crane path or guard enclosure has to clear | geometry |
-| `bounding_rectangle` | floor space to allocate, or the crate to ship it in | geometry |
-| `largest_body` | one machine, when the view holds several | geometry |
-| `conveyor_footprint` | conveying equipment alone | **CAD semantics** |
-| `guarded_area` | the fenced / light-curtain perimeter | **CAD semantics** |
-| `line_footprint` | the whole installation as sited | **CAD semantics** |
+| `geometry_union` | every counted profile, merged; claims nothing about meaning | geometric |
+| `convex_envelope` | what a crane path or guard enclosure has to clear | geometric |
+| `bounding_rectangle` | floor space to allocate, or the crate to ship it in | geometric |
+| `enclosing_boundary` | the largest closed loop — **may** be site, cell, floor or line boundary | **provisional** |
+| `internal_union` | what sits inside that boundary — **may** be the equipment | **provisional** |
+| `conveyor_footprint` | conveying equipment alone | needs **CAD metadata** |
+| `guarded_area` | the fenced / light-curtain perimeter | needs **CAD metadata** |
+| `line_footprint` | the whole installation as sited | needs **CAD metadata** |
+
+**Why `geometry_union` and not `equipment_union`.** Production evidence
+(GLTR-101) settled this: the largest closed loop on a line layout is the *site
+boundary*, not a machine — its bounding rectangle matched the sheet's stated
+13 200 × 75 000 mm exactly. Calling that "equipment" was arithmetically right and
+semantically wrong. `FootprintSemantics` now records how much is actually known:
+`geometric` (the definition makes no claim), `provisional` (a reading that is
+*not* confirmed, shown with its candidate meanings) or `confirmed` (backed by CAD
+metadata or a human). Nothing derived from shape alone is ever `confirmed`.
 
 Every result serialises all of them under `footprint_interpretations`, and the
 three CAD-only readings under `pending_interpretations` — reported as *known and

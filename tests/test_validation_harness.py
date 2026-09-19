@@ -256,8 +256,8 @@ def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path
     row = _validate(drawings["layout_1_100"]["path"], tmp_path)[0]
     by_key = {i["type"]: i for i in row.interpretations}
 
-    assert set(by_key) >= {"equipment_union", "convex_envelope", "bounding_rectangle"}
-    union = by_key["equipment_union"]["area_units2"]
+    assert set(by_key) >= {"geometry_union", "convex_envelope", "bounding_rectangle"}
+    union = by_key["geometry_union"]["area_units2"]
     hull = by_key["convex_envelope"]["area_units2"]
     box = by_key["bounding_rectangle"]["area_units2"]
     assert union < hull < box, (union, hull, box)
@@ -265,7 +265,7 @@ def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path
     # The L-shape is the point: a sparse footprint must not be reported as its box.
     from backend.units import Area
 
-    assert Area(by_key["equipment_union"]["area_mm2"]).to("m2") == pytest.approx(54.46, abs=0.05)
+    assert Area(by_key["geometry_union"]["area_mm2"]).to("m2") == pytest.approx(54.46, abs=0.05)
     assert Area(by_key["bounding_rectangle"]["area_mm2"]).to("m2") == pytest.approx(72.0, abs=0.05)
 
     # Every reading must say what physical region it is — that is the deliverable.
@@ -273,7 +273,8 @@ def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path
         assert item["means"].strip()
         assert item["evidence"], "a reading must record what it was derived from"
         assert item["type"] in {
-            "equipment_union", "convex_envelope", "bounding_rectangle", "largest_body",
+            "geometry_union", "convex_envelope", "bounding_rectangle",
+            "enclosing_boundary", "internal_union",
         }
         assert item["requires_cad_semantics"] is False
 
@@ -286,7 +287,7 @@ def test_a_rectangular_part_fills_its_hull_and_its_box(drawings, tmp_path):
         by_key["bounding_rectangle"]["area_units2"], rel=1e-3
     )
     # Holes mean the union is strictly smaller than the envelope.
-    assert by_key["equipment_union"]["area_units2"] < by_key["bounding_rectangle"]["area_units2"]
+    assert by_key["geometry_union"]["area_units2"] < by_key["bounding_rectangle"]["area_units2"]
 
 
 def test_no_geometry_means_no_interpretations(drawings, tmp_path):
@@ -390,9 +391,12 @@ def test_report_answers_what_physical_region_the_number_is(drawings, tmp_path):
     report = build_report(rows, str(out_dir))
 
     assert "What physical region is this?" in report
-    assert "Union of equipment geometry" in report
+    assert "Union of counted geometry" in report
     assert "Bounding rectangle" in report
     assert "Convex envelope" in report
+    # The primary reading must not claim to be equipment — production evidence
+    # showed the largest closed loop is the site boundary, not a machine.
+    assert "Union of equipment geometry" not in report
     # The overlay legend is what makes stage 7 checkable.
     assert "Overlay legend" in report
     assert "included" in report and "excluded" in report
@@ -418,7 +422,7 @@ def test_every_result_carries_its_interpretations_as_domain_objects(drawings):
         assert item.evidence, "a reading must record what it was derived from"
 
     types = [i.type for i in result.footprint_interpretations]
-    assert types[0] is FootprintType.EQUIPMENT_UNION, "the primary reading comes first"
+    assert types[0] is FootprintType.GEOMETRY_UNION, "the primary reading comes first"
     assert len(types) == len(set(types)), "each reading appears once"
 
 
@@ -433,7 +437,7 @@ def test_the_primary_reading_matches_the_headline_area(drawings):
     result, _prepared, _region = measure_plate(drawings)
     union = next(
         i for i in result.footprint_interpretations
-        if i.type is FootprintType.EQUIPMENT_UNION
+        if i.type is FootprintType.GEOMETRY_UNION
     )
     assert union.area_units2 == result.area_units2
     assert union.area_mm2 == result.area_mm2
@@ -446,7 +450,7 @@ def test_each_interpretation_carries_its_own_geometry_for_an_overlay(drawings):
     result, _prepared, _region = measure_plate(drawings)
     by_type = {i.type: i for i in result.footprint_interpretations}
 
-    union = by_type[FootprintType.EQUIPMENT_UNION]
+    union = by_type[FootprintType.GEOMETRY_UNION]
     assert union.outer and len(union.outer[0]) >= 4
     assert len(union.holes) == 3, "the plate's three holes must be drawable"
 
@@ -483,10 +487,11 @@ def test_the_enum_knows_which_types_need_cad_semantics():
     """The distinction lives on the type, so no caller has to remember it."""
     from backend.models import FootprintType
 
-    assert not FootprintType.EQUIPMENT_UNION.requires_cad_semantics
+    assert not FootprintType.GEOMETRY_UNION.requires_cad_semantics
     assert not FootprintType.CONVEX_ENVELOPE.requires_cad_semantics
     assert not FootprintType.BOUNDING_RECTANGLE.requires_cad_semantics
-    assert not FootprintType.LARGEST_BODY.requires_cad_semantics
+    assert not FootprintType.ENCLOSING_BOUNDARY.requires_cad_semantics
+    assert not FootprintType.INTERNAL_UNION.requires_cad_semantics
     assert FootprintType.CONVEYOR_FOOTPRINT.requires_cad_semantics
     assert FootprintType.GUARDED_AREA.requires_cad_semantics
     assert FootprintType.LINE_FOOTPRINT.requires_cad_semantics

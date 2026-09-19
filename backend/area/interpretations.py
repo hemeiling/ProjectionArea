@@ -28,7 +28,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from shapely.geometry import MultiPoint, Polygon
 from shapely.ops import unary_union
 
-from backend.models import AreaResult, FootprintInterpretation, FootprintType, Point
+from backend.models import (
+    AreaResult,
+    FootprintInterpretation,
+    FootprintSemantics,
+    FootprintType,
+    Point,
+)
 
 #: A ring needs at least this many distinct points to bound anything.
 _MIN_RING = 3
@@ -114,6 +120,12 @@ def _derived_confidence(result: AreaResult) -> Optional[float]:
     return result.confidence.overall if result.confidence else None
 
 
+def _encloses(outer: Polygon, others: Sequence[Polygon]) -> List[Polygon]:
+    """Which of ``others`` lie inside ``outer``'s exterior ring."""
+    shell = Polygon(outer.exterior)
+    return [o for o in others if o is not outer and shell.contains(o.representative_point())]
+
+
 def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
     """Every geometry-derived reading of this result, primary first.
 
@@ -134,12 +146,14 @@ def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
     out: List[FootprintInterpretation] = [
         FootprintInterpretation(
             id="f1",
-            type=FootprintType.EQUIPMENT_UNION,
-            name="Union of equipment geometry",
+            type=FootprintType.GEOMETRY_UNION,
+            name="Union of counted geometry",
             means=(
-                "The material actually occupied by the bodies drawn in the selected "
-                "view, overlaps counted once and enclosed holes removed."
+                "Every closed profile that was counted, overlaps merged and enclosed "
+                "holes removed. A measurement of the linework, making no claim about "
+                "what the linework depicts."
             ),
+            semantics=FootprintSemantics.GEOMETRIC,
             outer=union_outer,
             holes=union_holes,
             area_units2=result.area_units2,
@@ -155,6 +169,105 @@ def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
         )
     ]
 
+    # ── the enclosing boundary, and what sits inside it ──────────────────────
+    #
+    # Production evidence (GLTR-101): the largest closed loop on a line layout is
+    # the site boundary, not a machine — its bounding rectangle matched the
+    # sheet's stated 13 200 x 75 000 mm exactly. Labelling that "equipment" was
+    # arithmetically right and semantically wrong, so both the boundary and its
+    # interior are offered as *candidates* with their possible meanings listed.
+    by_area = sorted(polygons, key=lambda p: p.area, reverse=True)
+    boundary = None
+    contained: List[Polygon] = []
+    for candidate in by_area:
+        inside = _encloses(candidate, polygons)
+        if inside:
+            boundary, contained = candidate, inside
+            break
+
+    if boundary is not None:
+        b_outer, b_holes = _rings(boundary)
+        out.append(
+            FootprintInterpretation(
+                id="f2",
+                type=FootprintType.ENCLOSING_BOUNDARY,
+                name="Enclosing boundary (semantics unconfirmed)",
+                means=(
+                    f"The largest closed loop, which encloses {len(contained)} other "
+                    "bodies. On a line layout this is usually the site or cell "
+                    "boundary rather than equipment — but that cannot be told from "
+                    "shape, so it is offered as a candidate, not a fact."
+                ),
+                semantics=FootprintSemantics.PROVISIONAL,
+                candidate_meanings=[
+                    "site allocation",
+                    "cell envelope",
+                    "floor boundary",
+                    "line boundary",
+                    "a single large machine",
+                ],
+                outer=b_outer,
+                holes=b_holes,
+                area_units2=boundary.area,
+                area_mm2=_to_mm2(boundary.area, result),
+                evidence=[
+                    f"largest closed loop; strictly encloses {len(contained)} other bodies",
+                    f"its bounding rectangle is "
+                    f"{boundary.bounds[2] - boundary.bounds[0]:.2f} x "
+                    f"{boundary.bounds[3] - boundary.bounds[1]:.2f} drawing units",
+                ],
+                confidence=confidence,
+                assumptions=shared_assumptions,
+                warnings=shared_warnings
+                + [
+                    "What this boundary represents is unconfirmed. Confirm it against "
+                    "CAD layer or block metadata, or by selecting it by hand, before "
+                    "using this number for anything."
+                ],
+            )
+        )
+
+        internal = unary_union(contained)
+        i_outer, i_holes = _rings(internal)
+        share = internal.area / boundary.area if boundary.area > 0 else 0.0
+        internal_warnings = list(shared_warnings)
+        if share < 0.05:
+            internal_warnings.append(
+                f"The geometry inside the boundary totals only {share * 100:.1f} % of it. "
+                "On a drawing whose equipment outlines touch or merge into the boundary, "
+                "they are absorbed into that face and cannot be separated here — this "
+                "figure is then a floor, not the equipment area."
+            )
+        out.append(
+            FootprintInterpretation(
+                id="f3",
+                type=FootprintType.INTERNAL_UNION,
+                name="Union of geometry inside that boundary",
+                means=(
+                    f"The {len(contained)} bodies enclosed by the boundary above, merged. "
+                    "Often the equipment, but only CAD metadata can confirm that."
+                ),
+                semantics=FootprintSemantics.PROVISIONAL,
+                candidate_meanings=[
+                    "equipment and machinery",
+                    "internal fixtures",
+                    "annotation drawn inside the boundary",
+                ],
+                outer=i_outer,
+                holes=i_holes,
+                area_units2=internal.area,
+                area_mm2=_to_mm2(internal.area, result),
+                evidence=[
+                    f"union of the {len(contained)} bodies strictly inside the enclosing boundary",
+                    f"{share * 100:.1f} % of the boundary's own area",
+                ],
+                confidence=confidence,
+                assumptions=shared_assumptions,
+                warnings=internal_warnings,
+            )
+        )
+
+    # ── purely geometric envelopes ───────────────────────────────────────────
     points: List[Point] = []
     for component in result.components:
         if component.included:
@@ -165,13 +278,14 @@ def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
         hull_outer, _ = _rings(hull)
         out.append(
             FootprintInterpretation(
-                id="f2",
+                id="f4",
                 type=FootprintType.CONVEX_ENVELOPE,
                 name="Convex envelope",
                 means=(
                     "The smallest convex region containing every counted body — what "
                     "a gantry, crane path or guard enclosure has to clear."
                 ),
+                semantics=FootprintSemantics.GEOMETRIC,
                 outer=hull_outer,
                 area_units2=hull.area,
                 area_mm2=_to_mm2(hull.area, result),
@@ -188,13 +302,14 @@ def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
     if box_area > 0:
         out.append(
             FootprintInterpretation(
-                id="f3",
+                id="f5",
                 type=FootprintType.BOUNDING_RECTANGLE,
                 name="Bounding rectangle",
                 means=(
                     "The axis-aligned rectangle the whole arrangement sits in — the "
                     "floor space to allocate or the crate to ship it in."
                 ),
+                semantics=FootprintSemantics.GEOMETRIC,
                 outer=[[(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)]],
                 area_units2=box_area,
                 area_mm2=_to_mm2(box_area, result),
@@ -206,36 +321,11 @@ def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
                 assumptions=shared_assumptions
                 + [
                     "Axis-aligned to the sheet; a line drawn at an angle will report a "
-                    "larger rectangle than its true minimum."
+                    "larger rectangle than its true minimum.",
+                    "Bounds everything counted, including any annotation that was not "
+                    "demoted — on a sheet whose text is stroked into geometry this "
+                    "inflates the rectangle.",
                 ],
-                warnings=shared_warnings,
-            )
-        )
-
-    parts = sorted(polygons, key=lambda p: p.area, reverse=True)
-    if len(parts) > 1:
-        largest_outer, largest_holes = _rings(parts[0])
-        out.append(
-            FootprintInterpretation(
-                id="f4",
-                type=FootprintType.LARGEST_BODY,
-                name="Largest single body",
-                means=(
-                    f"One machine or assembly of the {len(parts)} disconnected bodies "
-                    "found, in case the view holds several and only one is the subject."
-                ),
-                outer=largest_outer,
-                holes=largest_holes,
-                area_units2=parts[0].area,
-                area_mm2=_to_mm2(parts[0].area, result),
-                evidence=[
-                    f"largest of {len(parts)} connected components",
-                    f"the other {len(parts) - 1} contribute "
-                    f"{sum(p.area for p in parts[1:]):.2f} units² between them",
-                ],
-                confidence=confidence,
-                assumptions=shared_assumptions
-                + ["Assumes the other bodies are not part of the subject."],
                 warnings=shared_warnings,
             )
         )

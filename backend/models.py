@@ -96,11 +96,15 @@ class FootprintType(str, Enum):
     produced by a semantics-aware source (§7 — no guessing).
     """
 
-    # Derivable from geometry alone.
-    EQUIPMENT_UNION = "equipment_union"
+    # Purely geometric: the definition makes no claim about what the shape *is*.
+    GEOMETRY_UNION = "geometry_union"
     CONVEX_ENVELOPE = "convex_envelope"
     BOUNDING_RECTANGLE = "bounding_rectangle"
-    LARGEST_BODY = "largest_body"
+
+    # Geometric constructions that invite a semantic reading, and must not be
+    # given one without evidence. See FootprintSemantics.PROVISIONAL.
+    ENCLOSING_BOUNDARY = "enclosing_boundary"
+    INTERNAL_UNION = "internal_union"
 
     # Require CAD semantics; never inferred from shape.
     CONVEYOR_FOOTPRINT = "conveyor_footprint"
@@ -120,6 +124,28 @@ _CAD_SEMANTIC_FOOTPRINTS = frozenset(
         FootprintType.LINE_FOOTPRINT,
     }
 )
+
+
+class FootprintSemantics(str, Enum):
+    """How much is actually known about what a measured region *means*.
+
+    Production evidence forced this distinction. On a manufacturing-line layout
+    the largest closed loop is the site boundary, not a machine — so a reading
+    can be arithmetically exact and semantically wrong. Naming that gap is the
+    difference between a measurement and a claim (§3, §30).
+    """
+
+    #: The definition is purely geometric and asserts nothing about meaning.
+    #: "The union of the counted geometry" is true whatever the geometry depicts.
+    GEOMETRIC = "geometric"
+
+    #: A geometric construction that suggests a physical meaning which has NOT
+    #: been confirmed. Shown with its candidate readings, never as a fact.
+    PROVISIONAL = "provisional"
+
+    #: Backed by CAD metadata (layer, block, linetype) or by a human confirming
+    #: it. Nothing produced from shape alone reaches this.
+    CONFIRMED = "confirmed"
 
 
 @dataclass
@@ -151,6 +177,9 @@ class FootprintInterpretation:
     type: FootprintType
     name: str
     means: str
+    semantics: "FootprintSemantics" = None  # type: ignore[assignment]
+    #: Physical regions this geometry *might* be, when semantics is PROVISIONAL.
+    candidate_meanings: List[str] = field(default_factory=list)
     outer: List[List[Point]] = field(default_factory=list)
     holes: List[List[Point]] = field(default_factory=list)
     area_units2: float = 0.0
@@ -175,6 +204,10 @@ class FootprintInterpretation:
             "type": self.type.value,
             "name": self.name,
             "means": self.means,
+            "semantics": (self.semantics or FootprintSemantics.GEOMETRIC).value,
+            "provisional": (self.semantics or FootprintSemantics.GEOMETRIC)
+            is FootprintSemantics.PROVISIONAL,
+            "candidate_meanings": list(self.candidate_meanings),
             "area_units2": self.area_units2,
             "area_mm2": self.area_mm2,
             "units": Area(self.area_mm2).as_dict() if self.area_mm2 is not None else None,

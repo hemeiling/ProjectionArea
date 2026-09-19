@@ -366,7 +366,7 @@ def test_a_demo_runs_the_real_pipeline_rather_than_returning_a_stored_answer(cli
         assert area["confidence"]["percent"] >= 80
         # And it carries the interpretations the UI is built on.
         types = [i["type"] for i in area["footprint_interpretations"]]
-        assert "equipment_union" in types and "bounding_rectangle" in types
+        assert "geometry_union" in types and "bounding_rectangle" in types
         assert [p["type"] for p in area["pending_interpretations"]] == [
             "conveyor_footprint", "guarded_area", "line_footprint",
         ]
