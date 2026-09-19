@@ -12,3 +12,4 @@ pillow>=10.0
 pytest>=8.0
 httpx>=0.27                  # FastAPI TestClient
 playwright>=1.40             # optional: browser smoke test, skipped if absent
+ezdxf>=1.4

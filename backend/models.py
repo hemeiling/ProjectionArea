@@ -60,6 +60,10 @@ class ScaleSource(str, Enum):
     """Where a physical scale came from, weakest last. §4, §10."""
 
     USER_TWO_POINT = "user_two_point_calibration"
+    #: The CAD file states its own units ($INSUNITS), so the scale is read, not
+    #: inferred. Stronger than any measurement of the drawing, because nothing
+    #: was measured — which is the central advantage of the CAD path.
+    CAD_UNITS = "cad_declared_units"
     DIMENSION_CONSENSUS = "dimension_consensus"
     SINGLE_DIMENSION = "single_dimension"
     DRAWING_RATIO = "drawing_scale_ratio"

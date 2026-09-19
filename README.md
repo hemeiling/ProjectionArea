@@ -1451,14 +1451,14 @@ Or a whole set, with a comparison table and an overlay per page:
 Tests:
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 140 tests, ~42 s
+.venv/bin/python -m pytest tests -q      # 155 tests, ~40 s
 ```
 
 Seven of those drive the real page in Chromium — the demo click-through, the
 three footprint readings and the overlay switching between them, the layer
 toggles, Explain Calculation, and the refusal path. They try the bundled
 headless shell, then the bundled Chromium, then a system Chrome, and skip only if
-none exists. The other 133 run in about a second.
+none exists. The other 147 run in about a second.
 
 ---
 
@@ -1759,10 +1759,11 @@ Backend   FastAPI
             api/             routes + request schemas
             pdf/space.py     canonical page space, /Rotate normalisation
             demo/            synthetic drawings + the demo catalogue
+            cad/             DXF source adapter, provenance-preserving
 run.py      one-command launcher — serves viewer + API, pre-builds demos
 tools/      audit_overlay.py    headless overlay renderer, one page
             validate_drawings.py whole-set validation harness + report
-tests/      133 unit/integration + 7 browser tests
+tests/      147 unit/integration + 8 browser tests
 ```
 
 ### Why this stack
@@ -1931,6 +1932,41 @@ where, with what evidence · what was repaired and by how much · how confident,
 which component drove that · what was assumed.
 
 ---
+
+## The CAD path (DXF)
+
+The production PDFs are "Microsoft Print to PDF" exports: geometry and nothing
+else. No text layer, no layers, no blocks — every character stroked into line
+segments. The engine measures their linework correctly and then, correctly,
+refuses to report millimetres, because there is no dimension text to calibrate
+from. That makes the PDF a **visual-validation and fallback path**, not the
+authoritative source.
+
+`backend/cad/` reads DXF instead, and keeps what the PDF destroyed:
+
+| Preserved | Why it matters |
+|---|---|
+| `$INSUNITS` declared units | the scale is **read, not inferred** — `ScaleSource.CAD_UNITS` |
+| layer name, colour, linetype | the raw material of every semantic rule |
+| block name and nesting path | a machine is usually one block, its parts blocks within it |
+| INSERT transforms | the placement is reproducible |
+| entity handle | a finding can be taken back to the drawing |
+| original coordinates | §15 — the placed points never overwrite the source ones |
+| TEXT / MTEXT / ATTRIB | station labels and titles, with their layers |
+| DIMENSION entities | the file **states** what it measures; no matching, no OCR |
+| XREF flags and paths | external references are visible, not silently inlined |
+
+Blocks are exploded so the geometry is usable, but nothing is flattened away:
+every primitive carries a `CadProvenance`. Curves are sampled finely and
+LWPOLYLINE bulges expand into real arcs rather than chords.
+
+**No production rules live in the adapter.** It never decides that a layer called
+`FENCE` is a safety perimeter. That rule has to be written against real drawings
+with evidence, and a test asserts the adapter assigns no semantic role at all.
+
+A `.dwg` is refused by signature with the instruction that actually helps — there
+is no pure-Python DWG reader, so export DXF from AutoCAD or convert with the ODA
+File Converter.
 
 ## Known limitations
 
