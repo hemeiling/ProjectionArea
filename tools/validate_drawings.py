@@ -46,9 +46,15 @@ import fitz
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.area.interpretations import (
+    body_breakdown,
+    bounding_extent,
+    interpretations,
+)
 from backend.models import AreaResult, BBox, ViewSource
 from backend.pdf.document import document_summary
 from backend.pipeline import prepare_page, region_scale
+from backend.units import Area
 from tools.audit_overlay import draw_overlay
 
 #: Files whose first bytes are not "%PDF" never reach PyMuPDF — saying so is far
@@ -67,10 +73,16 @@ class PageRow:
     drawing_type: str = ""
     view_label: str = ""
     scale_text: str = "—"
+    source: str = "PDF"
+    area_units2: Optional[float] = None
     area_mm2: Optional[float] = None
+    bounding_width_mm: Optional[float] = None
+    bounding_height_mm: Optional[float] = None
     bounding_area_mm2: Optional[float] = None
     utilization: Optional[float] = None
     confidence: Optional[float] = None
+    interpretations: List[Dict[str, Any]] = field(default_factory=list)
+    bodies: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     stages: Dict[str, Any] = field(default_factory=dict)
@@ -99,6 +111,79 @@ def _scale_text(result: AreaResult) -> str:
     return f"{result.scale.mm_per_unit:.6f} mm/unit {ratio}".strip()
 
 
+def _count_kinds(regions: Sequence[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for region in regions:
+        counts[region.kind] = counts.get(region.kind, 0) + 1
+    return counts
+
+
+def _title_block_ambiguity(prepared: Any, result: AreaResult) -> Optional[Dict[str, Any]]:
+    """Flag the known bottom-right / title-block confusion when it shows up.
+
+    `_classify_region` calls any bottom-right cluster carrying >= 2 text spans a
+    title block, and its `sparse` ink guard does not discriminate (README
+    limitation 6). On a real layout sheet that can hide a genuine view. Two
+    symptoms are worth reporting, and neither is inferred from shape alone:
+
+    * a cluster labelled `title_block` that carries a *lot* of linework, so it
+      may be a view that merely sits in the corner;
+    * more than one `title_block` on the page, which no sheet has.
+
+    Returns None when nothing looks ambiguous. This only ever *reports* — the
+    classifier is left alone until real drawings say how to change it.
+    """
+    blocks = [r for r in prepared.regions if r.kind == "title_block"]
+    if not blocks:
+        return None
+
+    primitives = prepared.analysis.primitives
+    findings: List[Dict[str, Any]] = []
+    for block in blocks:
+        inside = [
+            p
+            for p in primitives
+            if block.bbox.x0 <= p.bbox.center[0] <= block.bbox.x1
+            and block.bbox.y0 <= p.bbox.center[1] <= block.bbox.y1
+        ]
+        ink = sum(p.length for p in inside)
+        perimeter = max(2 * (block.bbox.width + block.bbox.height), 1e-9)
+        findings.append(
+            {
+                "region_id": block.id,
+                "label": block.label,
+                "primitives_inside": len(inside),
+                "ink_units": round(ink, 1),
+                "ink_ratio": round(ink / perimeter, 3),
+                "area_share_of_page": round(
+                    block.bbox.area / max(prepared.analysis.page_bbox.area, 1e-9), 4
+                ),
+            }
+        )
+
+    suspicious = [f for f in findings if f["primitives_inside"] >= 20]
+    if not suspicious and len(blocks) <= 1:
+        return None
+
+    return {
+        "reason": (
+            "more than one region was called a title block"
+            if len(blocks) > 1
+            else "a region called a title block carries a lot of linework, so it may be "
+            "a view that happens to sit in the bottom-right corner"
+        ),
+        "regions": findings,
+        "measured_region_was_a_title_block": any(
+            b.label == result.view_label for b in blocks
+        ),
+        "note": (
+            "Known limitation: the classifier's `sparse` ink guard does not "
+            "discriminate (threshold 2.5; a plain plate scores 1.108). Reported, "
+            "not corrected — select the region manually to override."
+        ),
+    }
+
+
 def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
     """The per-stage trace: what each step of the pipeline produced."""
     analysis = prepared.analysis
@@ -119,6 +204,10 @@ def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
             "role_counts": dict(sorted(prepared.role_counts.items())),
             "text_spans": len(analysis.text_items),
             "dimension_texts": len(analysis.dimension_texts),
+            # Counted vs set aside, the split that decides the area.
+            "counted_primitives": result.geometry.profile_primitive_count,
+            "excluded_primitives": result.geometry.ignored_primitive_count,
+            "unresolved_primitives": prepared.role_counts.get("uncertain", 0),
         },
         "scale": {
             "source": result.scale.source.value,
@@ -129,10 +218,20 @@ def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
         },
         "candidate_footprint": {
             "regions": [
-                {"id": r.id, "label": r.label, "kind": r.kind} for r in prepared.regions
+                {
+                    "id": r.id,
+                    "label": r.label,
+                    "kind": r.kind,
+                    "bbox": [round(v, 1) for v in (r.bbox.x0, r.bbox.y0, r.bbox.x1, r.bbox.y1)],
+                    "width_pt": round(r.bbox.width, 1),
+                    "height_pt": round(r.bbox.height, 1),
+                }
+                for r in prepared.regions
             ],
+            "regions_by_kind": _count_kinds(prepared.regions),
             "measured": result.view_label,
             "source": result.view_source.value,
+            "title_block_ambiguity": _title_block_ambiguity(prepared, result),
         },
         "union_polygon": {
             "components": result.geometry.component_count,
@@ -150,7 +249,12 @@ def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
             "mm2": result.area_mm2,
             "gross_mm2": result.gross_area_mm2,
             "hole_mm2": result.hole_area_mm2,
+            "in_units": (
+                Area(result.area_mm2).as_dict() if result.area_mm2 is not None else None
+            ),
         },
+        "interpretations": [i.as_dict() for i in interpretations(result)],
+        "bodies": body_breakdown(result),
         "confidence": {
             "overall": result.confidence.overall,
             "band": result.confidence.band,
@@ -206,11 +310,20 @@ def measure_page(
 
     box = profile_bbox(result)
     bounding_mm2 = None
+    bounding_w_mm = None
+    bounding_h_mm = None
     utilization = None
     if box is not None and result.scale.verified:
-        bounding_mm2 = box.area * (result.scale.mm_per_unit ** 2)
+        mm_per_unit = result.scale.mm_per_unit
+        extent = bounding_extent(result)
+        if extent is not None:
+            bounding_w_mm = extent[0] * mm_per_unit
+            bounding_h_mm = extent[1] * mm_per_unit
+        bounding_mm2 = box.area * (mm_per_unit ** 2)
         if bounding_mm2 > 0 and result.area_mm2 is not None:
             utilization = result.area_mm2 / bounding_mm2
+
+    stages = _stage_record(prepared, result)
 
     return PageRow(
         file_name=file_name,
@@ -220,13 +333,19 @@ def measure_page(
         drawing_type=result.drawing_type.value,
         view_label=result.view_label,
         scale_text=_scale_text(result),
+        source="PDF",
+        area_units2=result.area_units2,
         area_mm2=result.area_mm2,
+        bounding_width_mm=bounding_w_mm,
+        bounding_height_mm=bounding_h_mm,
         bounding_area_mm2=bounding_mm2,
         utilization=utilization,
         confidence=result.confidence.overall,
         warnings=list(result.warnings),
         assumptions=list(result.assumptions),
-        stages=_stage_record(prepared, result),
+        stages=stages,
+        interpretations=stages.get("interpretations", []),
+        bodies=stages.get("bodies", []),
         overlay_path=overlay_path,
         json_path=json_path,
     )
@@ -323,30 +442,127 @@ def _fmt_area(value: Optional[float]) -> str:
     return f"{value:,.1f} mm²"
 
 
-def comparison_table(rows: Sequence[PageRow]) -> str:
-    """The requested comparison table, as GitHub-flavoured Markdown."""
-    header = (
-        "| Drawing | Page | Detected Scale/Units | Projected Area | Bounding Area "
-        "| Utilization | Confidence | Warnings |\n"
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | --- |"
-    )
-    lines = [header]
+def _m2(value_mm2: Optional[float]) -> str:
+    return "—" if value_mm2 is None else f"{Area(value_mm2).to('m2'):,.4f}"
+
+
+def _major_warning(row: PageRow) -> str:
+    """The single warning that most affects trust in the number."""
+    if row.status == "blocked":
+        return row.detail
+    if row.status == "refused":
+        return "scale not verified — no physical area reported"
+    ambiguity = (row.stages.get("candidate_footprint") or {}).get("title_block_ambiguity")
+    if ambiguity and ambiguity.get("measured_region_was_a_title_block"):
+        return "measured region was classified as a title block"
+    if ambiguity:
+        return f"title-block ambiguity: {ambiguity['reason']}"
+    if row.warnings:
+        first = row.warnings[0].split("\n")[0]
+        return first[:120] + ("…" if len(first) > 120 else "")
+    return "none"
+
+
+def summary_table(rows: Sequence[PageRow]) -> str:
+    """The milestone deliverable table."""
+    lines = [
+        "| Drawing | Source | Selected View | Scale/Units | Projected Area m² "
+        "| Bounding Area m² | Utilization | Confidence | Major Warning |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
     for row in rows:
         if row.status in ("blocked", "failed"):
             lines.append(
-                f"| {row.file_name} | {row.page or '—'} | **{row.status.upper()}** | — | — | — | — "
-                f"| {row.detail} |"
+                f"| {row.file_name} | {row.source} | — | **{row.status.upper()}** "
+                f"| — | — | — | — | {_major_warning(row)} |"
             )
             continue
-        warnings = f"{len(row.warnings)}" if row.warnings else "none"
-        if row.status == "refused":
-            warnings = f"{warnings} · scale not verified"
         lines.append(
-            f"| {row.file_name} | {row.page} | {row.scale_text} | {_fmt_area(row.area_mm2)} "
-            f"| {_fmt_area(row.bounding_area_mm2)} "
+            f"| {row.file_name} p{row.page} | {row.source} | {row.view_label} "
+            f"| {row.scale_text} | {_m2(row.area_mm2)} | {_m2(row.bounding_area_mm2)} "
             f"| {f'{row.utilization * 100:.1f} %' if row.utilization is not None else '—'} "
             f"| {f'{row.confidence * 100:.0f} %' if row.confidence is not None else '—'} "
-            f"| {warnings} |"
+            f"| {_major_warning(row)} |"
+        )
+    return "\n".join(lines)
+
+
+def comparison_table(rows: Sequence[PageRow]) -> str:
+    """Full per-page table, with every unit the milestone asks for."""
+    columns = (
+        "Drawing", "Page", "Detected Scale/Units", "Projected Area", "native units²",
+        "m²", "ft²", "Bounding W×H", "Bounding Area", "Utilization", "Confidence",
+        "Warnings",
+    )
+    align = ("---", "---:", "---", "---:", "---:", "---:", "---:", "---:", "---:",
+             "---:", "---:", "---")
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join(align) + " |"]
+
+    for row in rows:
+        if row.status in ("blocked", "failed"):
+            cells = [row.file_name, str(row.page or "—"), f"**{row.status.upper()}**"]
+            cells += ["—"] * 8 + [row.detail]
+            lines.append("| " + " | ".join(cells) + " |")
+            continue
+
+        area = Area(row.area_mm2) if row.area_mm2 is not None else None
+        warnings = f"{len(row.warnings)}" if row.warnings else "none"
+        if row.status == "refused":
+            warnings += " · scale not verified"
+
+        cells = [
+            row.file_name,
+            str(row.page),
+            row.scale_text,
+            _fmt_area(row.area_mm2),
+            f"{row.area_units2:,.2f}" if row.area_units2 is not None else "—",
+            f"{area.to('m2'):,.4f}" if area else "—",
+            f"{area.to('ft2'):,.2f}" if area else "—",
+            (
+                f"{row.bounding_width_mm:,.1f} × {row.bounding_height_mm:,.1f} mm"
+                if row.bounding_width_mm is not None
+                else "—"
+            ),
+            _fmt_area(row.bounding_area_mm2),
+            f"{row.utilization * 100:.1f} %" if row.utilization is not None else "—",
+            f"{row.confidence * 100:.0f} %" if row.confidence is not None else "—",
+            warnings,
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def interpretation_table(row: PageRow) -> str:
+    """Every defensible reading of this drawing's projected area, side by side.
+
+    The milestone's central question — *what physical region does this number
+    represent?* — has more than one answer on a line-layout sheet, so the answers
+    are shown together rather than one being chosen silently (§30).
+    """
+    if not row.interpretations:
+        return "_No geometry was reconstructed, so there is no region to interpret._"
+
+    lines = [
+        "| Interpretation | Area m² | Area ft² | vs union | What physical region it is |",
+        "| --- | ---: | ---: | ---: | --- |",
+    ]
+    union = next(
+        (i for i in row.interpretations if i["key"] == "equipment_union"), None
+    )
+    base = (union or {}).get("area_units2") or 0.0
+    for item in row.interpretations:
+        mm2 = item["area_mm2"]
+        area = Area(mm2) if mm2 is not None else None
+        ratio = (
+            f"{item['area_units2'] / base * 100:.1f} %"
+            if base > 0 and item["area_units2"] is not None
+            else "—"
+        )
+        square_metres = f"{area.to('m2'):,.4f}" if area else "—"
+        square_feet = f"{area.to('ft2'):,.2f}" if area else "—"
+        lines.append(
+            f"| **{item['label']}** | {square_metres} | {square_feet} "
+            f"| {ratio} | {item['means']} |"
         )
     return "\n".join(lines)
 
@@ -362,27 +578,90 @@ def detail_section(row: PageRow) -> str:
     geometry = stages["geometry_extraction"]
     union = stages["union_polygon"]
     out += [
-        f"- **source** — {stages['source']['drawing_type']}, "
+        f"- **1 ingestion** — {stages['source']['drawing_type']}, "
         f"{stages['source']['page_size_pt'][0]} × {stages['source']['page_size_pt'][1]} pt, "
-        f"rotation {stages['source']['rotation']}, sheet unit {stages['source']['sheet_unit'] or 'not declared'}",
-        f"- **geometry extraction** — {geometry['primitives']} primitives "
-        f"{geometry['role_counts']}, {geometry['dimension_texts']} dimension annotations",
-        f"- **scale** — {stages['scale']['source']} ({'verified' if stages['scale']['verified'] else 'NOT verified'}); "
-        f"{stages['scale']['detail']}",
-        f"- **candidate footprint** — measured {row.view_label!r} "
+        f"rotation {stages['source']['rotation']}, sheet unit "
+        f"{stages['source']['sheet_unit'] or 'not declared'}, printed scale "
+        f"{stages['source']['printed_scale'] or 'none found'}",
+        f"- **2 scale / units** — {stages['scale']['source']} "
+        f"({'verified' if stages['scale']['verified'] else 'NOT verified'}), "
+        f"{stages['scale']['candidates']} candidate(s) from "
+        f"{geometry['dimension_texts']} dimension annotation(s); {stages['scale']['detail']}",
+        f"- **3 region detection** — measured {row.view_label!r} "
         f"({stages['candidate_footprint']['source']}) of "
-        f"{len(stages['candidate_footprint']['regions'])} candidate regions",
-        f"- **union polygon** — {union['components']} component(s), "
-        f"{union['outer_contours']} outer, {union['holes']} hole(s), method {union['method']}",
-        f"- **projected area** — {_fmt_area(row.area_mm2)}"
-        + (f" ({row.detail})" if row.status == "refused" else ""),
-        f"- **bounding area / utilization** — {_fmt_area(row.bounding_area_mm2)}"
-        + (f" · {row.utilization * 100:.1f} %" if row.utilization is not None else ""),
+        f"{len(stages['candidate_footprint']['regions'])} regions "
+        f"{stages['candidate_footprint']['regions_by_kind']}",
+        f"- **4 classification** — {geometry['primitives']} primitives: "
+        f"{geometry['counted_primitives']} counted, {geometry['excluded_primitives']} excluded, "
+        f"{geometry['unresolved_primitives']} unresolved · by role {geometry['role_counts']} "
+        f"· {geometry['text_spans']} text spans",
+        f"- **5 area construction** — {union['components']} component(s), "
+        f"{union['outer_contours']} outer ring(s), {union['holes']} hole(s), "
+        f"{union['faces']} face(s), method {union['method']}, "
+        f"{len(union['repairs'])} repair(s)",
+        f"- **6 results** — {_fmt_area(row.area_mm2)}"
+        + (f" ({row.detail})" if row.status == "refused" else "")
+        + (
+            f" · bounding {row.bounding_width_mm:,.1f} × {row.bounding_height_mm:,.1f} mm"
+            if row.bounding_width_mm is not None
+            else ""
+        )
+        + (f" · utilization {row.utilization * 100:.1f} %" if row.utilization is not None else ""),
         f"- **confidence** — {stages['confidence']['overall'] * 100:.0f} % "
         f"({stages['confidence']['band']}) {stages['confidence']['components']}",
-        f"- **overlay** — `{row.overlay_path}`",
+        f"- **7 visual QA** — `{row.overlay_path}`",
         "",
     ]
+    if stages["candidate_footprint"]["regions"]:
+        out += [
+            "| Region | Kind | Size pt | Measured |",
+            "| --- | --- | ---: | :-: |",
+        ]
+        for region in stages["candidate_footprint"]["regions"]:
+            measured = "✓" if region["label"] == row.view_label else ""
+            out.append(
+                f"| {region['id']} {region['label']} | {region['kind']} "
+                f"| {region['width_pt']:,.0f} × {region['height_pt']:,.0f} | {measured} |"
+            )
+        out.append("")
+    out += ["**What physical region is this?**", "", interpretation_table(row), ""]
+
+    if row.bodies and len(row.bodies) > 1:
+        out += [
+            f"**Bodies found ({len(row.bodies)})** — several disconnected silhouettes may "
+            "be one installation or several; listed so any subset can be summed.",
+            "",
+            "| Body | Included | Area m² | W × H mm | Holes |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ]
+        for body in row.bodies[:12]:
+            body_m2 = _m2(body["area_mm2"])
+            out.append(
+                f"| {body['id']} | {'yes' if body['included'] else 'no'} | {body_m2} "
+                f"| {body['width_units']:,.1f} × {body['height_units']:,.1f} (units) "
+                f"| {body['hole_count']} |"
+            )
+        if len(row.bodies) > 12:
+            out.append(f"| … {len(row.bodies) - 12} more | | | | |")
+        out.append("")
+
+    ambiguity = stages["candidate_footprint"].get("title_block_ambiguity")
+    if ambiguity:
+        out += [
+            "**⚠ Title-block ambiguity**",
+            "",
+            f"- {ambiguity['reason']}",
+            f"- measured region was itself classified a title block: "
+            f"**{ambiguity['measured_region_was_a_title_block']}**",
+        ]
+        for finding in ambiguity["regions"]:
+            out.append(
+                f"- `{finding['region_id']}` {finding['label']}: "
+                f"{finding['primitives_inside']} primitives, ink ratio "
+                f"{finding['ink_ratio']}, {finding['area_share_of_page'] * 100:.1f} % of the page"
+            )
+        out += [f"- {ambiguity['note']}", ""]
+
     if union["repairs"]:
         out.append("**Repairs**")
         out += [f"- {r['type']} ×{r['count']}: {r['detail']}" for r in union["repairs"]]
@@ -407,6 +686,19 @@ def build_report(rows: Sequence[PageRow], out_dir: str) -> str:
     out = [
         "# Real-drawing validation",
         "",
+        "**Overlay legend** — every overlay PNG uses one palette (§8):",
+        "",
+        "| Colour | Meaning |",
+        "| --- | --- |",
+        "| grey, thin | source geometry that was **excluded** — dimensions, annotation, sheet frame, hatching |",
+        "| orange, thin | **unresolved** geometry: counted, but the classifier was unsure |",
+        "| green outline + fill | **included** geometry — the final projected-area boundary |",
+        "| red outline + fill | **holes** subtracted from the area |",
+        "| amber dashed box | the **selected view / region** that was measured |",
+        "",
+        "Geometry drawn in no colour at all was not seen by the engine — that is",
+        "itself a finding, and the overlay is the place it shows up.",
+        "",
         f"Generated {stamp} · {len(rows)} page(s): "
         f"{len(measured)} measured, {len(refused)} refused for want of a verified scale, "
         f"{len(blocked)} blocked.",
@@ -414,11 +706,19 @@ def build_report(rows: Sequence[PageRow], out_dir: str) -> str:
         "Every number below is produced by the same backend the viewer calls, and every",
         "row links an overlay PNG showing exactly which geometry was counted (§8).",
         "",
-        "## Comparison",
+        "## Summary",
+        "",
+        summary_table(rows),
+        "",
+        "## All units and bounding extents",
         "",
         comparison_table(rows),
         "",
         "## Evidence per drawing",
+        "",
+        "Each drawing below is validated stage by stage: ingestion, scale and units,",
+        "view/region detection, geometry classification, area construction, results,",
+        "and the overlay for visual QA.",
         "",
     ]
     out += [detail_section(row) for row in rows]

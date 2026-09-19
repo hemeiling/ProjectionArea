@@ -184,8 +184,21 @@ def test_report_carries_every_requested_column_and_the_evidence(drawings, tmp_pa
     ):
         assert column in report, f"missing column {column!r}"
 
-    for stage in ("geometry extraction", "scale", "candidate footprint", "union polygon"):
-        assert stage in report
+    # The seven milestone stages are each reported, and in order.
+    stages = (
+        "1 ingestion",
+        "2 scale / units",
+        "3 region detection",
+        "4 classification",
+        "5 area construction",
+        "6 results",
+        "7 visual QA",
+    )
+    for stage in stages:
+        assert stage in report, f"missing stage {stage!r}"
+    first_drawing = report[report.index("### "):]
+    positions = [first_drawing.index(stage) for stage in stages]
+    assert positions == sorted(positions), f"stages out of order: {positions}"
     assert os.path.exists(out_dir / "REPORT.md")
 
 
@@ -198,3 +211,157 @@ def test_collect_pdfs_expands_a_directory_and_ignores_other_files(tmp_path):
     found = [os.path.basename(p) for p in collect_pdfs([str(tmp_path)])]
     assert sorted(found) == ["a.pdf", "b.PDF"]
     assert "c.dwg" not in found, "DWG needs a CAD adapter, not the PDF pipeline"
+
+
+# ── footprint interpretations ────────────────────────────────────────────────
+#
+# Exercises backend/area/interpretations.py through real results. On a line
+# layout "projected area" has several defensible readings, and §30 forbids
+# picking one silently — so all of them are computed and named.
+
+
+def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path):
+    """For an L-shaped plan the three readings must differ, and in this order.
+
+    Union ⊆ convex hull ⊆ bounding rectangle is a geometric fact; if the code
+    ever reports otherwise, something is wrong with the hull or the bounds.
+    """
+    row = _validate(drawings["layout_1_100"]["path"], tmp_path)[0]
+    by_key = {i["key"]: i for i in row.interpretations}
+
+    assert set(by_key) >= {"equipment_union", "convex_hull", "bounding_rectangle"}
+    union = by_key["equipment_union"]["area_units2"]
+    hull = by_key["convex_hull"]["area_units2"]
+    box = by_key["bounding_rectangle"]["area_units2"]
+    assert union < hull < box, (union, hull, box)
+
+    # The L-shape is the point: a sparse footprint must not be reported as its box.
+    from backend.units import Area
+
+    assert Area(by_key["equipment_union"]["area_mm2"]).to("m2") == pytest.approx(54.46, abs=0.05)
+    assert Area(by_key["bounding_rectangle"]["area_mm2"]).to("m2") == pytest.approx(72.0, abs=0.05)
+
+    # Every reading must say what physical region it is — that is the deliverable.
+    for item in row.interpretations:
+        assert item["means"].strip()
+        assert item["basis"].strip()
+
+
+def test_a_rectangular_part_fills_its_hull_and_its_box(drawings, tmp_path):
+    """The sanity case: for a rectangle, hull and bounding box coincide."""
+    row = _validate(drawings["plate_with_holes"]["path"], tmp_path)[0]
+    by_key = {i["key"]: i for i in row.interpretations}
+    assert by_key["convex_hull"]["area_units2"] == pytest.approx(
+        by_key["bounding_rectangle"]["area_units2"], rel=1e-3
+    )
+    # Holes mean the union is strictly smaller than the envelope.
+    assert by_key["equipment_union"]["area_units2"] < by_key["bounding_rectangle"]["area_units2"]
+
+
+def test_no_geometry_means_no_interpretations(drawings, tmp_path):
+    """§3: nothing reconstructed is not a region of area zero."""
+    row = _validate(drawings["raster_plate"]["path"], tmp_path)[0]
+    assert row.area_mm2 is None
+    for item in row.interpretations:
+        assert item["area_mm2"] is None, "an unverified scale cannot yield mm²"
+
+
+def test_bounding_extent_is_reported_in_millimetres(drawings, tmp_path):
+    """The 200 × 120 mm plate must report exactly that, not its page extent."""
+    row = _validate(drawings["plate_with_holes"]["path"], tmp_path)[0]
+    assert row.bounding_width_mm == pytest.approx(200.0, abs=1.0)
+    assert row.bounding_height_mm == pytest.approx(120.0, abs=1.0)
+    assert row.bounding_width_mm * row.bounding_height_mm == pytest.approx(
+        row.bounding_area_mm2, rel=1e-6
+    )
+
+
+def test_bodies_are_listed_largest_first_with_their_own_extents(drawings, tmp_path):
+    row = _validate(drawings["plate_with_holes"]["path"], tmp_path)[0]
+    assert row.bodies
+    areas = [b["area_units2"] for b in row.bodies]
+    assert areas == sorted(areas, reverse=True)
+    assert row.bodies[0]["hole_count"] == 3
+    assert row.bodies[0]["width_units"] > 0 and row.bodies[0]["height_units"] > 0
+
+
+# ── the title-block ambiguity, reported and not corrected ────────────────────
+
+
+def test_title_block_ambiguity_is_flagged_when_a_dense_cluster_is_labelled_one(
+    drawings, tmp_path
+):
+    """A /Rotate 180 sheet displays upside-down, so the part lands bottom-right.
+
+    `_classify_region` then calls the part a title block. The harness must *say
+    so* loudly rather than quietly measuring the wrong region — the classifier
+    itself is deliberately left untouched until real drawings say how to fix it.
+    """
+    from tests.fixtures import build_rotated_plate
+
+    upside_down = build_rotated_plate(
+        str(tmp_path / "rot180.pdf"), drawings["plate_with_holes"]["path"], 180
+    )
+    row = _validate(upside_down["path"], tmp_path)[0]
+
+    ambiguity = row.stages["candidate_footprint"]["title_block_ambiguity"]
+    assert ambiguity is not None, "the known title-block confusion went unreported"
+    assert "corner" in ambiguity["reason"] or "title block" in ambiguity["reason"]
+    dense = [r for r in ambiguity["regions"] if r["primitives_inside"] >= 20]
+    assert dense, "the part-sized cluster labelled a title block was not identified"
+    assert "not corrected" in ambiguity["note"]
+
+    # It must reach the summary table, where a reader will actually see it.
+    from tools.validate_drawings import summary_table
+
+    assert "title-block" in summary_table([row]) or "title block" in summary_table([row])
+
+
+def test_an_ordinary_sheet_reports_no_ambiguity(drawings, tmp_path):
+    """The flag must not cry wolf on a normal drawing."""
+    row = _validate(drawings["plate_with_holes"]["path"], tmp_path)[0]
+    assert row.stages["candidate_footprint"]["title_block_ambiguity"] is None
+
+
+# ── the deliverable table ────────────────────────────────────────────────────
+
+
+def test_summary_table_has_exactly_the_requested_columns(drawings, tmp_path):
+    from tools.validate_drawings import summary_table
+
+    rows = _validate(drawings["plate_with_holes"]["path"], tmp_path)
+    table = summary_table(rows)
+    for column in (
+        "Drawing", "Source", "Selected View", "Scale/Units", "Projected Area m²",
+        "Bounding Area m²", "Utilization", "Confidence", "Major Warning",
+    ):
+        assert column in table, f"missing column {column!r}"
+    assert "PDF" in table, "the measurement path must be named"
+
+
+def test_comparison_table_carries_native_units_m2_and_ft2(drawings, tmp_path):
+    from tools.validate_drawings import comparison_table
+
+    rows = _validate(drawings["plate_with_holes"]["path"], tmp_path)
+    table = comparison_table(rows)
+    assert "native units²" in table
+    assert "m²" in table and "ft²" in table
+    assert "Bounding W×H" in table
+    # 23 057.52 mm² is 0.0231 m² and 0.25 ft²; both must appear, not just mm².
+    assert "0.0231" in table
+    assert "0.25" in table
+
+
+def test_report_answers_what_physical_region_the_number_is(drawings, tmp_path):
+    out_dir = tmp_path / "rep"
+    out_dir.mkdir()
+    rows = _validate(drawings["layout_1_100"]["path"], tmp_path)
+    report = build_report(rows, str(out_dir))
+
+    assert "What physical region is this?" in report
+    assert "Union of equipment geometry" in report
+    assert "Bounding rectangle" in report
+    assert "Convex envelope" in report
+    # The overlay legend is what makes stage 7 checkable.
+    assert "Overlay legend" in report
+    assert "included" in report and "excluded" in report
