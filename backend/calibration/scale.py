@@ -28,7 +28,15 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from backend.config import CALIBRATION, MM_PER_PDF_UNIT_AT_1_1, CalibrationSettings
-from backend.models import BBox, Point, Primitive, Scale, ScaleCandidate, ScaleSource
+from backend.models import (
+    BBox,
+    Calibration,
+    Point,
+    Primitive,
+    Scale,
+    ScaleCandidate,
+    ScaleSource,
+)
 
 #: Physically plausible bounds on mm per PDF unit. Below this a sheet could not
 #: hold readable linework; above it a single page would span kilometres.
@@ -109,6 +117,13 @@ def scale_from_two_points(a: Point, b: Point, known_length_mm: float) -> Scale:
         mm_per_unit=known_length_mm / distance,
         source=ScaleSource.USER_TWO_POINT,
         confidence=round(confidence, 4),
+        calibration=Calibration(
+            a=(float(a[0]), float(a[1])),
+            b=(float(b[0]), float(b[1])),
+            known_length=known_length_mm,
+            known_unit="mm",
+            span_units=distance,
+        ),
         detail=(
             f"User calibration: {known_length_mm:g} mm measured across "
             f"{distance:.3f} PDF units."

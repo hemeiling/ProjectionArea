@@ -239,6 +239,11 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
 .demoGrid button{display:block; width:100%; text-align:left; padding:8px 10px; font-size:12px}
 .demoGrid .dTitle{font-weight:600}
 .demoGrid .dWhat{display:block; margin-top:2px; font-size:10.5px; color:var(--ink-2); line-height:1.4}
+.calbadge{border:1px solid #9A3412; background:#FBEFEA; border-radius:6px; padding:7px 9px;
+  margin:0 0 9px; font-size:11.5px; color:#7A2D10; line-height:1.5}
+.calbadge b{display:block; font-size:12px; letter-spacing:.02em}
+.provnote{margin:0 0 10px; padding:7px 9px; border-left:3px solid #B4802A; background:#FDF6E7;
+  font-size:11.5px; line-height:1.5; color:#6B4E14}
 </style>
 
 <div class="app">
@@ -373,9 +378,14 @@ details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-s
           <button id="rcAmbShow">显示该区域</button>
         </div>
 
+        <div class="calbadge" id="rcCalBadge" style="display:none">
+          <b>人工标定 · operator-calibrated</b>
+          <span id="rcCalDetail"></span>
+        </div>
         <div class="big" id="rcMain">—</div>
         <div class="alt" id="rcAlt"></div>
         <p class="fixnote" id="rcMeans" style="margin-bottom:10px"></p>
+        <p class="provnote" id="rcProvisional" style="display:none"></p>
 
         <div class="conf" id="rcConf">
           <div class="top"><span>置信度</span><span class="pct" id="rcConfPct">—</span></div>
@@ -794,7 +804,8 @@ const SRV = (() => {
     // Milestone A：当前选中的 footprint 定义，以及叠加层开关。
     fpType:"geometry_union", ambiguity:null,
     layers:{source:true, measured:true, excluded:true, dimensions:true, holes:true,
-            footprint:true, envelope:false, boundingRect:false, warnings:true}
+            footprint:true, envelope:false, boundingRect:false, warnings:true,
+            calibration:true}
   };
 
   /* ── footprint 定义 ─────────────────────────────────────────
@@ -826,7 +837,8 @@ const SRV = (() => {
     ["footprint",    "所选 footprint", "rgba(62,154,141,.30)"],
     ["envelope",     "凸包外廓",   "rgba(91,124,153,.35)"],
     ["boundingRect", "外接矩形",   "rgba(138,107,168,.35)"],
-    ["warnings",     "存疑/告警区", "rgba(180,128,42,.55)"]
+    ["warnings",     "存疑/告警区", "rgba(180,128,42,.55)"],
+    ["calibration",  "标定基准线", "rgba(154,52,18,.85)"]
   ];
 
   const AREA_LABEL = {mm2:"mm²", cm2:"cm²", m2:"m²", in2:"in²", ft2:"ft²"};
@@ -1129,6 +1141,34 @@ const SRV = (() => {
       : "";
     $("rcAlt").innerHTML = others + gross;
     $("rcMeans").textContent = fp.means;
+    renderCalBadge();
+    renderProvisional(fp);
+  }
+
+  /* 人工标定必须和"自动求出的比例"区分开：数字一样可信地被算出来，
+     但它来自操作员的一次输入，不是从图上推出来的。 */
+  function renderCalBadge() {
+    const r = st.result, sc = r && r.scale, el = $("rcCalBadge");
+    if (!sc || !sc.operator_supplied || !sc.verified) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    const cal = sc.calibration;
+    $("rcCalDetail").innerHTML = cal
+      ? `比例来自你量的一段：<b>${esc(cal.label)}</b> 对应 ${cal.span_units.toFixed(2)} 图面单位 ` +
+        `→ ${sc.mm_per_unit.toFixed(4)} mm/unit（${esc(sc.implied_ratio || "")}）。` +
+        `<br>这一段已画在图上（红色基准线），请核对你量的是不是那条线。` +
+        `<br>该结果为<b>人工标定</b>，不是自动核验的比例。`
+      : `比例由操作员提供：${sc.mm_per_unit.toFixed(4)} mm/unit。该结果为人工标定，不是自动核验的比例。`;
+  }
+
+  /* provisional 读法：语义未经确认，必须连同"可能是什么"一起显示。 */
+  function renderProvisional(fp) {
+    const el = $("rcProvisional");
+    if (!fp || !fp.provisional) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    const maybe = (fp.candidate_meanings || []).map(esc).join("、");
+    el.innerHTML = `<b>语义未确认 · provisional</b><br>` +
+      `这是一个几何构造，它代表什么尚未确认${maybe ? "，可能是：" + maybe : ""}。` +
+      `<br>需要 CAD 图层/块信息，或由你确认，才能当作某个具体物理区域使用。`;
   }
 
   /* 一块 200×120 的板读作 "0.0231 m²" 没有意义；一条产线读作 "54,460,800 mm²"
@@ -1210,12 +1250,23 @@ const SRV = (() => {
         r.view.source === "auto_detected" ? "自动识别" : "整页"}）`],
       ["比例 Scale", r.scale.verified
         ? `<code>${r.scale.mm_per_unit.toFixed(6)} mm/unit</code> · ${r.scale.implied_ratio}<br>` +
-          `来源：${SCALE_CN[r.scale.source] || r.scale.source}<br>${esc(r.scale.detail || "")}`
+          `来源：${SCALE_CN[r.scale.source] || r.scale.source}` +
+          (r.scale.operator_supplied ? `　<b>（人工标定，非自动核验）</b>` : "") +
+          `<br>${esc(r.scale.detail || "")}` +
+          ((r.scale.evidence || []).length
+            ? `<ul class="evl">` + r.scale.evidence.map(e => `<li>${esc(e)}</li>`).join("") + `</ul>`
+            : "")
         : "未建立 —— 因此不报告任何毫米数值"],
       ["单位 Units", st.analysis && st.analysis.sheet_unit
         ? `图纸声明 ${esc(st.analysis.sheet_unit)}` : "图纸未声明单位（按 mm 假设，已记入假设项）"],
       ["图元分类 Classification", `共 ${g.raw_primitives} 个图元 · 计入 ${g.profile_primitives} · 排除 ${g.ignored_primitives}<br>已忽略：${ignored}`],
-      ["footprint 定义", fp ? `<b>${esc((FP_CN[fp.type] || {}).name || fp.name)}</b><br>${esc(fp.means)}` : "—"],
+      ["footprint 定义", fp
+        ? `<b>${esc((FP_CN[fp.type] || {}).name || fp.name)}</b>` +
+          `　<span class="fpTag">${fp.provisional ? "语义未确认 provisional" : "纯几何 geometric"}</span>` +
+          `<br>${esc(fp.means)}` +
+          (fp.candidate_meanings && fp.candidate_meanings.length
+            ? `<br>可能是：${fp.candidate_meanings.map(esc).join("、")}` : "")
+        : "—"],
       ["多边形与孔洞 Polygon", `${g.outer_contours} 个外轮廓 · ${g.holes} 个孔 · ${g.faces} 个面 · ${g.segments} 段线`],
       ["并集 Union", `${METHOD_CN[r.method] || r.method} · ${g.components} 个连通体`],
       ["单位换算 Conversion", fp && fp.units
@@ -1404,6 +1455,25 @@ const SRV = (() => {
           out.push(`<path d="${d}" fill-rule="evenodd" fill="none" stroke="#4A585F"
             stroke-opacity=".55" stroke-width="${hair}" stroke-dasharray="${hair*4} ${hair*3}"/>`);
         }
+      }
+
+      /* 操作员标定的基准线：把量过的那一段和填入的实际长度画回图上，
+         别人才能核对"你量的是不是这条线"。数据来自后端 scale.calibration。 */
+      const cal = r.scale && r.scale.calibration;
+      if (st.layers.calibration && cal) {
+        const [ax, ay] = cal.a, [bx, by] = cal.b;
+        const tick = hair * 9;
+        const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len * tick, ny = dx / len * tick;
+        out.push(`<path d="M${ax},${ay}L${bx},${by}" stroke="#9A3412" fill="none"
+          stroke-width="${hair * 2.2}" stroke-opacity=".95"/>`);
+        out.push(`<path d="M${ax+nx},${ay+ny}L${ax-nx},${ay-ny}M${bx+nx},${by+ny}L${bx-nx},${by-ny}"
+          stroke="#9A3412" stroke-width="${hair * 2.2}"/>`);
+        const mx = (ax + bx) / 2, my = (ay + by) / 2;
+        out.push(`<text x="${mx + nx * 1.8}" y="${my + ny * 1.8}" fill="#9A3412"
+          font-size="${hair * 11}" text-anchor="middle" dominant-baseline="middle"
+          style="paint-order:stroke" stroke="#fff" stroke-width="${hair*2.5}"
+          data-calibration-label="1">${esc(cal.label)}</text>`);
       }
 
       /* 触发告警的区域：描出来，点"显示该区域"时能直接看到是哪一块。 */

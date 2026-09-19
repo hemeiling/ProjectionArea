@@ -1904,6 +1904,18 @@ The result card is built around the question *which* area you are being shown:
 - **工程细节 · Engineering Details** keeps method, region, scale source, segment
   and component counts and the repair log one click away, so the default view
   stays readable.
+- **Operator calibration is labelled as such.** On a sheet with no text layer —
+  which is what "Microsoft Print to PDF" produces from AutoCAD — no automatic
+  scale exists. Pick two points, state the real distance, and the result carries
+  a **人工标定 · operator-calibrated** badge giving the declared length, the span
+  in drawing units and the resulting mm/unit. The picked span is drawn back onto
+  the drawing in red with its length, so a reviewer can check the operator
+  measured the right line. `Scale.operator_supplied` keeps this distinct from
+  `verified`: the number is usable and auditable, but it was not derived from the
+  drawing, and the UI never presents it as though it were.
+- **Provisional readings say so.** `enclosing_boundary` and `internal_union` show
+  a *语义未确认 · provisional* note listing what the geometry might be, because
+  shape alone cannot tell a site boundary from a machine.
 - **Review recommended** appears when the engine reports an ambiguity — today
   that is the title-block confusion. It says what looks wrong, and "显示该区域"
   outlines the region that triggered it. It never silently corrects anything.

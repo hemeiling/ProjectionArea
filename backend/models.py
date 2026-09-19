@@ -474,6 +474,33 @@ class ScaleCandidate:
 
 
 @dataclass
+class Calibration:
+    """An operator's two-point pick, kept so the result can be re-checked.
+
+    A manually calibrated area is only as good as the span it was derived from,
+    so the span itself is part of the record (§8): the viewer draws it back onto
+    the drawing and the explanation states it, which is what lets someone else
+    confirm the operator picked the right line.
+    """
+
+    a: Point
+    b: Point
+    known_length: float
+    known_unit: str
+    span_units: float
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "a": [round(self.a[0], 3), round(self.a[1], 3)],
+            "b": [round(self.b[0], 3), round(self.b[1], 3)],
+            "known_length": self.known_length,
+            "known_unit": self.known_unit,
+            "span_units": round(self.span_units, 4),
+            "label": f"{self.known_length:g} {self.known_unit}",
+        }
+
+
+@dataclass
 class Scale:
     """The scale actually used for a calculation, with its provenance."""
 
@@ -483,6 +510,18 @@ class Scale:
     detail: str = ""
     evidence: List[str] = field(default_factory=list)
     cross_check_spread: Optional[float] = None
+    #: Present only for a two-point calibration: the span the operator picked.
+    calibration: Optional["Calibration"] = None
+
+    @property
+    def operator_supplied(self) -> bool:
+        """True when a human established this scale rather than the engine.
+
+        Kept distinct from ``verified``: an operator-supplied scale is usable
+        and auditable, but it was not *derived* from the drawing, so the UI must
+        say so rather than presenting it as an automatic finding (§30).
+        """
+        return self.source is ScaleSource.USER_TWO_POINT
 
     @property
     def verified(self) -> bool:
@@ -504,6 +543,8 @@ class Scale:
             "detail": self.detail,
             "evidence": self.evidence[:12],
             "cross_check_spread": self.cross_check_spread,
+            "operator_supplied": self.operator_supplied,
+            "calibration": self.calibration.as_dict() if self.calibration else None,
         }
 
 

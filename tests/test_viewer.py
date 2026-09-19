@@ -405,3 +405,93 @@ def test_a_scanned_demo_still_refuses_to_invent_an_area(viewer_url, drawings):
 
     assert "未标定" in headline, headline
     assert "毫米" in means or "比例" in means, means
+
+
+def test_operator_two_point_calibration_marks_the_result_as_manual(viewer_url, drawings):
+    """The manual calibration path, driven with real mouse clicks.
+
+    Production drawings printed via "Microsoft Print to PDF" carry no text layer,
+    so automatic calibration is impossible and this is the only way to get a
+    physical area out of them. The result must then be visibly *operator*
+    calibrated — not presented as something the engine verified — and the span
+    that was picked must be recoverable from the overlay and the explanation, so
+    a reviewer can check the operator measured the right line (§8, §30).
+    """
+    errors = []
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 1000})
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.on(
+            "console",
+            lambda m: errors.append(m.text) if m.type == "error" else None,
+        )
+        _open_demo(page, viewer_url)
+
+        before = page.inner_text("#rcMain")
+        assert page.is_visible("#rcCalBadge") is False, (
+            "an automatically calibrated result must not claim to be manual"
+        )
+
+        page.select_option("#calMode", "pick")
+        page.wait_for_timeout(250)
+        page.click("#startPick")
+
+        # Two points on a span that fits on screen, in PDF units.
+        a, b = (200.0, 200.0), (500.0, 200.0)
+        geom = page.evaluate(
+            """() => {
+                const c = document.getElementById('overlay');
+                const r = c.getBoundingClientRect();
+                return {left:r.left, top:r.top, w:r.width, h:r.height,
+                        cw:c.width, ch:c.height, scale:S.scale};
+            }"""
+        )
+        for point in (a, b):
+            px, py = point[0] * geom["scale"], point[1] * geom["scale"]
+            page.mouse.click(
+                geom["left"] + px * geom["w"] / geom["cw"],
+                geom["top"] + py * geom["h"] / geom["ch"],
+            )
+            page.wait_for_timeout(250)
+
+        picked = page.evaluate("() => S.calPts.length")
+        assert picked == 2, f"two clicks must register two calibration points, got {picked}"
+
+        # 300 PDF units declared as 600 mm => exactly 2 mm per unit.
+        page.fill("#knownLen", "600")
+        page.select_option("#knownUnit", "mm")
+        page.click("#applyPick")
+        page.wait_for_timeout(4000)
+
+        badge_visible = page.is_visible("#rcCalBadge")
+        badge = " ".join(page.inner_text("#rcCalBadge").split())
+        after = page.inner_text("#rcMain")
+        label = page.eval_on_selector_all(
+            "#vec text[data-calibration-label]", "els => els.map(e => e.textContent)"
+        )
+        span_drawn = page.eval_on_selector_all(
+            "#vec path[stroke='#9A3412']", "els => els.length"
+        )
+        page.click("#rcExplainSummary")
+        page.wait_for_timeout(400)
+        flow = page.inner_text("#rcFlow")
+        browser.close()
+
+    assert errors == [], errors
+    assert badge_visible, "an operator-calibrated result must say so"
+    assert "人工标定" in badge and "operator-calibrated" in badge
+    assert "600 mm" in badge, "the badge must state the declared length"
+    assert "2.0000 mm/unit" in badge or "2.00" in badge, badge
+
+    # The measurement actually changed — the calibration was applied, not ignored.
+    assert after != before, "re-calculation must follow the new scale"
+
+    # The picked span is drawn back onto the drawing, with its declared length.
+    assert label == ["600 mm"], label
+    assert span_drawn >= 1, "the calibration span itself must be drawn"
+
+    # And preserved in Explain Calculation, from the backend's own record.
+    assert "人工标定，非自动核验" in flow
+    assert "600" in flow
+    assert "user_two_point_calibration" in flow or "两点人工标定" in flow
