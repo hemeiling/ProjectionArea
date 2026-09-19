@@ -35,6 +35,33 @@ def _validate(path, tmp_path, **kwargs):
     )
 
 
+def measure_plate(drawings):
+    """Measure the plate fixture through the real pipeline, for model assertions."""
+    import fitz
+
+    from backend.area.projected import compute_projected_area
+    from backend.models import ViewSource
+    from backend.pipeline import prepare_page, region_scale
+
+    doc = fitz.open(drawings["plate_with_holes"]["path"])
+    prepared = prepare_page(doc, 1)
+    region = prepared.default_region()
+    scale, warnings = region_scale(prepared, region)
+    result = compute_projected_area(
+        analysis=prepared.analysis,
+        fitz_page=doc.load_page(0),
+        document_id="test",
+        file_name="plate_with_holes.pdf",
+        scale=scale,
+        region_bbox=region.bbox if region else None,
+        view_source=ViewSource.USER_SELECTED,
+        view_label=region.label if region else "Whole page",
+        extra_warnings=warnings,
+    )
+    doc.close()
+    return result, prepared, region
+
+
 # ── blocked inputs ───────────────────────────────────────────────────────────
 
 
@@ -227,11 +254,11 @@ def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path
     ever reports otherwise, something is wrong with the hull or the bounds.
     """
     row = _validate(drawings["layout_1_100"]["path"], tmp_path)[0]
-    by_key = {i["key"]: i for i in row.interpretations}
+    by_key = {i["type"]: i for i in row.interpretations}
 
-    assert set(by_key) >= {"equipment_union", "convex_hull", "bounding_rectangle"}
+    assert set(by_key) >= {"equipment_union", "convex_envelope", "bounding_rectangle"}
     union = by_key["equipment_union"]["area_units2"]
-    hull = by_key["convex_hull"]["area_units2"]
+    hull = by_key["convex_envelope"]["area_units2"]
     box = by_key["bounding_rectangle"]["area_units2"]
     assert union < hull < box, (union, hull, box)
 
@@ -244,14 +271,18 @@ def test_interpretations_are_ordered_union_then_hull_then_box(drawings, tmp_path
     # Every reading must say what physical region it is — that is the deliverable.
     for item in row.interpretations:
         assert item["means"].strip()
-        assert item["basis"].strip()
+        assert item["evidence"], "a reading must record what it was derived from"
+        assert item["type"] in {
+            "equipment_union", "convex_envelope", "bounding_rectangle", "largest_body",
+        }
+        assert item["requires_cad_semantics"] is False
 
 
 def test_a_rectangular_part_fills_its_hull_and_its_box(drawings, tmp_path):
     """The sanity case: for a rectangle, hull and bounding box coincide."""
     row = _validate(drawings["plate_with_holes"]["path"], tmp_path)[0]
-    by_key = {i["key"]: i for i in row.interpretations}
-    assert by_key["convex_hull"]["area_units2"] == pytest.approx(
+    by_key = {i["type"]: i for i in row.interpretations}
+    assert by_key["convex_envelope"]["area_units2"] == pytest.approx(
         by_key["bounding_rectangle"]["area_units2"], rel=1e-3
     )
     # Holes mean the union is strictly smaller than the envelope.
@@ -365,3 +396,148 @@ def test_report_answers_what_physical_region_the_number_is(drawings, tmp_path):
     # The overlay legend is what makes stage 7 checkable.
     assert "Overlay legend" in report
     assert "included" in report and "excluded" in report
+
+
+# ── the interpretation type as a domain concept ──────────────────────────────
+#
+# The measurement *type* is modelled explicitly so a CAD-derived definition can
+# be added without redesigning the area engine, and so the three geometry
+# readings are never collapsed into one generic `projected_area` field.
+
+
+def test_every_result_carries_its_interpretations_as_domain_objects(drawings):
+    """The engine attaches typed readings to every result, not loose dicts."""
+    from backend.models import FootprintInterpretation, FootprintType
+
+    result, _prepared, _region = measure_plate(drawings)
+    assert result.footprint_interpretations
+    for item in result.footprint_interpretations:
+        assert isinstance(item, FootprintInterpretation)
+        assert isinstance(item.type, FootprintType)
+        assert item.id and item.name and item.means
+        assert item.evidence, "a reading must record what it was derived from"
+
+    types = [i.type for i in result.footprint_interpretations]
+    assert types[0] is FootprintType.EQUIPMENT_UNION, "the primary reading comes first"
+    assert len(types) == len(set(types)), "each reading appears once"
+
+
+def test_the_primary_reading_matches_the_headline_area(drawings):
+    """`projected_area` and the union interpretation must never disagree.
+
+    They are the same measurement presented twice; if they drift apart, one of
+    the two is lying about what was measured.
+    """
+    from backend.models import FootprintType
+
+    result, _prepared, _region = measure_plate(drawings)
+    union = next(
+        i for i in result.footprint_interpretations
+        if i.type is FootprintType.EQUIPMENT_UNION
+    )
+    assert union.area_units2 == result.area_units2
+    assert union.area_mm2 == result.area_mm2
+
+
+def test_each_interpretation_carries_its_own_geometry_for_an_overlay(drawings):
+    """§8: the user must be able to see each region, not just read its number."""
+    from backend.models import FootprintType
+
+    result, _prepared, _region = measure_plate(drawings)
+    by_type = {i.type: i for i in result.footprint_interpretations}
+
+    union = by_type[FootprintType.EQUIPMENT_UNION]
+    assert union.outer and len(union.outer[0]) >= 4
+    assert len(union.holes) == 3, "the plate's three holes must be drawable"
+
+    box = by_type[FootprintType.BOUNDING_RECTANGLE]
+    assert len(box.outer) == 1 and len(box.outer[0]) == 5, "a closed rectangle"
+    assert not box.holes, "a bounding rectangle has no holes by definition"
+
+    hull = by_type[FootprintType.CONVEX_ENVELOPE]
+    assert hull.outer and not hull.holes
+
+
+def test_geometry_derived_readings_never_claim_cad_semantics(drawings):
+    """A shape-only source must not produce a fence or conveyor footprint."""
+    result, _prepared, _region = measure_plate(drawings)
+    for item in result.footprint_interpretations:
+        assert not item.requires_cad_semantics, (
+            f"{item.type.value} claims to be CAD-derived but came from shape alone"
+        )
+
+
+def test_cad_only_readings_are_declared_as_known_and_unavailable(drawings):
+    """Absence must be visible: the three CAD readings are listed, not omitted."""
+    result, _prepared, _region = measure_plate(drawings)
+    pending = {p["type"]: p for p in result.pending_interpretations}
+
+    assert set(pending) == {"conveyor_footprint", "guarded_area", "line_footprint"}
+    for entry in pending.values():
+        assert entry["available"] is False
+        assert entry["requires"], "each must name the CAD metadata it needs"
+        assert "not be guessed" in entry["reason"]
+
+
+def test_the_enum_knows_which_types_need_cad_semantics():
+    """The distinction lives on the type, so no caller has to remember it."""
+    from backend.models import FootprintType
+
+    assert not FootprintType.EQUIPMENT_UNION.requires_cad_semantics
+    assert not FootprintType.CONVEX_ENVELOPE.requires_cad_semantics
+    assert not FootprintType.BOUNDING_RECTANGLE.requires_cad_semantics
+    assert not FootprintType.LARGEST_BODY.requires_cad_semantics
+    assert FootprintType.CONVEYOR_FOOTPRINT.requires_cad_semantics
+    assert FootprintType.GUARDED_AREA.requires_cad_semantics
+    assert FootprintType.LINE_FOOTPRINT.requires_cad_semantics
+
+
+def test_interpretations_reach_the_api_payload(drawings):
+    """The UI cannot show three readings if the JSON only carries one."""
+    result, _prepared, _region = measure_plate(drawings)
+    payload = result.as_dict()
+
+    assert "footprint_interpretations" in payload
+    assert "pending_interpretations" in payload
+    readings = payload["footprint_interpretations"]
+    assert len(readings) >= 3
+
+    first = readings[0]
+    for key in (
+        "id", "type", "name", "means", "area_units2", "area_mm2", "units",
+        "evidence", "confidence", "assumptions", "warnings",
+        "requires_cad_semantics", "outer", "holes",
+    ):
+        assert key in first, f"missing field {key!r}"
+    assert first["units"]["m2"] > 0 and first["units"]["ft2"] > 0
+
+    # The headline field still exists — the readings are additive, not a rename.
+    assert payload["projected_area"]["verified"] is True
+
+
+def test_an_unverified_scale_yields_no_millimetres_in_any_reading(drawings):
+    """§3 applies to every interpretation, not just the headline number."""
+    import fitz
+
+    from backend.area.projected import compute_projected_area
+    from backend.models import Scale, ScaleSource, ViewSource
+    from backend.pipeline import prepare_page
+
+    doc = fitz.open(drawings["plate_with_holes"]["path"])
+    prepared = prepare_page(doc, 1)
+    result = compute_projected_area(
+        analysis=prepared.analysis,
+        fitz_page=doc.load_page(0),
+        document_id="t",
+        file_name="p.pdf",
+        scale=Scale(mm_per_unit=None, source=ScaleSource.NONE, confidence=0.0, detail="none"),
+        region_bbox=None,
+        view_source=ViewSource.WHOLE_PAGE,
+        view_label="Whole page",
+    )
+    doc.close()
+
+    assert result.area_mm2 is None
+    for item in result.footprint_interpretations:
+        assert item.area_mm2 is None, f"{item.type.value} invented a physical area"
+        assert item.area_units2 > 0, "page-space area is still knowable"

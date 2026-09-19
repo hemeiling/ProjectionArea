@@ -81,6 +81,115 @@ class Method(str, Enum):
     USER_POLYGON = "user_drawn_polygon"
 
 
+class FootprintType(str, Enum):
+    """Which physical region a measured area is claimed to represent. §2.
+
+    "Projected area" is unambiguous for one machined part and ambiguous for a
+    manufacturing line, where the same sheet defensibly yields several different
+    numbers. Making the *type* explicit — rather than reducing everything to one
+    ``projected_area`` field — is what lets a new definition be added without
+    touching the area engine.
+
+    The first group follows from geometry alone. The second cannot: knowing which
+    linework is a fence or a conveyor is CAD semantics (layer, block, linetype),
+    never a property of the shape, so those types exist here but are only ever
+    produced by a semantics-aware source (§7 — no guessing).
+    """
+
+    # Derivable from geometry alone.
+    EQUIPMENT_UNION = "equipment_union"
+    CONVEX_ENVELOPE = "convex_envelope"
+    BOUNDING_RECTANGLE = "bounding_rectangle"
+    LARGEST_BODY = "largest_body"
+
+    # Require CAD semantics; never inferred from shape.
+    CONVEYOR_FOOTPRINT = "conveyor_footprint"
+    GUARDED_AREA = "guarded_area"
+    LINE_FOOTPRINT = "line_footprint"
+
+    @property
+    def requires_cad_semantics(self) -> bool:
+        return self in _CAD_SEMANTIC_FOOTPRINTS
+
+
+#: Types that a shape-only source must never claim to have measured.
+_CAD_SEMANTIC_FOOTPRINTS = frozenset(
+    {
+        FootprintType.CONVEYOR_FOOTPRINT,
+        FootprintType.GUARDED_AREA,
+        FootprintType.LINE_FOOTPRINT,
+    }
+)
+
+
+@dataclass
+class FootprintInterpretation:
+    """One defensible reading of "the projected area of this drawing".
+
+    Carries its own geometry so each interpretation can be drawn as its own
+    overlay — the user switches between readings and sees the region change,
+    rather than trusting that a number means what they assume (§8).
+
+    Attributes:
+        id: Stable identifier within one result.
+        type: Which physical region this claims to be.
+        name: Short human label.
+        means: One sentence naming the physical region, for the UI and report.
+        outer: Outer rings of the interpreted region, in page units.
+        holes: Rings subtracted from it.
+        area_units2: Area in the drawing's own squared units.
+        area_mm2: The same area in mm², or ``None`` without a verified scale (§3).
+        evidence: What this reading was derived from, so it is reproducible.
+        confidence: Confidence that this number *is* the named region. Inherited
+            from the geometry and scale beneath it; a derivation that is exact
+            arithmetic adds no certainty of its own.
+        assumptions: Everything taken for granted to produce it.
+        warnings: Anything that should reduce trust in it.
+    """
+
+    id: str
+    type: FootprintType
+    name: str
+    means: str
+    outer: List[List[Point]] = field(default_factory=list)
+    holes: List[List[Point]] = field(default_factory=list)
+    area_units2: float = 0.0
+    area_mm2: Optional[float] = None
+    evidence: List[str] = field(default_factory=list)
+    confidence: Optional[float] = None
+    assumptions: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def requires_cad_semantics(self) -> bool:
+        return self.type.requires_cad_semantics
+
+    def as_dict(self, digits: int = 2, include_geometry: bool = True) -> Dict[str, Any]:
+        from backend.units import Area
+
+        def ring(points: Sequence[Point]) -> List[List[float]]:
+            return [[round(x, digits), round(y, digits)] for x, y in points]
+
+        payload: Dict[str, Any] = {
+            "id": self.id,
+            "type": self.type.value,
+            "name": self.name,
+            "means": self.means,
+            "area_units2": self.area_units2,
+            "area_mm2": self.area_mm2,
+            "units": Area(self.area_mm2).as_dict() if self.area_mm2 is not None else None,
+            "evidence": list(self.evidence),
+            "confidence": self.confidence,
+            "assumptions": list(self.assumptions),
+            "warnings": list(self.warnings),
+            "requires_cad_semantics": self.requires_cad_semantics,
+        }
+        if include_geometry:
+            payload["outer"] = [ring(r) for r in self.outer]
+            payload["holes"] = [ring(r) for r in self.holes]
+        return payload
+
+
 @dataclass
 class BBox:
     """Axis-aligned bounding box in PDF user units."""
@@ -481,6 +590,13 @@ class AreaResult:
     assumptions: List[str] = field(default_factory=list)
     engine_version: str = ""
     timestamp: str = ""
+    #: Competing readings of this result, primary first. Populated by
+    #: :func:`backend.area.interpretations.interpretations` once the silhouette
+    #: exists; empty when nothing was reconstructed.
+    footprint_interpretations: List[FootprintInterpretation] = field(default_factory=list)
+    #: Readings the product intends to support that need CAD semantics, reported
+    #: as known-and-unavailable rather than omitted.
+    pending_interpretations: List[Dict[str, Any]] = field(default_factory=list)
 
     # ── Physical values, available only when scale is verified (§3) ──────────
 
@@ -559,6 +675,13 @@ class AreaResult:
             "geometry": self.geometry.as_dict(),
             "confidence": self.confidence.as_dict(),
             "components": [c.as_dict() for c in self.components],
+            # Every defensible reading of "the projected area", each with its own
+            # geometry so the UI can draw and switch between them. The primary
+            # reading is also in "projected_area" above; it is not collapsed into
+            # that one field, because on a line layout the definition is the
+            # question (§2, §30).
+            "footprint_interpretations": [i.as_dict() for i in self.footprint_interpretations],
+            "pending_interpretations": self.pending_interpretations,
             "warnings": self.warnings,
             "assumptions": self.assumptions,
             "engine_version": self.engine_version,

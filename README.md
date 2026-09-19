@@ -1434,11 +1434,11 @@ Or a whole set, with a comparison table and an overlay per page:
 Tests:
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 109 tests, ~16 s
+.venv/bin/python -m pytest tests -q      # 130 tests, ~16 s
 ```
 
 The two browser tests drive the real page in Chromium and are skipped
-automatically if Playwright or a Chromium build is missing; the other 107 run in
+automatically if Playwright or a Chromium build is missing; the other 128 run in
 about a second.
 
 ---
@@ -1741,7 +1741,7 @@ Backend   FastAPI
             pdf/space.py     canonical page space, /Rotate normalisation
 tools/      audit_overlay.py    headless overlay renderer, one page
             validate_drawings.py whole-set validation harness + report
-tests/      fixtures.py + 107 tests
+tests/      fixtures.py + 128 tests
 ```
 
 ### Why this stack
@@ -1812,23 +1812,36 @@ On one machined part "projected area" has a single obvious meaning. On a
 factors, so `area/interpretations.py` computes every definition that follows from
 geometry alone and names the physical region each one represents:
 
-| Reading | What it is |
-|---|---|
-| Union of equipment geometry | material actually occupied; overlaps counted once, holes removed |
-| Convex envelope | what a crane path or guard enclosure has to clear |
-| Bounding rectangle | floor space to allocate, or the crate to ship it in |
-| Largest single body | one machine, when the view holds several |
-| Per-body breakdown | every body listed, so any subset can be summed |
+The measurement **type** is a first-class domain concept — `FootprintType` and
+`FootprintInterpretation` in `models.py` — not a generic `projected_area` float.
+Each reading carries its own geometry, evidence, confidence, assumptions and
+warnings, so the UI can draw it and a CAD-derived definition can be added without
+touching the area engine.
+
+| `FootprintType` | What it is | Source |
+|---|---|---|
+| `equipment_union` | material actually occupied; overlaps counted once, holes removed | geometry |
+| `convex_envelope` | what a crane path or guard enclosure has to clear | geometry |
+| `bounding_rectangle` | floor space to allocate, or the crate to ship it in | geometry |
+| `largest_body` | one machine, when the view holds several | geometry |
+| `conveyor_footprint` | conveying equipment alone | **CAD semantics** |
+| `guarded_area` | the fenced / light-curtain perimeter | **CAD semantics** |
+| `line_footprint` | the whole installation as sited | **CAD semantics** |
+
+Every result serialises all of them under `footprint_interpretations`, and the
+three CAD-only readings under `pending_interpretations` — reported as *known and
+unavailable*, each naming the metadata it needs (layer, block name, linetype,
+XREF extent), so the absence is visible rather than silent. That list is also the
+specification for the DXF adapter.
 
 On the L-shaped plan fixture these come out 54.46 m², 64.00 m² and 72.00 m² — a
 32 % spread. Reporting one of those without saying which would be the hidden
 assumption §30 forbids.
 
-**Deliberately absent**: *conveyor footprint*, *safety-fence perimeter* and
-*total line footprint* are **semantic** selections — they require knowing which
-linework is a fence and which is a conveyor. That lives in CAD layers and
-linetypes, or in a human pick, not in the shape. They will be resolvable from the
-DXF path's layer information; they are never guessed at from geometry.
+`FootprintType.requires_cad_semantics` marks the three that cannot come from
+shape, and a test asserts no geometry-derived reading ever claims one of them.
+Identifying a fence or a conveyor needs layer, block and linetype information —
+it is not a property of the outline and will not be guessed.
 
 A file it cannot open is reported as **BLOCKED** with a reason and a suggested
 action; it never becomes a measured `0 mm²`. Pages that fail are isolated, so one

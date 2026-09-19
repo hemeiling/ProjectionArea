@@ -272,7 +272,7 @@ def compute_projected_area(
         user_verified=bool(overrides or manual_notes),
     )
 
-    return AreaResult(
+    result = AreaResult(
         document_id=document_id,
         file_name=file_name,
         page=analysis.page_number,
@@ -294,6 +294,15 @@ def compute_projected_area(
         engine_version=ENGINE_VERSION,
         timestamp=_datetime.datetime.now(_datetime.timezone.utc).isoformat(timespec="seconds"),
     )
+
+    # The competing readings are attached after construction because each is
+    # derived from the finished silhouette. They are additive: "projected_area"
+    # still carries the primary union, and nothing here changes a number (§2).
+    from backend.area.interpretations import interpretations, pending_cad_interpretations
+
+    result.footprint_interpretations = interpretations(result)
+    result.pending_interpretations = pending_cad_interpretations()
+    return result
 
 
 #: On a raster trace, a component smaller than this share of the largest is

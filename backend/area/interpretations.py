@@ -1,74 +1,61 @@
-"""Competing definitions of "projected area", each computed and named.
+"""Competing definitions of "projected area", each computed, named and drawn.
 
 CONSTITUTION.md §2 (what projected area *means*) and §30 (never hide a choice).
 
 On a single machined part "projected area" has one obvious reading: the union of
 the silhouette. On a **manufacturing line layout** it does not. The same sheet
-can defensibly yield any of:
+can defensibly yield the material actually occupied by machines, the envelope a
+crane has to clear, or the floor space the line has to be given — and those
+differ by large factors. Reporting one of them as *the* projected area is exactly
+the hidden assumption §30 forbids.
 
-    union of equipment        the material actually occupied by machines
-    bounding rectangle        the rectangle the line has to be shipped/sited in
-    convex hull              the envelope a crane or guard has to clear
-    largest single body       one machine, when the sheet holds several
-    per-body list            so any subset can be summed
+This module produces one :class:`~backend.models.FootprintInterpretation` per
+reading, each carrying its own geometry so the UI can draw it and the engineer
+can *see* which physical region a number refers to.
 
-Those differ by large factors — a sparse line can fill under a third of its own
-bounding box — so reporting one number without saying which definition produced
-it is exactly the "hidden assumption" §30 forbids. This module computes every
-definition that follows from geometry alone and labels each with the physical
-region it represents, so the engineer chooses rather than the tool.
-
-**What is deliberately not here.** "Conveyor footprint", "safety fence
-perimeter" and "total line footprint" are *semantic* selections: they need to
-know which linework is a fence and which is a conveyor. That information is not
-in the geometry — it lives in CAD layers and linetypes, or in a human pick. Those
-interpretations are therefore left to the layer-aware path and to manual region
-selection, and are never guessed at from shape alone.
+**Shape-derived only.** Every reading here follows from geometry alone.
+``conveyor_footprint``, ``guarded_area`` and ``line_footprint`` are declared in
+:class:`~backend.models.FootprintType` but are never produced here: identifying a
+fence or a conveyor is CAD semantics — layer, block name, linetype — not a
+property of the shape. :func:`pending_cad_interpretations` reports them as known
+but unavailable, so the absence is visible rather than silent.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from shapely.geometry import MultiPoint, Polygon
 from shapely.ops import unary_union
 
-from backend.models import AreaResult, Point
+from backend.models import AreaResult, FootprintInterpretation, FootprintType, Point
 
 #: A ring needs at least this many distinct points to bound anything.
 _MIN_RING = 3
 
-
-@dataclass
-class Interpretation:
-    """One defensible reading of "the projected area of this drawing".
-
-    Attributes:
-        key: Stable identifier for the JSON record.
-        label: Short human name.
-        means: The physical region this number represents, in one sentence.
-        area_units2: Area in the drawing's own squared units.
-        area_mm2: Same area in mm², or ``None`` when the scale is unverified.
-        basis: How it was computed, so the number is reproducible.
-    """
-
-    key: str
-    label: str
-    means: str
-    area_units2: float
-    area_mm2: Optional[float]
-    basis: str
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "key": self.key,
-            "label": self.label,
-            "means": self.means,
-            "area_units2": self.area_units2,
-            "area_mm2": self.area_mm2,
-            "basis": self.basis,
-        }
+#: Readings that exist as a concept but need a semantics-aware source, with the
+#: CAD metadata each one actually depends on. Reported, never guessed.
+_PENDING_CAD: Tuple[Tuple[FootprintType, str, str, str], ...] = (
+    (
+        FootprintType.CONVEYOR_FOOTPRINT,
+        "Conveyor footprint",
+        "The floor area occupied by conveying equipment alone, excluding stations and cells.",
+        "conveyor layer or block name, plus centreline linetype and declared width",
+    ),
+    (
+        FootprintType.GUARDED_AREA,
+        "Safety / guarded footprint",
+        "The area enclosed by the safety fence or light-curtain perimeter, which is "
+        "what floor-space and access arguments usually turn on.",
+        "fence or guarding layer, and a closed perimeter polyline on it",
+    ),
+    (
+        FootprintType.LINE_FOOTPRINT,
+        "Total production-line footprint",
+        "The whole installation as sited, including aisles and access reserved to it.",
+        "cell or line boundary layer, or an XREF/model-space extent for the installation",
+    ),
+)
 
 
 def _polygon(outer: Sequence[Point], holes: Sequence[Sequence[Point]]) -> Optional[Polygon]:
@@ -101,8 +88,34 @@ def _to_mm2(area_units2: float, result: AreaResult) -> Optional[float]:
     return area_units2 * (result.scale.mm_per_unit ** 2)
 
 
-def interpretations(result: AreaResult) -> List[Interpretation]:
-    """Every geometry-derived reading of the result, strongest evidence first.
+def _rings(geometry: Any) -> Tuple[List[List[Point]], List[List[Point]]]:
+    """Split a Shapely polygon or multipolygon into outer and hole rings."""
+    outer: List[List[Point]] = []
+    holes: List[List[Point]] = []
+    parts = getattr(geometry, "geoms", None) or [geometry]
+    for part in parts:
+        if not isinstance(part, Polygon) or part.is_empty:
+            continue
+        outer.append([(float(x), float(y)) for x, y in part.exterior.coords])
+        for interior in part.interiors:
+            holes.append([(float(x), float(y)) for x, y in interior.coords])
+    return outer, holes
+
+
+def _derived_confidence(result: AreaResult) -> Optional[float]:
+    """Confidence that a derived reading *is* the region it names.
+
+    Every reading rests on the same detected geometry and the same scale, and the
+    derivations themselves (hull, bounding box) are exact arithmetic that adds no
+    uncertainty of its own. So the engine's confidence carries straight through —
+    deliberately not inflated because the maths is exact (§10: confidence comes
+    from evidence, and the evidence here is the geometry underneath).
+    """
+    return result.confidence.overall if result.confidence else None
+
+
+def interpretations(result: AreaResult) -> List[FootprintInterpretation]:
+    """Every geometry-derived reading of this result, primary first.
 
     Returns an empty list when nothing was reconstructed — there is then no
     region to interpret, and §3 forbids presenting zero as a measurement.
@@ -111,90 +124,160 @@ def interpretations(result: AreaResult) -> List[Interpretation]:
     if not polygons:
         return []
 
+    confidence = _derived_confidence(result)
+    shared_assumptions = list(result.assumptions)
+    shared_warnings = list(result.warnings)
+
     union = unary_union(polygons)
+    union_outer, union_holes = _rings(union)
+
+    out: List[FootprintInterpretation] = [
+        FootprintInterpretation(
+            id="f1",
+            type=FootprintType.EQUIPMENT_UNION,
+            name="Union of equipment geometry",
+            means=(
+                "The material actually occupied by the bodies drawn in the selected "
+                "view, overlaps counted once and enclosed holes removed."
+            ),
+            outer=union_outer,
+            holes=union_holes,
+            area_units2=result.area_units2,
+            area_mm2=result.area_mm2,
+            evidence=[
+                f"union of {len(polygons)} validated closed profile(s)",
+                f"reconstruction method {result.method.value}",
+                "the engine's primary result",
+            ],
+            confidence=confidence,
+            assumptions=shared_assumptions,
+            warnings=shared_warnings,
+        )
+    ]
+
     points: List[Point] = []
     for component in result.components:
         if component.included:
             points.extend(component.outer)
 
-    out: List[Interpretation] = [
-        Interpretation(
-            key="equipment_union",
-            label="Union of equipment geometry",
-            means=(
-                "The material actually occupied by the bodies drawn in the selected "
-                "view, overlaps counted once and enclosed holes removed."
-            ),
-            area_units2=result.area_units2,
-            area_mm2=result.area_mm2,
-            basis="union of validated closed profiles; the engine's primary result",
-        )
-    ]
-
     hull = MultiPoint(points).convex_hull if len(points) >= _MIN_RING else None
-    if hull is not None and hasattr(hull, "area") and hull.area > 0:
+    if isinstance(hull, Polygon) and hull.area > 0:
+        hull_outer, _ = _rings(hull)
         out.append(
-            Interpretation(
-                key="convex_hull",
-                label="Convex envelope",
+            FootprintInterpretation(
+                id="f2",
+                type=FootprintType.CONVEX_ENVELOPE,
+                name="Convex envelope",
                 means=(
                     "The smallest convex region containing every counted body — what "
                     "a gantry, crane path or guard enclosure has to clear."
                 ),
+                outer=hull_outer,
                 area_units2=hull.area,
                 area_mm2=_to_mm2(hull.area, result),
-                basis="convex hull of all included outer rings",
+                evidence=["convex hull of all included outer rings"],
+                confidence=confidence,
+                assumptions=shared_assumptions
+                + ["Voids between bodies are treated as part of the envelope."],
+                warnings=shared_warnings,
             )
         )
 
-    bounds = union.bounds  # (minx, miny, maxx, maxy)
-    box_area = max(bounds[2] - bounds[0], 0.0) * max(bounds[3] - bounds[1], 0.0)
+    minx, miny, maxx, maxy = union.bounds
+    box_area = max(maxx - minx, 0.0) * max(maxy - miny, 0.0)
     if box_area > 0:
         out.append(
-            Interpretation(
-                key="bounding_rectangle",
-                label="Bounding rectangle",
+            FootprintInterpretation(
+                id="f3",
+                type=FootprintType.BOUNDING_RECTANGLE,
+                name="Bounding rectangle",
                 means=(
                     "The axis-aligned rectangle the whole arrangement sits in — the "
                     "floor space to allocate or the crate to ship it in."
                 ),
+                outer=[[(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)]],
                 area_units2=box_area,
                 area_mm2=_to_mm2(box_area, result),
-                basis="axis-aligned bounding box of the counted geometry",
+                evidence=[
+                    "axis-aligned bounding box of the counted geometry",
+                    f"extent {maxx - minx:.2f} x {maxy - miny:.2f} drawing units",
+                ],
+                confidence=confidence,
+                assumptions=shared_assumptions
+                + [
+                    "Axis-aligned to the sheet; a line drawn at an angle will report a "
+                    "larger rectangle than its true minimum."
+                ],
+                warnings=shared_warnings,
             )
         )
 
     parts = sorted(polygons, key=lambda p: p.area, reverse=True)
     if len(parts) > 1:
+        largest_outer, largest_holes = _rings(parts[0])
         out.append(
-            Interpretation(
-                key="largest_body",
-                label="Largest single body",
+            FootprintInterpretation(
+                id="f4",
+                type=FootprintType.LARGEST_BODY,
+                name="Largest single body",
                 means=(
                     f"One machine or assembly of the {len(parts)} disconnected bodies "
                     "found, in case the view holds several and only one is the subject."
                 ),
+                outer=largest_outer,
+                holes=largest_holes,
                 area_units2=parts[0].area,
                 area_mm2=_to_mm2(parts[0].area, result),
-                basis="largest connected component of the union",
+                evidence=[
+                    f"largest of {len(parts)} connected components",
+                    f"the other {len(parts) - 1} contribute "
+                    f"{sum(p.area for p in parts[1:]):.2f} units² between them",
+                ],
+                confidence=confidence,
+                assumptions=shared_assumptions
+                + ["Assumes the other bodies are not part of the subject."],
+                warnings=shared_warnings,
             )
         )
 
     return out
 
 
+def pending_cad_interpretations() -> List[Dict[str, Any]]:
+    """Readings the product intends to support but geometry cannot supply.
+
+    Returned so the UI and the report can show them as *known and unavailable*
+    rather than omitting them. Each names the CAD metadata it needs, which is
+    also the specification for the DXF adapter when real files arrive.
+    """
+    return [
+        {
+            "type": footprint_type.value,
+            "name": name,
+            "means": means,
+            "available": False,
+            "requires": requires,
+            "reason": (
+                "Needs CAD semantics to identify the linework; it cannot be inferred "
+                "from shape alone and will not be guessed."
+            ),
+        }
+        for footprint_type, name, means, requires in _PENDING_CAD
+    ]
+
+
 def body_breakdown(result: AreaResult) -> List[Dict[str, Any]]:
     """Per-body areas, so any subset can be summed by hand.
 
-    Several disconnected silhouettes may be one part or several (§ multi-body);
-    the tool lists them and lets the engineer decide rather than guessing.
+    Several disconnected silhouettes may be one installation or several; the tool
+    lists them and lets the engineer decide rather than guessing.
     """
     rows: List[Dict[str, Any]] = []
     for component in result.components:
         polygon = _polygon(component.outer, component.holes)
         if polygon is None:
             continue
-        bounds = polygon.bounds
+        minx, miny, maxx, maxy = polygon.bounds
         rows.append(
             {
                 "id": component.id,
@@ -202,8 +285,8 @@ def body_breakdown(result: AreaResult) -> List[Dict[str, Any]]:
                 "area_units2": component.area_units2,
                 "area_mm2": _to_mm2(component.area_units2, result),
                 "hole_count": len(component.holes),
-                "width_units": bounds[2] - bounds[0],
-                "height_units": bounds[3] - bounds[1],
+                "width_units": maxx - minx,
+                "height_units": maxy - miny,
             }
         )
     return sorted(rows, key=lambda r: r["area_units2"], reverse=True)
@@ -214,5 +297,5 @@ def bounding_extent(result: AreaResult) -> Optional[Tuple[float, float]]:
     polygons = included_polygons(result)
     if not polygons:
         return None
-    bounds = unary_union(polygons).bounds
-    return (bounds[2] - bounds[0], bounds[3] - bounds[1])
+    minx, miny, maxx, maxy = unary_union(polygons).bounds
+    return (maxx - minx, maxy - miny)

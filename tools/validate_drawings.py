@@ -46,11 +46,7 @@ import fitz
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.area.interpretations import (
-    body_breakdown,
-    bounding_extent,
-    interpretations,
-)
+from backend.area.interpretations import body_breakdown, bounding_extent
 from backend.models import AreaResult, BBox, ViewSource
 from backend.pdf.document import document_summary
 from backend.pipeline import prepare_page, region_scale
@@ -253,7 +249,10 @@ def _stage_record(prepared: Any, result: AreaResult) -> Dict[str, Any]:
                 Area(result.area_mm2).as_dict() if result.area_mm2 is not None else None
             ),
         },
-        "interpretations": [i.as_dict() for i in interpretations(result)],
+        "interpretations": [
+            i.as_dict(include_geometry=False) for i in result.footprint_interpretations
+        ],
+        "pending_interpretations": result.pending_interpretations,
         "bodies": body_breakdown(result),
         "confidence": {
             "overall": result.confidence.overall,
@@ -547,7 +546,7 @@ def interpretation_table(row: PageRow) -> str:
         "| --- | ---: | ---: | ---: | --- |",
     ]
     union = next(
-        (i for i in row.interpretations if i["key"] == "equipment_union"), None
+        (i for i in row.interpretations if i["type"] == "equipment_union"), None
     )
     base = (union or {}).get("area_units2") or 0.0
     for item in row.interpretations:
@@ -561,9 +560,22 @@ def interpretation_table(row: PageRow) -> str:
         square_metres = f"{area.to('m2'):,.4f}" if area else "—"
         square_feet = f"{area.to('ft2'):,.2f}" if area else "—"
         lines.append(
-            f"| **{item['label']}** | {square_metres} | {square_feet} "
+            f"| **{item['name']}** | {square_metres} | {square_feet} "
             f"| {ratio} | {item['means']} |"
         )
+
+    pending = row.stages.get("pending_interpretations") or []
+    if pending:
+        lines += [
+            "",
+            "Readings the product intends to support but that geometry alone cannot "
+            "supply — reported as known and unavailable rather than omitted:",
+            "",
+            "| Reading | Needs | What it would be |",
+            "| --- | --- | --- |",
+        ]
+        for item in pending:
+            lines.append(f"| {item['name']} | {item['requires']} | {item['means']} |")
     return "\n".join(lines)
 
 
