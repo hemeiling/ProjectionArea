@@ -1,0 +1,533 @@
+"""Domain model for the projected-area pipeline.
+
+CONSTITUTION.md §12 (preserve intermediate geometry), §16 (record every
+repair), §24 (preserve processing metadata) and §41 (result structure).
+
+These are plain dataclasses rather than Pydantic models: they are the internal
+engineering model and must stay usable from tests and scripts without a web
+framework. The API layer serialises them with ``as_dict``.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+Point = Tuple[float, float]
+
+
+class DrawingType(str, Enum):
+    """How a page carries its geometry. §19."""
+
+    VECTOR = "vector"
+    RASTER = "raster"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
+class PrimitiveKind(str, Enum):
+    """Normalised primitive types. §12."""
+
+    LINE = "line"
+    POLYLINE = "polyline"
+    BEZIER = "bezier"
+    RECT = "rect"
+    QUAD = "quad"
+    CURVE_CHAIN = "curve_chain"
+
+
+class GeometryRole(str, Enum):
+    """What a primitive appears to *mean* on an engineering drawing. §2.
+
+    Only :attr:`PROFILE` geometry is allowed to contribute to a projected area.
+    Everything else is retained and shown in the overlay so the user can see
+    what was set aside and why.
+    """
+
+    PROFILE = "profile"            # candidate component outline / real linework
+    CENTERLINE = "centerline"      # dashed or chain-dashed construction line
+    HIDDEN = "hidden"              # dashed hidden edge, behind the silhouette
+    DIMENSION = "dimension"        # dimension line, extension line, arrowhead
+    ANNOTATION = "annotation"      # text decoration, leader, balloon, symbol
+    SHEET = "sheet"                # drawing border, title block, revision table
+    HATCH = "hatch"                # section hatching
+    UNCERTAIN = "uncertain"        # kept, but flagged for the engineer
+
+
+class ScaleSource(str, Enum):
+    """Where a physical scale came from, weakest last. §4, §10."""
+
+    USER_TWO_POINT = "user_two_point_calibration"
+    DIMENSION_CONSENSUS = "dimension_consensus"
+    SINGLE_DIMENSION = "single_dimension"
+    DRAWING_RATIO = "drawing_scale_ratio"
+    NONE = "none"
+
+
+class ViewSource(str, Enum):
+    USER_SELECTED = "user_selected"
+    AUTO_DETECTED = "auto_detected"
+    WHOLE_PAGE = "whole_page"
+
+
+class Method(str, Enum):
+    """How the silhouette was reconstructed. §30 — never hide the method."""
+
+    VECTOR_EXACT = "vector_exact_polygonization"
+    VECTOR_GAP_CLOSED = "vector_gap_closed_silhouette"
+    RASTER_TRACE = "raster_contour_trace"
+    USER_POLYGON = "user_drawn_polygon"
+
+
+@dataclass
+class BBox:
+    """Axis-aligned bounding box in PDF user units."""
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def width(self) -> float:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> float:
+        return self.y1 - self.y0
+
+    @property
+    def area(self) -> float:
+        return max(0.0, self.width) * max(0.0, self.height)
+
+    @property
+    def center(self) -> Point:
+        return (0.5 * (self.x0 + self.x1), 0.5 * (self.y0 + self.y1))
+
+    @property
+    def diagonal(self) -> float:
+        return math.hypot(self.width, self.height)
+
+    def padded(self, pad: float) -> "BBox":
+        return BBox(self.x0 - pad, self.y0 - pad, self.x1 + pad, self.y1 + pad)
+
+    def contains_point(self, p: Point) -> bool:
+        return self.x0 <= p[0] <= self.x1 and self.y0 <= p[1] <= self.y1
+
+    def intersects(self, other: "BBox") -> bool:
+        return not (self.x1 < other.x0 or other.x1 < self.x0 or self.y1 < other.y0 or other.y1 < self.y0)
+
+    def intersection_area(self, other: "BBox") -> float:
+        dx = min(self.x1, other.x1) - max(self.x0, other.x0)
+        dy = min(self.y1, other.y1) - max(self.y0, other.y0)
+        return max(0.0, dx) * max(0.0, dy)
+
+    @classmethod
+    def from_points(cls, points: Sequence[Point]) -> "BBox":
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return cls(min(xs), min(ys), max(xs), max(ys))
+
+    @classmethod
+    def union_of(cls, boxes: Sequence["BBox"]) -> Optional["BBox"]:
+        if not boxes:
+            return None
+        return cls(
+            min(b.x0 for b in boxes),
+            min(b.y0 for b in boxes),
+            max(b.x1 for b in boxes),
+            max(b.y1 for b in boxes),
+        )
+
+    def as_dict(self) -> Dict[str, float]:
+        return {"x0": self.x0, "y0": self.y0, "x1": self.x1, "y1": self.y1}
+
+
+@dataclass
+class Primitive:
+    """One normalised drawing primitive, in PDF user units, y-down page space.
+
+    This is the *preserved raw layer* of §15: flattening curves into ``points``
+    is lossless enough for area work, and ``kind`` records what it originally
+    was so a future DXF/CAD exporter can rebuild true arcs.
+    """
+
+    index: int
+    kind: PrimitiveKind
+    points: List[Point]
+    closed: bool
+    stroked: bool
+    filled: bool
+    line_width: float
+    dashed: bool
+    color: Optional[Tuple[float, float, float]] = None
+    fill_color: Optional[Tuple[float, float, float]] = None
+    layer: Optional[str] = None
+    role: GeometryRole = GeometryRole.PROFILE
+    role_reason: str = ""
+    path_index: int = -1
+
+    @property
+    def bbox(self) -> BBox:
+        return BBox.from_points(self.points)
+
+    @property
+    def length(self) -> float:
+        total = 0.0
+        for a, b in zip(self.points, self.points[1:]):
+            total += math.hypot(b[0] - a[0], b[1] - a[1])
+        if self.closed and len(self.points) > 2:
+            a, b = self.points[-1], self.points[0]
+            total += math.hypot(b[0] - a[0], b[1] - a[1])
+        return total
+
+    def as_dict(self, include_points: bool = True) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "index": self.index,
+            "kind": self.kind.value,
+            "closed": self.closed,
+            "stroked": self.stroked,
+            "filled": self.filled,
+            "dashed": self.dashed,
+            "line_width": self.line_width,
+            "role": self.role.value,
+            "role_reason": self.role_reason,
+            "bbox": self.bbox.as_dict(),
+        }
+        if include_points:
+            data["points"] = [[round(x, 3), round(y, 3)] for x, y in self.points]
+        return data
+
+
+@dataclass
+class TextItem:
+    """A text span with its bounding box, used for annotation masking and for
+    dimension-driven calibration. §6 — text informs, it never *is* geometry."""
+
+    text: str
+    bbox: BBox
+    size: float
+    direction: Tuple[float, float] = (1.0, 0.0)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "bbox": self.bbox.as_dict(),
+            "size": self.size,
+            "direction": list(self.direction),
+        }
+
+
+@dataclass
+class Repair:
+    """One recorded automatic geometry repair. §16 — nothing silent."""
+
+    type: str
+    count: int = 1
+    magnitude_units: Optional[float] = None
+    detail: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "count": self.count,
+            "magnitude_units": self.magnitude_units,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class Region:
+    """A candidate drawing region — a view, a detail, a table. §17."""
+
+    id: str
+    bbox: BBox
+    primitive_count: int
+    ink_length: float
+    text_count: int
+    label: str = ""
+    kind: str = "view"          # view | title_block | sheet_frame | table | note
+    view_guess: str = "unknown"  # top | front | side | section | detail | isometric
+    view_guess_source: str = "none"
+    score: float = 0.0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "bbox": self.bbox.as_dict(),
+            "primitive_count": self.primitive_count,
+            "ink_length": round(self.ink_length, 2),
+            "text_count": self.text_count,
+            "label": self.label,
+            "kind": self.kind,
+            "view_guess": self.view_guess,
+            "view_guess_source": self.view_guess_source,
+            "score": round(self.score, 4),
+        }
+
+
+@dataclass
+class ScaleCandidate:
+    """One piece of evidence for the physical scale. §4."""
+
+    mm_per_unit: float
+    source: ScaleSource
+    support: int = 1
+    agreement: float = 0.0
+    detail: str = ""
+    evidence: List[str] = field(default_factory=list)
+
+    @property
+    def ratio_denominator(self) -> float:
+        """The nominal drawing ratio 1:N implied by this scale, at 1:1 print."""
+        from backend.config import MM_PER_PDF_UNIT_AT_1_1
+
+        return self.mm_per_unit / MM_PER_PDF_UNIT_AT_1_1
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "mm_per_unit": self.mm_per_unit,
+            "source": self.source.value,
+            "support": self.support,
+            "agreement": round(self.agreement, 4),
+            "implied_ratio": f"1 : {self.ratio_denominator:.4g}",
+            "detail": self.detail,
+            "evidence": self.evidence[:12],
+        }
+
+
+@dataclass
+class Scale:
+    """The scale actually used for a calculation, with its provenance."""
+
+    mm_per_unit: Optional[float]
+    source: ScaleSource
+    confidence: float
+    detail: str = ""
+    evidence: List[str] = field(default_factory=list)
+    cross_check_spread: Optional[float] = None
+
+    @property
+    def verified(self) -> bool:
+        """True only when a physical area may be reported (§3)."""
+        return self.mm_per_unit is not None and self.mm_per_unit > 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        from backend.config import MM_PER_PDF_UNIT_AT_1_1
+
+        return {
+            "mm_per_unit": self.mm_per_unit,
+            "unit": "mm_per_pdf_unit",
+            "source": self.source.value,
+            "confidence": round(self.confidence, 4),
+            "verified": self.verified,
+            "implied_ratio": (
+                f"1 : {self.mm_per_unit / MM_PER_PDF_UNIT_AT_1_1:.4g}" if self.verified else None
+            ),
+            "detail": self.detail,
+            "evidence": self.evidence[:12],
+            "cross_check_spread": self.cross_check_spread,
+        }
+
+
+@dataclass
+class ConfidenceBreakdown:
+    """Interpretable confidence. §10 — every number traceable to evidence."""
+
+    overall: float
+    source: float
+    geometry: float
+    scale: float
+    view: float
+    repair: float
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def band(self) -> str:
+        if self.overall >= 0.85:
+            return "high"
+        if self.overall >= 0.6:
+            return "medium"
+        return "low"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "overall": round(self.overall, 4),
+            "percent": int(round(self.overall * 100)),
+            "band": self.band,
+            "components": {
+                "source": round(self.source, 4),
+                "geometry": round(self.geometry, 4),
+                "scale": round(self.scale, 4),
+                "view": round(self.view, 4),
+                "repair": round(self.repair, 4),
+            },
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class ProfileComponent:
+    """One connected silhouette component, with its holes."""
+
+    id: str
+    outer: List[Point]
+    holes: List[List[Point]]
+    area_units2: float
+    gross_area_units2: float
+    included: bool = True
+
+    def as_dict(self, digits: int = 2) -> Dict[str, Any]:
+        def ring(points: Sequence[Point]) -> List[List[float]]:
+            return [[round(x, digits), round(y, digits)] for x, y in points]
+
+        return {
+            "id": self.id,
+            "outer": ring(self.outer),
+            "holes": [ring(h) for h in self.holes],
+            "area_units2": self.area_units2,
+            "gross_area_units2": self.gross_area_units2,
+            "hole_count": len(self.holes),
+            "included": self.included,
+        }
+
+
+@dataclass
+class GeometryReport:
+    """What the geometry stage found and what it did about it. §11, §12."""
+
+    raw_primitive_count: int = 0
+    profile_primitive_count: int = 0
+    ignored_primitive_count: int = 0
+    segment_count: int = 0
+    face_count: int = 0
+    component_count: int = 0
+    outer_contours: int = 0
+    holes: int = 0
+    repairs: List[Repair] = field(default_factory=list)
+    role_counts: Dict[str, int] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "raw_primitives": self.raw_primitive_count,
+            "profile_primitives": self.profile_primitive_count,
+            "ignored_primitives": self.ignored_primitive_count,
+            "segments": self.segment_count,
+            "faces": self.face_count,
+            "components": self.component_count,
+            "outer_contours": self.outer_contours,
+            "holes": self.holes,
+            "repairs": [r.as_dict() for r in self.repairs],
+            "role_counts": self.role_counts,
+        }
+
+
+@dataclass
+class AreaResult:
+    """The auditable projected-area result. §41, §42."""
+
+    document_id: str
+    file_name: str
+    page: int
+    method: Method
+    drawing_type: DrawingType
+    view_source: ViewSource
+    view_label: str
+    region_bbox: Optional[BBox]
+    scale: Scale
+    geometry: GeometryReport
+    confidence: ConfidenceBreakdown
+    components: List[ProfileComponent]
+    area_units2: float
+    gross_area_units2: float
+    hole_area_units2: float
+    subtract_holes: bool
+    warnings: List[str] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    engine_version: str = ""
+    timestamp: str = ""
+
+    # ── Physical values, available only when scale is verified (§3) ──────────
+
+    @property
+    def has_profile(self) -> bool:
+        """True when a silhouette was actually reconstructed.
+
+        A run that reconstructs nothing must not present ``0.00 mm²`` as a
+        verified measurement — that reads as "this part has no area" rather
+        than "nothing was found" (§3).
+        """
+        return bool(self.components) and self.area_units2 > 0.0
+
+    @property
+    def area_mm2(self) -> Optional[float]:
+        if not self.scale.verified or not self.has_profile:
+            return None
+        return self.area_units2 * (self.scale.mm_per_unit ** 2)
+
+    @property
+    def gross_area_mm2(self) -> Optional[float]:
+        if not self.scale.verified or not self.has_profile:
+            return None
+        return self.gross_area_units2 * (self.scale.mm_per_unit ** 2)
+
+    @property
+    def hole_area_mm2(self) -> Optional[float]:
+        if not self.scale.verified or not self.has_profile:
+            return None
+        return self.hole_area_units2 * (self.scale.mm_per_unit ** 2)
+
+    def as_dict(self) -> Dict[str, Any]:
+        from backend.units import Area
+
+        area_block: Dict[str, Any]
+        if self.scale.verified and self.has_profile:
+            area_block = {
+                "verified": True,
+                "net": Area(self.area_mm2).as_dict(),
+                "gross": Area(self.gross_area_mm2).as_dict(),
+                "holes": Area(self.hole_area_mm2).as_dict(),
+            }
+        else:
+            area_block = {
+                "verified": False,
+                "message": (
+                    "No closed profile was reconstructed, so there is no area to report."
+                    if not self.has_profile
+                    else "Scale not verified. Physical projected area cannot yet be "
+                         "calculated. Calibrate against a known dimension."
+                ),
+                "net": None,
+                "gross": None,
+                "holes": None,
+            }
+
+        return {
+            "document_id": self.document_id,
+            "file_name": self.file_name,
+            "page": self.page,
+            "method": self.method.value,
+            "drawing_type": self.drawing_type.value,
+            "view": {
+                "label": self.view_label,
+                "source": self.view_source.value,
+                "bbox": self.region_bbox.as_dict() if self.region_bbox else None,
+            },
+            "projected_area": area_block,
+            "area_pdf_units2": {
+                "net": self.area_units2,
+                "gross": self.gross_area_units2,
+                "holes": self.hole_area_units2,
+            },
+            "subtract_holes": self.subtract_holes,
+            "scale": self.scale.as_dict(),
+            "geometry": self.geometry.as_dict(),
+            "confidence": self.confidence.as_dict(),
+            "components": [c.as_dict() for c in self.components],
+            "warnings": self.warnings,
+            "assumptions": self.assumptions,
+            "engine_version": self.engine_version,
+            "timestamp": self.timestamp,
+        }

@@ -1,0 +1,1260 @@
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>投影面积测量仪 — PDF / CAD 图纸</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{
+  --film:#D9E0E3;        /* 描图膜底色 */
+  --film-deep:#C3CDD1;
+  --paper:#FFFFFF;
+  --ink:#0F1619;
+  --ink-2:#4A585F;
+  --rule:#B4C0C5;
+  --rule-2:#8A999F;
+  --brass:#B4802A;
+  --brass-lit:#E0A63C;
+  --verdigris:#2C6B62;
+  --verdigris-lit:#3E9A8D;
+  --minus:#9A3412;
+  --panel:#F4F7F8;
+  --display: "Arial Narrow", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --body: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--film); color:var(--ink);
+  font-family:var(--body); font-size:13px; line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+.app{display:grid; grid-template-columns:340px 1fr; height:100vh; overflow:hidden}
+
+/* ── 左侧仪器面板 ───────────────────────────── */
+.rail{
+  background:var(--panel); border-right:1px solid var(--rule);
+  display:flex; flex-direction:column; overflow-y:auto;
+}
+.brand{padding:18px 20px 14px; border-bottom:1px solid var(--rule)}
+.brand h1{
+  margin:0; font-family:var(--display); font-weight:700;
+  font-size:21px; letter-spacing:.06em; text-transform:none;
+}
+.brand p{margin:3px 0 0; color:var(--ink-2); font-size:11.5px; letter-spacing:.04em}
+
+.sect{padding:16px 20px; border-bottom:1px solid var(--rule)}
+.sect h2{
+  margin:0 0 10px; font-size:10.5px; font-weight:700; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--ink-2);
+  display:flex; align-items:center; gap:8px;
+}
+.sect h2::after{content:""; flex:1; height:1px; background:var(--rule)}
+
+label.f{display:block; font-size:11.5px; color:var(--ink-2); margin:0 0 4px}
+input[type=text],input[type=number],select{
+  width:100%; padding:7px 9px; border:1px solid var(--rule-2); background:#fff;
+  border-radius:2px; font-family:var(--mono); font-size:13px; color:var(--ink);
+}
+input:focus,select:focus,button:focus-visible{outline:2px solid var(--brass); outline-offset:1px}
+.row{display:flex; gap:8px}
+.row>*{flex:1}
+
+button{
+  font-family:var(--body); font-size:12.5px; padding:8px 10px; cursor:pointer;
+  border:1px solid var(--rule-2); background:#fff; color:var(--ink); border-radius:2px;
+}
+button:hover:not(:disabled){background:#EDF2F3}
+button:disabled{opacity:.42; cursor:not-allowed}
+button.primary{background:var(--ink); color:#fff; border-color:var(--ink)}
+button.primary:hover:not(:disabled){background:#233038}
+
+.modes{display:grid; grid-template-columns:1fr 1fr 1fr; gap:0; border:1px solid var(--rule-2); border-radius:2px; overflow:hidden}
+.modes button{border:0; border-right:1px solid var(--rule-2); border-radius:0; padding:9px 4px; font-size:12px}
+.modes button:last-child{border-right:0}
+.modes button[aria-pressed=true]{background:var(--ink); color:#fff}
+.hint{margin:9px 0 0; font-size:11.5px; color:var(--ink-2)}
+
+/* 标定状态 */
+.cal{display:flex; align-items:baseline; gap:8px; font-family:var(--mono); font-size:12px}
+.cal .dot{width:7px;height:7px;border-radius:50%;background:var(--rule-2);flex:none;align-self:center}
+.cal.ok .dot{background:var(--verdigris-lit)}
+.cal .val{color:var(--ink)}
+.cal .lbl{color:var(--ink-2)}
+
+/* ── 读数（签名元素）─────────────────────────── */
+.readout{padding:18px 20px; background:#fff; border-bottom:1px solid var(--rule)}
+.readout .cap{font-size:10.5px; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-2)}
+.readout .num{
+  font-family:var(--mono); font-size:34px; line-height:1.1; letter-spacing:-.02em;
+  margin-top:6px; font-variant-numeric:tabular-nums; word-break:break-all;
+}
+.readout .num small{font-size:16px; color:var(--ink-2); margin-left:4px}
+.readout .bar{height:3px; margin-top:10px; background:linear-gradient(90deg,var(--brass) 0%,var(--brass-lit) 55%,transparent 100%)}
+
+/* 测量列表 */
+.list{list-style:none; margin:0; padding:0}
+.list li{
+  display:flex; align-items:center; gap:9px; padding:8px 0;
+  border-bottom:1px dotted var(--rule); font-family:var(--mono); font-size:12px;
+}
+.list li:last-child{border-bottom:0}
+.swatch{width:4px; align-self:stretch; background:var(--verdigris-lit); flex:none; border-radius:2px}
+.list li.neg .swatch{background:var(--minus)}
+.list .nm{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--body)}
+.list .ar{font-variant-numeric:tabular-nums}
+.list .x{border:0; background:none; color:var(--ink-2); font-size:15px; padding:0 2px; line-height:1; cursor:pointer}
+.list .x:hover{color:var(--minus)}
+.empty{color:var(--ink-2); font-size:12px; margin:2px 0 0}
+
+/* ── 图纸台 ─────────────────────────────────── */
+.stage{position:relative; overflow:auto; background:
+  linear-gradient(0deg,rgba(0,0,0,.03) 1px,transparent 1px) 0 0/28px 28px,
+  linear-gradient(90deg,rgba(0,0,0,.03) 1px,transparent 1px) 0 0/28px 28px,
+  var(--film);
+}
+.topbar{
+  position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:10px;
+  padding:8px 14px; background:rgba(217,224,227,.92); backdrop-filter:blur(6px);
+  border-bottom:1px solid var(--rule); font-size:12px;
+}
+.topbar .fname{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); font-family:var(--mono)}
+.topbar button{padding:5px 9px}
+.topbar .pg{font-family:var(--mono); font-variant-numeric:tabular-nums; min-width:66px; text-align:center}
+
+.holder{padding:26px; display:inline-block; min-width:100%}
+.sheet{position:relative; display:inline-block; background:var(--paper); box-shadow:0 1px 0 var(--rule-2), 0 14px 34px rgba(16,30,36,.20)}
+.sheet canvas{display:block}
+#overlay{position:absolute; inset:0; cursor:crosshair}
+/* ── 服务器分析 / 审计面板 ───────────────────────── */
+.chips{display:flex; flex-wrap:wrap; gap:5px; margin:0 0 9px}
+.chip{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.02em;
+  padding:2px 7px; border:1px solid var(--rule-2); border-radius:9px; color:var(--ink-2); background:#fff;
+}
+.chip.on{background:var(--ink); color:#fff; border-color:var(--ink)}
+.chip.warn{background:#FBE9DE; border-color:#C4733F; color:#7C3A12}
+
+.rlist{list-style:none; margin:0; padding:0}
+.rlist li{
+  display:flex; align-items:center; gap:8px; padding:7px 8px; margin-bottom:4px; cursor:pointer;
+  border:1px solid var(--rule); background:#fff; border-radius:2px; font-size:12px;
+}
+.rlist li:hover{background:#EDF2F3}
+.rlist li[aria-selected=true]{border-color:var(--brass); box-shadow:inset 3px 0 0 var(--brass)}
+.rlist .rk{font-family:var(--mono); font-size:10px; color:var(--ink-2); text-transform:uppercase; letter-spacing:.08em}
+.rlist .rn{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.rlist li.tb{opacity:.62}
+
+/* 结果卡 */
+.card{border:1px solid var(--rule-2); background:#fff; border-radius:2px; padding:14px; margin-top:2px}
+.card .big{font-family:var(--mono); font-size:27px; line-height:1.1; font-variant-numeric:tabular-nums; letter-spacing:-.02em}
+.card .big small{font-size:14px; color:var(--ink-2); margin-left:5px}
+.card .alt{font-family:var(--mono); font-size:11.5px; color:var(--ink-2); margin-top:4px; font-variant-numeric:tabular-nums}
+.conf{margin-top:12px}
+.conf .top{display:flex; justify-content:space-between; align-items:baseline; font-size:11.5px}
+.conf .pct{font-family:var(--mono); font-size:15px}
+.conf .track{height:5px; background:var(--film-deep); margin-top:5px; border-radius:3px; overflow:hidden}
+.conf .fill{height:100%; background:var(--verdigris-lit)}
+.conf.medium .fill{background:var(--brass-lit)}
+.conf.low .fill{background:var(--minus)}
+.conf .parts{display:grid; grid-template-columns:1fr 1fr; gap:2px 10px; margin-top:8px; font-family:var(--mono); font-size:10.5px; color:var(--ink-2)}
+.conf .parts b{color:var(--ink); font-weight:400}
+
+.kv{margin-top:12px; border-top:1px dotted var(--rule); padding-top:10px; font-size:11.5px}
+.kv div{display:flex; gap:8px; padding:2px 0}
+.kv .k{color:var(--ink-2); flex:none; width:62px}
+.kv .v{flex:1; min-width:0; font-family:var(--mono); font-size:11px; word-break:break-word}
+
+.notes{margin:10px 0 0; padding:0; list-style:none; font-size:11.5px}
+.notes li{padding:6px 8px; margin-top:5px; border-left:3px solid var(--brass); background:#FCF6EA; white-space:pre-wrap}
+.notes li.assume{border-left-color:var(--rule-2); background:var(--panel); color:var(--ink-2)}
+details.ev{margin-top:9px; font-size:11.5px}
+details.ev summary{cursor:pointer; color:var(--ink-2)}
+details.ev ul{margin:6px 0 0; padding-left:16px; font-family:var(--mono); font-size:10.5px; color:var(--ink-2)}
+
+.legend{display:flex; flex-wrap:wrap; gap:9px; margin-top:10px; font-size:11px; color:var(--ink-2)}
+.legend span{display:flex; align-items:center; gap:5px}
+.legend i{width:11px; height:11px; border-radius:2px; display:inline-block}
+
+#vec{position:absolute; inset:0; pointer-events:none; overflow:visible}
+#vec.review{pointer-events:auto; cursor:pointer}
+.sheet.review #overlay{pointer-events:none}
+.fixbar{display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:10px}
+.fixbar button{font-size:12px; padding:7px 4px}
+.fixbar button[aria-pressed=true]{background:var(--ink); color:#fff; border-color:var(--ink)}
+.fixnote{margin:8px 0 0; font-size:11.5px; color:var(--ink-2)}
+.fixnote b{color:var(--brass); font-weight:400; font-family:var(--mono)}
+.selbox{position:absolute; border:1.5px dashed var(--brass); background:rgba(224,166,60,.14); pointer-events:none; display:none}
+
+.drop{
+  position:absolute; inset:0; display:grid; place-items:center; text-align:center; padding:30px;
+}
+.drop .card{max-width:430px}
+.drop .mark{font-family:var(--display); font-size:15px; letter-spacing:.22em; text-transform:uppercase; color:var(--ink-2)}
+.drop h3{font-family:var(--display); font-size:30px; margin:10px 0 8px; font-weight:700}
+.drop p{color:var(--ink-2); margin:0 0 18px}
+.drop.hot{background:rgba(224,166,60,.18)}
+.busy{position:absolute; inset:0; display:none; place-items:center; background:rgba(217,224,227,.7); font-family:var(--mono); font-size:13px}
+.busy.on{display:grid}
+
+@media (max-width:860px){
+  .app{grid-template-columns:1fr; grid-template-rows:auto 1fr}
+  .rail{border-right:0; border-bottom:1px solid var(--rule); max-height:46vh}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <h1>投影面积测量仪</h1>
+      <p>PDF 图纸 · 标定比例 · 读取面积</p>
+    </div>
+
+    <div class="readout">
+      <div class="cap" id="totalCap">合计投影面积</div>
+      <div class="num" id="total">—<small id="totalUnit"></small></div>
+      <div class="bar"></div>
+    </div>
+
+    <div class="sect" id="srvSect">
+      <h2>0 · 图纸分析</h2>
+      <div class="chips" id="srvChips"><span class="chip">尚未分析</span></div>
+      <button class="primary" style="width:100%" id="srvRun" disabled>分析当前页</button>
+      <p class="hint" id="srvHint">识别矢量/扫描件、切分视图、从标注反推比例。文件只发送到你自己电脑上的本地服务。</p>
+
+      <ul class="rlist" id="srvRegions" style="margin-top:10px"></ul>
+
+      <div class="cal" id="srvScale" style="margin-top:10px; display:none">
+        <span class="dot"></span><span class="lbl">自动比例</span><span class="val">—</span>
+      </div>
+      <details class="ev" id="srvScaleEv" style="display:none">
+        <summary>比例依据</summary><ul></ul>
+      </details>
+
+      <div class="fixbar">
+        <button id="fxReview" aria-pressed="false" title="点击图上的线条，改判它是否计入">审阅线条</button>
+        <button id="fxDraw" title="手工补画一块计入区域">补画边界</button>
+        <button id="fxErase" title="手工挖掉一块区域">擦除区域</button>
+        <button id="fxClear" title="撤销全部人工修正">清除修正</button>
+      </div>
+      <p class="fixnote" id="fxNote">自动识别不对时，可以人工改判。所有修正都会写进结果里。</p>
+
+      <div class="row" style="margin-top:10px">
+        <div>
+          <label class="f" for="srvHoles">孔洞处理</label>
+          <select id="srvHoles">
+            <option value="1">扣除孔洞（净投影）</option>
+            <option value="0">填满孔洞（外轮廓）</option>
+          </select>
+        </div>
+      </div>
+      <button style="width:100%; margin-top:8px" id="srvCalc" disabled>计算投影面积</button>
+    </div>
+
+    <div class="sect">
+      <h2>1 · 比例标定</h2>
+      <label class="f" for="calMode">标定方式</label>
+      <select id="calMode">
+        <option value="ratio">按出图比例（1 : N）</option>
+        <option value="pick">在图上量一段已知长度</option>
+      </select>
+
+      <div id="ratioBox" style="margin-top:10px">
+        <label class="f" for="ratioN">比例分母 N（1 : N）</label>
+        <input type="number" id="ratioN" value="100" min="0.001" step="any">
+        <button style="margin-top:8px;width:100%" id="applyRatio">套用比例</button>
+        <p class="hint">前提：PDF 按实际图幅打印。1:1 导出的图填 1。</p>
+      </div>
+
+      <div id="pickBox" style="margin-top:10px; display:none">
+        <button style="width:100%" id="startPick">在图上点两点</button>
+        <div class="row" style="margin-top:8px">
+          <div>
+            <label class="f" for="knownLen">该段实际长度</label>
+            <input type="number" id="knownLen" placeholder="例如 6000" step="any">
+          </div>
+          <div>
+            <label class="f" for="knownUnit">单位</label>
+            <select id="knownUnit">
+              <option value="mm">mm</option><option value="cm">cm</option>
+              <option value="m">m</option><option value="in">in</option><option value="ft">ft</option>
+            </select>
+          </div>
+        </div>
+        <button class="primary" style="margin-top:8px;width:100%" id="applyPick" disabled>设定比例</button>
+        <p class="hint">选一条最长的已知尺寸线，误差最小。</p>
+      </div>
+
+      <div class="cal" id="calState" style="margin-top:12px">
+        <span class="dot"></span><span class="lbl">当前比例</span><span class="val">未标定</span>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h2>2 · 测量</h2>
+      <div class="modes">
+        <button id="mWand" aria-pressed="true">魔棒填充</button>
+        <button id="mPoly" aria-pressed="false">多边形</button>
+        <button id="mCal" aria-pressed="false">标尺</button>
+      </div>
+      <p class="hint" id="modeHint">点进封闭轮廓内部，自动填满并算面积。</p>
+
+      <div id="wandOpts" style="margin-top:12px">
+        <label class="f" for="tol">颜色容差 <span id="tolVal" style="font-family:var(--mono)">30</span></label>
+        <input type="range" id="tol" min="4" max="120" value="30" style="width:100%">
+      </div>
+
+      <div id="polyOpts" style="margin-top:12px; display:none">
+        <div class="row">
+          <button id="closePoly">闭合并计算</button>
+          <button id="undoPt">退回一点</button>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div>
+          <label class="f" for="sign">计入方式</label>
+          <select id="sign"><option value="1">加上 (+)</option><option value="-1">扣除 (−)</option></select>
+        </div>
+        <div>
+          <label class="f" for="unit">显示单位</label>
+          <select id="unit">
+            <option value="m2">m²</option><option value="cm2">cm²</option>
+            <option value="mm2">mm²</option><option value="ft2">ft²</option><option value="in2">in²</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect" id="srvResultSect" style="display:none">
+      <h2>投影面积结果</h2>
+      <div class="card">
+        <div class="big" id="rcMain">—</div>
+        <div class="alt" id="rcAlt"></div>
+
+        <div class="conf" id="rcConf">
+          <div class="top"><span>置信度</span><span class="pct" id="rcConfPct">—</span></div>
+          <div class="track"><div class="fill" id="rcConfFill" style="width:0%"></div></div>
+          <div class="parts" id="rcConfParts"></div>
+        </div>
+
+        <div class="kv" id="rcKv"></div>
+        <ul class="rlist" id="rcComponents" style="margin-top:10px"></ul>
+        <ul class="notes" id="rcNotes"></ul>
+        <details class="ev" id="rcRepairs" style="display:none"><summary>几何修复记录</summary><ul></ul></details>
+
+        <div class="legend">
+          <span><i style="background:rgba(62,154,141,.55)"></i>计入轮廓</span>
+          <span><i style="background:rgba(154,52,18,.55)"></i>孔洞/扣除</span>
+          <span><i style="background:rgba(180,128,42,.55)"></i>存疑</span>
+          <span><i style="background:rgba(74,88,95,.35)"></i>已忽略</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect" style="flex:1">
+      <h2>3 · 手工测量</h2>
+      <ul class="list" id="list"></ul>
+      <p class="empty" id="listEmpty">还没有测量记录。</p>
+      <div class="cal" id="manualTotal" style="margin-top:10px; display:none">
+        <span class="dot"></span><span class="lbl">手工合计</span><span class="val">—</span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="exportCsv">导出 CSV</button>
+        <button id="clearAll">全部清除</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="stage" id="stage">
+    <div class="topbar">
+      <input type="file" id="file" accept="application/pdf,image/*" hidden>
+      <button id="openBtn">打开文件</button>
+      <span class="fname" id="fname">未载入图纸</span>
+      <button id="prev" disabled>‹</button>
+      <span class="pg" id="pg">— / —</span>
+      <button id="next" disabled>›</button>
+      <button id="zoomOut" disabled>−</button>
+      <span class="pg" id="zoomLbl">100%</span>
+      <button id="zoomIn" disabled>＋</button>
+      <button id="serverAnalyze" disabled>分析图纸</button>
+      <button id="pickRegion" disabled aria-pressed="false">框选视图</button>
+    </div>
+
+    <div class="holder" id="holder">
+      <div class="sheet" id="sheet" style="display:none">
+        <canvas id="page"></canvas>
+        <svg id="vec" xmlns="http://www.w3.org/2000/svg"></svg>
+        <canvas id="overlay"></canvas>
+        <div class="selbox" id="selbox"></div>
+      </div>
+    </div>
+
+    <div class="drop" id="drop">
+      <div class="card">
+        <div class="mark">Planimeter</div>
+        <h3>把 PDF 图纸拖进来</h3>
+        <p>支持矢量导出的 CAD 图，也支持扫描件和图片。文件只在你的浏览器里处理，不会上传。</p>
+        <button class="primary" id="openBtn2">选择文件</button>
+      </div>
+    </div>
+    <div class="busy" id="busy">正在渲染…</div>
+  </main>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const $ = id => document.getElementById(id);
+const pageCv = $("page"), ovCv = $("overlay");
+const pctx = pageCv.getContext("2d", {willReadFrequently:true});
+const octx = ovCv.getContext("2d");
+
+const S = {
+  pdf:null, imgEl:null, pageNum:1, numPages:0,
+  zoom:1, base:1.4,           // 渲染倍率 = base*zoom（canvas 像素 / PDF 点）
+  scale:1,                    // 实际渲染倍率
+  mmPerPt:null,               // 真实毫米 / PDF 点
+  mode:"wand", tol:30, sign:1, unit:"m2",
+  items:[], calPts:[], poly:[], seq:0,
+  imgData:null, W:0, H:0
+};
+const MM = {mm:1, cm:10, m:1000, in:25.4, ft:304.8};
+const AREA = {mm2:[1,"mm²"], cm2:[100,"cm²"], m2:[1e6,"m²"], in2:[645.16,"in²"], ft2:[92903.04,"ft²"]};
+
+/* ── 文件载入 ───────────────────────────────── */
+$("openBtn").onclick = $("openBtn2").onclick = () => $("file").click();
+$("file").onchange = e => { if(e.target.files[0]) load(e.target.files[0]); };
+const stage = $("stage"), drop = $("drop");
+["dragenter","dragover"].forEach(t=>stage.addEventListener(t,e=>{e.preventDefault();drop.classList.add("hot");drop.style.display="grid";}));
+stage.addEventListener("dragleave",e=>{if(e.target===stage){drop.classList.remove("hot"); if(S.pdf||S.imgEl) drop.style.display="none";}});
+stage.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("hot");
+  const f=e.dataTransfer.files[0]; if(f) load(f); else if(S.pdf||S.imgEl) drop.style.display="none";});
+
+async function load(file){
+  busy(true);
+  S.items=[]; S.calPts=[]; S.poly=[]; S.pdf=null; S.imgEl=null; S.pageNum=1;
+  S.uploadFile = file;
+  $("fname").textContent = file.name;
+  try{
+    if(file.type === "application/pdf" || /\.pdf$/i.test(file.name)){
+      const buf = await file.arrayBuffer();
+      S.pdf = await pdfjsLib.getDocument({data:buf}).promise;
+      S.numPages = S.pdf.numPages;
+    } else {
+      S.imgEl = await new Promise((res,rej)=>{ const i=new Image();
+        i.onload=()=>res(i); i.onerror=()=>rej(new Error("图片打不开")); i.src=URL.createObjectURL(file); });
+      S.numPages = 1;
+    }
+    drop.style.display="none"; $("sheet").style.display="inline-block";
+    ["prev","next","zoomIn","zoomOut","serverAnalyze"].forEach(b=>$(b).disabled=false);
+    await render();
+  }catch(err){
+    alert("这个文件读不了：" + err.message);
+  }finally{ busy(false); }
+}
+function busy(on){ $("busy").classList.toggle("on", on); }
+
+/* ── 渲染 ──────────────────────────────────── */
+async function render(){
+  busy(true);
+  S.scale = S.base * S.zoom;
+  if(S.pdf){
+    const page = await S.pdf.getPage(S.pageNum);
+    const vp = page.getViewport({scale:S.scale});
+    pageCv.width = Math.round(vp.width); pageCv.height = Math.round(vp.height);
+    pctx.fillStyle="#fff"; pctx.fillRect(0,0,pageCv.width,pageCv.height);
+    await page.render({canvasContext:pctx, viewport:vp}).promise;
+  } else {
+    pageCv.width = Math.round(S.imgEl.width*S.scale);
+    pageCv.height = Math.round(S.imgEl.height*S.scale);
+    pctx.fillStyle="#fff"; pctx.fillRect(0,0,pageCv.width,pageCv.height);
+    pctx.drawImage(S.imgEl,0,0,pageCv.width,pageCv.height);
+  }
+  S.W = pageCv.width; S.H = pageCv.height;
+  ovCv.width = S.W; ovCv.height = S.H;
+  S.imgData = pctx.getImageData(0,0,S.W,S.H);
+  S.items.forEach(m => { if(m.type==="wand") m._mask = null; });
+  $("pg").textContent = `${S.pageNum} / ${S.numPages}`;
+  $("zoomLbl").textContent = Math.round(S.zoom*100)+"%";
+  redraw();
+  if (window.SRV) SRV.onRender();
+  busy(false);
+}
+$("prev").onclick = ()=>{ if(S.pageNum>1){S.pageNum--; S.poly=[]; S.calPts=[]; render();} };
+$("next").onclick = ()=>{ if(S.pageNum<S.numPages){S.pageNum++; S.poly=[]; S.calPts=[]; render();} };
+$("zoomIn").onclick = ()=>{ S.zoom=Math.min(8,S.zoom*1.4); render(); };
+$("zoomOut").onclick= ()=>{ S.zoom=Math.max(.15,S.zoom/1.4); render(); };
+
+/* ── 比例标定 ───────────────────────────────── */
+$("calMode").onchange = e => {
+  const r = e.target.value==="ratio";
+  $("ratioBox").style.display = r?"block":"none";
+  $("pickBox").style.display  = r?"none":"block";
+};
+$("applyRatio").onclick = ()=>{
+  const n = parseFloat($("ratioN").value);
+  if(!(n>0)) return alert("比例分母要填大于 0 的数。");
+  // 1 PDF 点 = 1/72 英寸 = 25.4/72 mm（纸面尺寸）→ 乘比例分母得实际长度
+  S.mmPerPt = (25.4/72) * n;
+  showCal(`1 : ${n}`);
+};
+$("startPick").onclick = ()=>{ setMode("cal"); S.calPts=[]; redraw(); };
+$("applyPick").onclick = ()=>{
+  const v = parseFloat($("knownLen").value);
+  if(!(v>0)) return alert("先填这段线的实际长度。");
+  const [a,b] = S.calPts;
+  const dPt = Math.hypot(a.x-b.x, a.y-b.y);      // 已是 PDF 点
+  if(dPt < 2) return alert("两点太近了，换一段长一点的尺寸线。");
+  S.mmPerPt = v*MM[$("knownUnit").value] / dPt;
+  showCal(`1 : ${(S.mmPerPt/(25.4/72)).toFixed(1)}`);
+  recalcAll();
+};
+function showCal(txt){
+  const el=$("calState"); el.classList.add("ok");
+  el.querySelector(".val").textContent = txt;
+  recalcAll();
+}
+
+/* ── 模式 ──────────────────────────────────── */
+const HINTS = {
+  wand:"点进封闭轮廓内部，自动填满并算面积。",
+  poly:"依次点击顶点，双击或按“闭合并计算”收尾。",
+  cal:"点第一点，再点第二点，然后填实际长度。"
+};
+function setMode(m){
+  S.mode=m; S.poly=[]; if(m!=="cal") S.calPts=[];
+  $("mWand").setAttribute("aria-pressed", m==="wand");
+  $("mPoly").setAttribute("aria-pressed", m==="poly");
+  $("mCal").setAttribute("aria-pressed",  m==="cal");
+  $("wandOpts").style.display = m==="wand"?"block":"none";
+  $("polyOpts").style.display = m==="poly"?"block":"none";
+  $("modeHint").textContent = HINTS[m];
+  $("applyPick").disabled = !(m==="cal" && S.calPts.length===2);
+  redraw();
+}
+$("mWand").onclick=()=>setMode("wand");
+$("mPoly").onclick=()=>setMode("poly");
+$("mCal").onclick =()=>{ $("calMode").value="pick"; $("calMode").onchange({target:$("calMode")}); setMode("cal"); };
+$("tol").oninput = e=>{ S.tol=+e.target.value; $("tolVal").textContent=e.target.value; };
+$("sign").onchange = e=>S.sign=+e.target.value;
+$("unit").onchange = e=>{ S.unit=e.target.value; paint(); };
+
+/* ── 画布交互 ───────────────────────────────── */
+function pos(ev){
+  const r = ovCv.getBoundingClientRect();
+  return { px:(ev.clientX-r.left)*(ovCv.width/r.width), py:(ev.clientY-r.top)*(ovCv.height/r.height) };
+}
+ovCv.addEventListener("click", ev=>{
+  if(!S.imgData) return;
+  const {px,py} = pos(ev);
+  const pt = {x:px/S.scale, y:py/S.scale};        // 存 PDF 点，缩放后仍有效
+  if(S.mode==="cal"){
+    if(S.calPts.length>=2) S.calPts=[];
+    S.calPts.push(pt); $("applyPick").disabled = S.calPts.length!==2; redraw();
+  } else if(S.mode==="poly"){
+    S.poly.push(pt); redraw();
+  } else {
+    wand(px|0, py|0, pt);
+  }
+});
+ovCv.addEventListener("dblclick", ()=>{ if(S.mode==="poly") closePoly(); });
+$("closePoly").onclick = closePoly;
+$("undoPt").onclick = ()=>{ S.poly.pop(); redraw(); };
+
+function closePoly(){
+  if(S.poly.length<3) return alert("至少要 3 个点才围得成面。");
+  const m = {id:++S.seq, page:S.pageNum, type:"poly", sign:S.sign, pts:S.poly.slice()};
+  S.items.push(m); S.poly=[]; recalcAll();
+}
+
+/* 魔棒：扫描线洪水填充 */
+function wand(sx,sy,seedPt){
+  if(sx<0||sy<0||sx>=S.W||sy>=S.H) return;
+  const m = {id:++S.seq, page:S.pageNum, type:"wand", sign:S.sign, seed:seedPt, tol:S.tol};
+  const r = fill(m);
+  if(!r) return;
+  if(r.count > S.W*S.H*0.9){
+    if(!confirm("填充范围几乎盖住整张图 —— 轮廓可能没闭合，或者点到线上了。仍然记入吗？")) return;
+  }
+  S.items.push(m); recalcAll();
+}
+function fill(m){
+  const sx = Math.round(m.seed.x*S.scale), sy = Math.round(m.seed.y*S.scale);
+  if(sx<0||sy<0||sx>=S.W||sy>=S.H) return null;
+  const d = S.imgData.data, W=S.W, H=S.H, tol=m.tol;
+  const i0=(sy*W+sx)*4, r0=d[i0], g0=d[i0+1], b0=d[i0+2];
+  const seen = new Uint8Array(W*H);
+  const stack = [sx,sy]; let count=0;
+  const like = i => Math.abs(d[i]-r0)<=tol && Math.abs(d[i+1]-g0)<=tol && Math.abs(d[i+2]-b0)<=tol;
+  while(stack.length){
+    const y = stack.pop(), x0 = stack.pop();
+    let x = x0;
+    while(x>=0 && !seen[y*W+x] && like((y*W+x)*4)) x--;
+    x++;
+    let up=false, dn=false;
+    while(x<W && !seen[y*W+x] && like((y*W+x)*4)){
+      seen[y*W+x]=1; count++;
+      if(y>0){ const u=!seen[(y-1)*W+x] && like(((y-1)*W+x)*4);
+        if(u&&!up){stack.push(x,y-1);up=true;} else if(!u) up=false; }
+      if(y<H-1){ const v=!seen[(y+1)*W+x] && like(((y+1)*W+x)*4);
+        if(v&&!dn){stack.push(x,y+1);dn=true;} else if(!v) dn=false; }
+      x++;
+    }
+  }
+  m._mask = seen; m._scale = S.scale; m.pxCount = count;
+  return {count};
+}
+
+/* ── 面积计算 ───────────────────────────────── */
+function areaMM2(m){
+  if(!S.mmPerPt) return null;
+  if(m.type==="poly"){
+    let a=0; const p=m.pts;
+    for(let i=0,j=p.length-1;i<p.length;j=i++) a += (p[j].x*p[i].y - p[i].x*p[j].y);
+    return Math.abs(a/2) * S.mmPerPt * S.mmPerPt;      // 点² → mm²
+  }
+  if(m._scale!==S.scale || !m._mask) fill(m);
+  const mmPerPx = S.mmPerPt / S.scale;
+  return m.pxCount * mmPerPx * mmPerPx;
+}
+function fmt(mm2){
+  if(mm2==null) return "—";
+  const v = mm2 / AREA[S.unit][0];
+  const abs = Math.abs(v);
+  const dp = abs>=1000?0 : abs>=100?1 : abs>=1?2 : 4;
+  return v.toLocaleString(undefined,{minimumFractionDigits:dp, maximumFractionDigits:dp});
+}
+function recalcAll(){ S.items.forEach(m=> m.mm2 = areaMM2(m)); paint(); redraw(); }
+
+/* ── 面板刷新 ───────────────────────────────── */
+function paint(){
+  const ul=$("list"); ul.innerHTML="";
+  let tot=0, any=false;
+  S.items.forEach((m,i)=>{
+    const li=document.createElement("li");
+    if(m.sign<0) li.classList.add("neg");
+    const nm = (m.type==="wand"?"填充":"多边形") + ` ${i+1} · P${m.page}`;
+    li.innerHTML = `<span class="swatch"></span><span class="nm">${nm}</span>
+      <span class="ar">${m.sign<0?"−":"+"}${fmt(m.mm2)}</span>
+      <button class="x" title="删除">×</button>`;
+    li.querySelector(".x").onclick=()=>{ S.items.splice(i,1); recalcAll(); };
+    ul.appendChild(li);
+    if(m.mm2!=null){ tot += m.sign*m.mm2; any=true; }
+  });
+  $("listEmpty").style.display = S.items.length?"none":"block";
+  const mt = $("manualTotal");
+  if(mt){
+    mt.style.display = any ? "flex" : "none";
+    mt.classList.toggle("ok", any);
+    mt.querySelector(".val").textContent = any ? fmt(tot)+" "+AREA[S.unit][1] : "—";
+  }
+  // 顶部读数归后端结果所有；没有后端结果时才显示手工合计。
+  if(window.SRV && SRV.hasResult && SRV.hasResult()){ SRV.paintReadout(); return; }
+  $("totalCap").textContent = "合计投影面积";
+  $("total").firstChild.nodeValue = any ? fmt(tot) : "—";
+  $("totalUnit").textContent = any ? " "+AREA[S.unit][1] : "";
+}
+
+/* ── 叠加层绘制 ─────────────────────────────── */
+function redraw(){
+  if(!S.W) return;
+  octx.clearRect(0,0,S.W,S.H);
+  const here = S.items.filter(m=>m.page===S.pageNum);
+  const wands = here.filter(m=>m.type==="wand");
+  if(wands.length){
+    const im = octx.createImageData(S.W,S.H); const d=im.data;
+    wands.forEach(m=>{
+      if(m._scale!==S.scale || !m._mask) fill(m);
+      const [r,g,b] = m.sign<0 ? [154,52,18] : [62,154,141];
+      const k=m._mask;
+      for(let p=0;p<k.length;p++) if(k[p]){ const o=p*4; d[o]=r; d[o+1]=g; d[o+2]=b; d[o+3]=76; }
+    });
+    octx.putImageData(im,0,0);
+  }
+  const sc = S.scale;
+  here.filter(m=>m.type==="poly").forEach(m=>{
+    octx.beginPath();
+    m.pts.forEach((p,i)=> i? octx.lineTo(p.x*sc,p.y*sc) : octx.moveTo(p.x*sc,p.y*sc));
+    octx.closePath();
+    octx.fillStyle = m.sign<0 ? "rgba(154,52,18,.28)" : "rgba(62,154,141,.28)";
+    octx.strokeStyle = m.sign<0 ? "#9A3412" : "#2C6B62";
+    octx.lineWidth=2; octx.fill(); octx.stroke();
+  });
+  if(S.poly.length){
+    octx.beginPath();
+    S.poly.forEach((p,i)=> i? octx.lineTo(p.x*sc,p.y*sc) : octx.moveTo(p.x*sc,p.y*sc));
+    octx.strokeStyle="#B4802A"; octx.lineWidth=2; octx.setLineDash([6,4]); octx.stroke(); octx.setLineDash([]);
+    S.poly.forEach(p=>dot(p.x*sc,p.y*sc,"#B4802A"));
+  }
+  if(S.calPts.length){
+    if(S.calPts.length===2){
+      const [a,b]=S.calPts;
+      octx.beginPath(); octx.moveTo(a.x*sc,a.y*sc); octx.lineTo(b.x*sc,b.y*sc);
+      octx.strokeStyle="#B4802A"; octx.lineWidth=2.5; octx.stroke();
+    }
+    S.calPts.forEach(p=>dot(p.x*sc,p.y*sc,"#B4802A"));
+  }
+}
+function dot(x,y,c){
+  octx.beginPath(); octx.arc(x,y,4.5,0,7); octx.fillStyle=c; octx.fill();
+  octx.lineWidth=1.5; octx.strokeStyle="#fff"; octx.stroke();
+}
+
+/* ── 导出 / 清除 ────────────────────────────── */
+$("exportCsv").onclick = ()=>{
+  if(!S.items.length) return alert("还没有可导出的测量结果。");
+  const u = AREA[S.unit][1];
+  let csv = `序号,类型,页码,计入,面积(${u})\n`, tot=0;
+  S.items.forEach((m,i)=>{
+    csv += `${i+1},${m.type==="wand"?"填充":"多边形"},${m.page},${m.sign<0?"扣除":"加上"},${(m.mm2||0)/AREA[S.unit][0]}\n`;
+    tot += m.sign*(m.mm2||0);
+  });
+  csv += `,,,合计,${tot/AREA[S.unit][0]}\n`;
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob(["\uFEFF"+csv],{type:"text/csv"}));
+  a.download="投影面积.csv"; a.click();
+};
+$("clearAll").onclick = ()=>{ if(S.items.length && confirm("清除全部测量记录？")){ S.items=[]; recalcAll(); } };
+
+paint();
+</script>
+<script>
+/* ══════════════════════════════════════════════════════════════════════════
+   服务器几何分析 —— 与本地魔棒/多边形工具并存，不替换它们。
+   本地工具用于人工测量；后端负责矢量几何、比例反推与可审计的投影面积。
+   坐标一律使用 PDF 单位（1/72 英寸），与 PDF.js scale=1 视口一致，
+   因此叠加层只需按 S.scale 缩放，无需翻转坐标轴。
+   ══════════════════════════════════════════════════════════════════════════ */
+const SRV = (() => {
+  const API = /^https?:/.test(location.protocol) ? location.origin : "http://localhost:8000";
+  const vec = $("vec"), selbox = $("selbox");
+
+  const st = {
+    docId:null, file:null, page:null, analysis:null, result:null,
+    ignored:[], allPrims:[], regionId:null, regionBox:null, customBox:null,
+    scaleSpec:{mode:"auto"}, busy:false, dragging:null,
+    // 人工修正：图元改判、补画/擦除的边界。
+    overrides:{}, manualAdd:[], manualSub:[], review:false, polyTarget:null
+  };
+
+  const AREA_LABEL = {mm2:"mm²", cm2:"cm²", m2:"m²", in2:"in²", ft2:"ft²"};
+  const ROLE_CN = {
+    profile:"轮廓", centerline:"中心线", hidden:"虚线/不可见", dimension:"尺寸标注",
+    annotation:"注释", sheet:"图框/标题栏", hatch:"剖面线", uncertain:"存疑"
+  };
+  const METHOD_CN = {
+    vector_exact_polygonization:"原生矢量精确多边形化",
+    vector_gap_closed_silhouette:"矢量补口轮廓重建（近似）",
+    raster_contour_trace:"栅格描摹（精度受限）",
+    user_drawn_polygon:"人工绘制多边形"
+  };
+  const SCALE_CN = {
+    user_two_point_calibration:"两点人工标定", dimension_consensus:"多个尺寸标注一致反推",
+    single_dimension:"单个尺寸标注反推", drawing_scale_ratio:"图纸标注比例（未验证）", none:"未建立"
+  };
+  const KIND_CN = {view:"视图", title_block:"标题栏", table:"表格/BOM", note:"注释"};
+
+  const num = (v, dp) => v.toLocaleString(undefined, {minimumFractionDigits:dp, maximumFractionDigits:dp});
+  const fmtArea = v => num(v, Math.abs(v) >= 10000 ? 0 : Math.abs(v) >= 1000 ? 1 : Math.abs(v) >= 1 ? 2 : 4);
+  const esc = t => String(t).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+  async function call(path, options = {}) {
+    const res = await fetch(API + path, options);
+    if (!res.ok) {
+      let detail = await res.text();
+      try { detail = JSON.parse(detail).detail || detail; } catch (e) {}
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  function chips(list) {
+    $("srvChips").innerHTML = list
+      .map(c => `<span class="chip ${c.cls || ""}">${esc(c.text)}</span>`).join("");
+  }
+
+  /* ── 上传与分析 ───────────────────────────────────────────── */
+
+  function reset(file) {
+    if (st.docId) { fetch(API + "/api/documents/" + st.docId, {method:"DELETE"}).catch(()=>{}); }
+    Object.assign(st, {docId:null, file:file || null, page:null, analysis:null, result:null,
+                       ignored:[], allPrims:[], regionId:null, regionBox:null, customBox:null,
+                       scaleSpec:{mode:"auto"}, overrides:{}, manualAdd:[], manualSub:[],
+                       review:false, polyTarget:null});
+    setReview(false);
+    $("srvRegions").innerHTML = "";
+    $("srvScale").style.display = "none";
+    $("srvScaleEv").style.display = "none";
+    $("srvResultSect").style.display = "none";
+    $("srvCalc").disabled = true;
+    chips([{text:"尚未分析"}]);
+    $("totalCap").textContent = "合计投影面积";
+    $("total").firstChild.nodeValue = "—";
+    $("totalUnit").textContent = "";
+    paintOverlay();
+  }
+
+  async function ensureDoc() {
+    if (st.docId) return st.docId;
+    const file = st.file || (S.uploadFile) || ($("file").files && $("file").files[0]);
+    if (!file) throw new Error("先打开一个 PDF 文件。");
+    const body = new FormData();
+    body.append("file", file);
+    const doc = await call("/api/documents", {method:"POST", body});
+    st.docId = doc.document_id;
+    return st.docId;
+  }
+
+  async function analyze() {
+    if (st.busy) return;
+    if (!S.pdf) { alert("服务器分析目前只支持 PDF。图片请用左侧的人工测量工具。"); return; }
+    let autoRegion = null;
+    st.busy = true; busy(true);
+    try {
+      await ensureDoc();
+      const a = await call(`/api/documents/${st.docId}/pages/${S.pageNum}/analyze`);
+      st.analysis = a; st.page = S.pageNum;
+
+      const roles = "dimension,annotation,centerline,hidden,sheet,hatch,uncertain";
+      const g = await call(
+        `/api/documents/${st.docId}/pages/${S.pageNum}/geometry?roles=${roles}&max_primitives=6000`);
+      st.ignored = g.primitives || [];
+      st.allPrims = [];
+      renderFixNote();
+
+      renderChips(a); renderRegions(a); renderScale(a);
+      autoRegion = a.default_region_id || (a.regions[0] && a.regions[0].id);
+      if (autoRegion) selectRegion(autoRegion, {silent:true});
+      $("srvCalc").disabled = false;
+      paintOverlay();
+    } catch (err) {
+      chips([{text:"分析失败", cls:"warn"}]);
+      alert("分析失败：" + err.message + "\n\n请确认本地服务已启动：\n  .venv/bin/uvicorn backend.main:app --port 8000");
+    } finally { st.busy = false; busy(false); }
+
+    // 必须等 busy 释放后再算，否则 calc() 会因为忙标志直接返回，
+    // 分析完却什么结果都不出——这一步不能挪进 try 里。
+    if (autoRegion) await calc();
+  }
+
+  function renderChips(a) {
+    const typeCN = {vector:"矢量 PDF", raster:"扫描/位图", mixed:"矢量+位图", unknown:"未知"}[a.drawing_type];
+    const out = [
+      {text:typeCN, cls:a.drawing_type === "vector" ? "on" : "warn"},
+      {text:`${a.primitive_count} 个图元`},
+      {text:`${a.width_mm_paper}×${a.height_mm_paper} mm 图幅`}
+    ];
+    if (a.printed_scale) out.push({text:"图注 " + a.printed_scale.text});
+    if (a.sheet_unit) out.push({text:"单位 " + a.sheet_unit});
+    else out.push({text:"未声明单位，按 mm 处理", cls:"warn"});
+    chips(out);
+  }
+
+  function renderRegions(a) {
+    const ul = $("srvRegions");
+    if (!a.regions.length) { ul.innerHTML = '<li class="tb"><span class="rn">未识别出视图区域，可用“框选视图”手动指定。</span></li>'; return; }
+    ul.innerHTML = a.regions.map(r => `
+      <li data-id="${r.id}" class="${r.kind === "view" ? "" : "tb"}" aria-selected="false">
+        <span class="rk">${KIND_CN[r.kind] || r.kind}</span>
+        <span class="rn">${esc(r.label)}</span>
+        <span class="rk">${Math.round(r.ink_length)}</span>
+      </li>`).join("");
+    [...ul.querySelectorAll("li[data-id]")].forEach(li =>
+      li.onclick = () => selectRegion(li.dataset.id));
+  }
+
+  function renderScale(a) {
+    const el = $("srvScale"), ev = $("srvScaleEv");
+    const sc = a.scale;
+    el.style.display = "flex";
+    el.classList.toggle("ok", !!(sc && sc.verified));
+    if (!sc || !sc.verified) {
+      el.querySelector(".val").textContent = "未建立 — 请人工标定";
+      ev.style.display = "none";
+      return;
+    }
+    el.querySelector(".val").textContent =
+      `${sc.mm_per_unit.toFixed(5)} mm/unit · ${sc.implied_ratio}`;
+    // 让本地魔棒/多边形工具与后端使用同一个比例，避免同一张图出现两个答案。
+    S.mmPerPt = sc.mm_per_unit;
+    showCal(sc.implied_ratio);
+    const lines = (sc.evidence || []).concat(a.scale_warnings || []);
+    ev.style.display = lines.length ? "block" : "none";
+    ev.querySelector("ul").innerHTML = lines.map(e => `<li>${esc(e)}</li>`).join("");
+  }
+
+  /* ── 视图选择 ─────────────────────────────────────────────── */
+
+  function selectRegion(id, opts = {}) {
+    st.regionId = id; st.customBox = null;
+    const region = (st.analysis.regions || []).find(r => r.id === id);
+    st.regionBox = region ? region.bbox : null;
+    [...$("srvRegions").querySelectorAll("li[data-id]")].forEach(li =>
+      li.setAttribute("aria-selected", String(li.dataset.id === id)));
+    paintOverlay();
+    if (!opts.silent) calc();
+  }
+
+  function setCustomBox(box) {
+    st.customBox = box; st.regionId = null; st.regionBox = box;
+    [...$("srvRegions").querySelectorAll("li[data-id]")].forEach(li =>
+      li.setAttribute("aria-selected", "false"));
+    paintOverlay();
+    calc();
+  }
+
+  /* ── 计算 ─────────────────────────────────────────────────── */
+
+  async function calc(extra = {}) {
+    if (!st.docId || !st.analysis || st.busy) return;
+    st.busy = true; busy(true);
+    try {
+      const body = {
+        scale: st.scaleSpec,
+        subtract_holes: $("srvHoles").value === "1",
+        exclude_components: extra.exclude || [],
+        role_overrides: st.overrides,
+        manual_add: st.manualAdd,
+        manual_subtract: st.manualSub,
+        ...(st.customBox ? {region_bbox: st.customBox} : {}),
+        ...(st.regionId ? {region_id: st.regionId} : {})
+      };
+      st.result = await call(`/api/documents/${st.docId}/pages/${st.page}/area`,
+        {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      renderResult(); paintOverlay();
+    } catch (err) {
+      alert("计算失败：" + err.message);
+    } finally { st.busy = false; busy(false); }
+  }
+
+  function paintReadout() {
+    const r = st.result;
+    const pa = r && r.projected_area;
+    if (!pa) return;
+    if (pa.verified) {
+      $("totalCap").textContent = "投影面积 · " + (r.view.label || "自动");
+      $("total").firstChild.nodeValue = fmtArea(pa.net[S.unit]);
+      $("totalUnit").textContent = " " + AREA_LABEL[S.unit];
+    } else {
+      $("totalCap").textContent = "投影面积 · 未标定";
+      $("total").firstChild.nodeValue = "—";
+      $("totalUnit").textContent = "";
+    }
+  }
+
+  function renderResult() {
+    const r = st.result; if (!r) return;
+    $("srvResultSect").style.display = "block";
+    paintReadout();
+    const unit = S.unit, pa = r.projected_area;
+
+    if (pa.verified) {
+      $("rcMain").innerHTML = `${fmtArea(pa.net[unit])}<small>${AREA_LABEL[unit]}</small>`;
+      const others = ["mm2","cm2","m2","in2"].filter(u => u !== unit)
+        .map(u => `${fmtArea(pa.net[u])} ${AREA_LABEL[u]}`).join("　·　");
+      const gross = r.subtract_holes && r.area_pdf_units2.holes > 0
+        ? `<br>外轮廓（含孔）${fmtArea(pa.gross[unit])} ${AREA_LABEL[unit]}　·　孔洞 ${fmtArea(pa.holes[unit])} ${AREA_LABEL[unit]}`
+        : "";
+      $("rcAlt").innerHTML = others + gross;
+    } else {
+      $("rcMain").innerHTML = `未标定<small>无法给出物理面积</small>`;
+      $("rcAlt").textContent = `图面面积 ${fmtArea(r.area_pdf_units2.net)} PDF 单位²（不是制造尺寸）`;
+    }
+
+    const c = r.confidence;
+    $("rcConf").className = "conf " + c.band;
+    $("rcConfPct").textContent = c.percent + "%";
+    $("rcConfFill").style.width = c.percent + "%";
+    $("rcConfParts").innerHTML = Object.entries(c.components)
+      .map(([k, v]) => `<div>${({source:"来源",geometry:"几何",scale:"比例",view:"视图",repair:"修复"})[k]} <b>${Math.round(v*100)}%</b></div>`)
+      .join("");
+
+    const g = r.geometry;
+    const ignoredSummary = Object.entries(g.role_counts || {})
+      .filter(([k]) => k !== "profile").map(([k, v]) => `${ROLE_CN[k] || k}×${v}`).join("、") || "无";
+    $("rcKv").innerHTML = [
+      ["方法", METHOD_CN[r.method] || r.method],
+      ["视图", `${esc(r.view.label)}（${r.view.source === "user_selected" ? "已选定" : r.view.source === "auto_detected" ? "自动识别" : "整页"}）`],
+      ["比例", r.scale.verified
+        ? `${r.scale.mm_per_unit.toFixed(5)} mm/unit · ${r.scale.implied_ratio}`
+        : "未建立"],
+      ["来源", SCALE_CN[r.scale.source] || r.scale.source],
+      ["几何", `${g.outer_contours} 个外轮廓 · ${g.holes} 个孔 · ${g.segments} 段线`],
+      ["已忽略", ignoredSummary],
+      ["版本", `${r.engine_version} · ${r.timestamp}`]
+    ].map(([k, v]) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`).join("");
+
+    const comps = r.components || [];
+    $("rcComponents").innerHTML = comps.length < 2 ? "" : comps.map(c2 => `
+      <li data-cid="${c2.id}" class="${c2.included ? "" : "tb"}" aria-selected="${c2.included}">
+        <span class="rk">${c2.included ? "计入" : "排除"}</span>
+        <span class="rn">轮廓 ${c2.id}　${c2.hole_count} 孔</span>
+        <span class="rk">${r.scale.verified
+          ? fmtArea(c2.area_units2 * r.scale.mm_per_unit ** 2 / ({mm2:1,cm2:100,m2:1e6,in2:645.16,ft2:92903.04})[S.unit])
+          : Math.round(c2.area_units2)}</span>
+      </li>`).join("");
+    [...$("rcComponents").querySelectorAll("li[data-cid]")].forEach(li => li.onclick = () => {
+      const excluded = comps.filter(x => !x.included).map(x => x.id);
+      const id = li.dataset.cid;
+      const next = excluded.includes(id) ? excluded.filter(x => x !== id) : excluded.concat([id]);
+      calc({exclude: next});
+    });
+
+    $("rcNotes").innerHTML =
+      (r.warnings || []).map(w => `<li>${esc(w)}</li>`).join("") +
+      (r.assumptions || []).map(a => `<li class="assume">${esc(a)}</li>`).join("");
+
+    const repairs = (g.repairs || []).filter(x => x.count > 0);
+    $("rcRepairs").style.display = repairs.length ? "block" : "none";
+    $("rcRepairs").querySelector("ul").innerHTML =
+      repairs.map(x => `<li>${esc(x.type)} ×${x.count} — ${esc(x.detail)}</li>`).join("");
+  }
+
+  /* ── 叠加层 ───────────────────────────────────────────────── */
+
+  const ringPath = ring => "M" + ring.map(p => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("L") + "Z";
+
+  function paintOverlay() {
+    if (!S.W) { vec.innerHTML = ""; return; }
+    const wPt = pageCv.width / S.scale, hPt = pageCv.height / S.scale;
+    vec.setAttribute("width", pageCv.width);
+    vec.setAttribute("height", pageCv.height);
+    vec.setAttribute("viewBox", `0 0 ${wPt} ${hPt}`);
+    const hair = 1.1 / S.scale;   // 线宽保持屏幕上恒定粗细
+    const out = [];
+
+    const source = st.review ? st.allPrims : st.ignored;
+    for (const prim of source) {
+      const role = st.overrides[prim.index] || prim.role;
+      const counted = role === "profile";
+      const d = "M" + prim.points.map(p => `${p[0]},${p[1]}`).join("L") + (prim.closed ? "Z" : "");
+      const colour = role === "uncertain" ? "#B4802A" : counted ? "#2C6B62" : "#4A585F";
+      if (st.review) {
+        // 透明粗描边只用来接住点击，视觉上仍是细线。
+        out.push(`<path d="${d}" fill="none" stroke="transparent" stroke-width="${hair * 7}"
+          pointer-events="stroke" data-idx="${prim.index}"><title>${esc(role)}${
+            prim.role_reason ? " — " + esc(prim.role_reason) : ""}</title></path>`);
+      }
+      out.push(`<path d="${d}" fill="none" stroke="${colour}" pointer-events="none"
+        stroke-opacity="${st.review ? (counted ? .9 : .55) : role === "uncertain" ? .85 : .34}"
+        stroke-width="${hair * (st.review && counted ? 1.8 : 1)}"
+        ${st.review && !counted ? `stroke-dasharray="${hair*3} ${hair*2.5}"` : ""}/>`);
+    }
+
+    const r = st.result;
+    if (r) {
+      for (const comp of r.components) {
+        const d = [ringPath(comp.outer)].concat(comp.holes.map(ringPath)).join(" ");
+        if (comp.included) {
+          out.push(`<path d="${d}" fill-rule="evenodd" fill="rgba(62,154,141,.30)"
+            stroke="#2C6B62" stroke-width="${hair * 1.7}"/>`);
+          for (const hole of comp.holes) {
+            out.push(`<path d="${ringPath(hole)}" fill="rgba(154,52,18,.30)"
+              stroke="#9A3412" stroke-width="${hair * 1.4}"/>`);
+          }
+        } else {
+          out.push(`<path d="${d}" fill-rule="evenodd" fill="none" stroke="#4A585F"
+            stroke-opacity=".55" stroke-width="${hair}" stroke-dasharray="${hair*4} ${hair*3}"/>`);
+        }
+      }
+    }
+
+    const box = st.regionBox;
+    if (box) {
+      out.push(`<rect x="${box.x0}" y="${box.y0}" width="${box.x1-box.x0}" height="${box.y1-box.y0}"
+        fill="none" stroke="#B4802A" stroke-width="${hair*1.5}" stroke-dasharray="${hair*6} ${hair*4}"/>`);
+    }
+    vec.innerHTML = out.join("");
+  }
+
+  /* ── 框选视图 ─────────────────────────────────────────────── */
+
+  function pdfPoint(ev) {
+    const rect = ovCv.getBoundingClientRect();
+    return {
+      x: (ev.clientX - rect.left) * (ovCv.width / rect.width) / S.scale,
+      y: (ev.clientY - rect.top) * (ovCv.height / rect.height) / S.scale
+    };
+  }
+
+  let picking = false;
+  $("pickRegion").onclick = () => {
+    picking = !picking;
+    $("pickRegion").setAttribute("aria-pressed", String(picking));
+    ovCv.style.cursor = picking ? "cell" : "crosshair";
+  };
+
+  ovCv.addEventListener("pointerdown", ev => {
+    if (!picking) return;
+    ev.stopPropagation(); ev.preventDefault();
+    st.dragging = pdfPoint(ev);
+    ovCv.setPointerCapture(ev.pointerId);
+  }, true);
+
+  ovCv.addEventListener("pointermove", ev => {
+    if (!st.dragging) return;
+    const now = pdfPoint(ev), a = st.dragging;
+    Object.assign(selbox.style, {
+      display: "block",
+      left: Math.min(a.x, now.x) * S.scale + "px",
+      top: Math.min(a.y, now.y) * S.scale + "px",
+      width: Math.abs(now.x - a.x) * S.scale + "px",
+      height: Math.abs(now.y - a.y) * S.scale + "px"
+    });
+  }, true);
+
+  ovCv.addEventListener("pointerup", ev => {
+    if (!st.dragging) return;
+    ev.stopPropagation(); ev.preventDefault();
+    const a = st.dragging, b = pdfPoint(ev);
+    st.dragging = null; selbox.style.display = "none";
+    picking = false; $("pickRegion").setAttribute("aria-pressed", "false");
+    ovCv.style.cursor = "crosshair";
+    if (Math.abs(b.x - a.x) < 6 || Math.abs(b.y - a.y) < 6) return;
+    setCustomBox({x0:Math.min(a.x,b.x), y0:Math.min(a.y,b.y), x1:Math.max(a.x,b.x), y1:Math.max(a.y,b.y)});
+  }, true);
+
+  /* ── 人工修正 ─────────────────────────────────────────────── */
+
+  function fixCount() {
+    return Object.keys(st.overrides).length + st.manualAdd.length + st.manualSub.length;
+  }
+
+  function renderFixNote() {
+    const n = fixCount();
+    $("fxClear").disabled = n === 0;
+    $("fxNote").innerHTML = n === 0
+      ? "自动识别不对时，可以人工改判。所有修正都会写进结果里。"
+      : `已应用 <b>${Object.keys(st.overrides).length}</b> 处线条改判、` +
+        `<b>${st.manualAdd.length}</b> 块补画、<b>${st.manualSub.length}</b> 块擦除。`;
+  }
+
+  async function setReview(on) {
+    st.review = on;
+    $("fxReview").setAttribute("aria-pressed", String(on));
+    vec.classList.toggle("review", on);
+    $("sheet").classList.toggle("review", on);
+    if (on && st.docId && !st.allPrims.length) {
+      try {
+        const g = await call(`/api/documents/${st.docId}/pages/${st.page}/geometry?max_primitives=8000`);
+        st.allPrims = g.primitives || [];
+        if (g.truncated) alert("这一页图元过多，审阅视图只显示了前 8000 条。");
+      } catch (err) { alert("读取图元失败：" + err.message); }
+    }
+    paintOverlay();
+  }
+
+  vec.addEventListener("click", ev => {
+    if (!st.review) return;
+    const target = ev.target.closest("path[data-idx]");
+    if (!target) return;
+    const index = target.dataset.idx;
+    const prim = st.allPrims.find(p => String(p.index) === index);
+    if (!prim) return;
+    const current = st.overrides[index] || prim.role;
+    if (current === "profile") st.overrides[index] = "annotation";
+    else if (st.overrides[index]) delete st.overrides[index];
+    else st.overrides[index] = "profile";
+    renderFixNote(); paintOverlay(); calc();
+  });
+
+  $("fxReview").onclick = () => setReview(!st.review);
+  $("fxClear").onclick = () => {
+    st.overrides = {}; st.manualAdd = []; st.manualSub = [];
+    renderFixNote(); paintOverlay(); calc();
+  };
+  $("fxDraw").onclick = () => startBoundary("add");
+  $("fxErase").onclick = () => startBoundary("subtract");
+
+  function startBoundary(target) {
+    if (!st.analysis) { alert("请先分析当前页。"); return; }
+    if (st.review) setReview(false);
+    st.polyTarget = target;
+    setMode("poly");
+    $("modeHint").textContent = target === "add"
+      ? "依次点击顶点圈出要【计入】的区域，双击或按“闭合并计算”收尾。"
+      : "依次点击顶点圈出要【挖掉】的区域，双击或按“闭合并计算”收尾。";
+  }
+
+  /* “闭合并计算”在补画/擦除模式下交给后端，而不是记进本地测量列表。 */
+  const _closePolyLocal = closePoly;
+  closePoly = function () {
+    if (!st.polyTarget) return _closePolyLocal();
+    if (S.poly.length < 3) { alert("至少要 3 个点才围得成面。"); return; }
+    const ring = S.poly.map(p => [p.x, p.y]);
+    (st.polyTarget === "add" ? st.manualAdd : st.manualSub).push(ring);
+    st.polyTarget = null; S.poly = []; setMode("wand");
+    renderFixNote(); calc();
+  };
+  $("closePoly").onclick = () => closePoly();
+
+  /* ── 与既有控件的接线 ─────────────────────────────────────── */
+
+  $("srvRun").onclick = analyze;
+  $("serverAnalyze").onclick = analyze;
+  $("srvCalc").onclick = () => calc();
+  $("srvHoles").onchange = () => calc();
+
+  const origUnitChange = $("unit").onchange;
+  $("unit").onchange = e => { origUnitChange(e); renderResult(); };
+
+  // 人工两点标定同时交给后端，保证前后端用同一个比例。
+  const origApplyPick = $("applyPick").onclick;
+  $("applyPick").onclick = () => {
+    origApplyPick();
+    if (S.calPts.length === 2 && S.mmPerPt) {
+      const [a, b] = S.calPts;
+      const len = parseFloat($("knownLen").value);
+      if (len > 0) {
+        st.scaleSpec = {mode:"two_point", points:[[a.x,a.y],[b.x,b.y]],
+                        known_length:len, known_unit:$("knownUnit").value};
+        if (st.docId && st.analysis) calc();
+      }
+    }
+  };
+
+  const origApplyRatio = $("applyRatio").onclick;
+  $("applyRatio").onclick = () => {
+    origApplyRatio();
+    const n = parseFloat($("ratioN").value);
+    if (n > 0) {
+      st.scaleSpec = {mode:"ratio", ratio_denominator:n};
+      if (st.docId && st.analysis) calc();
+    }
+  };
+
+  renderFixNote();
+
+  return {
+    reset,
+    paintReadout,
+    hasResult: () => !!st.result,
+    onRender() {
+      $("srvRun").disabled = !S.pdf;
+      if (st.page !== null && st.page !== S.pageNum) {
+        st.analysis = null; st.result = null; st.ignored = [];
+        st.regionId = null; st.regionBox = null; st.customBox = null;
+        st.allPrims = []; st.overrides = {}; st.manualAdd = []; st.manualSub = [];
+        setReview(false); renderFixNote();
+        $("srvRegions").innerHTML = ""; $("srvResultSect").style.display = "none";
+        $("srvCalc").disabled = true; st.page = null;
+        chips([{text:"换页后请重新分析"}]);
+      }
+      paintOverlay();
+    }
+  };
+})();
+
+/* 载入新文件时释放服务器上的旧文档，避免残留副本。 */
+const _loadWithoutServer = load;
+load = async function (file) {
+  SRV.reset(file);
+  const out = await _loadWithoutServer(file);
+  $("srvRun").disabled = !S.pdf;
+  return out;
+};
+window.addEventListener("beforeunload", () => SRV.reset(null));
+</script>

@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Proprietary engineering drawings — NEVER commit these.
+#
+# Inputs/ holds customer manufacturing drawings (PDF + DWG). samples/ is the
+# documented drop point for real drawings to audit locally (see samples/README).
+# Both are confidential per CONSTITUTION §Security: uploaded documents stay on
+# this machine. Only the checked-in README and the synthetic fixture generator
+# are tracked.
+# ---------------------------------------------------------------------------
+Inputs/
+samples/*
+!samples/README.md
+
+# Generated test drawings — rebuilt by `python -m tests.fixtures samples/generated`
+samples/generated/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local audit output
+audit*.png
+audit*.json
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp

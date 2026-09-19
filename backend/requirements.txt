@@ -1,0 +1,14 @@
+# Runtime
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9      # multipart/form-data uploads
+PyMuPDF>=1.24                # PDF parsing and native vector path extraction
+shapely>=2.0                 # planar geometry: noding, polygonize, boolean ops
+numpy>=1.24
+opencv-python-headless>=4.9  # scan conversion and raster tracing only
+pillow>=10.0
+
+# Tests
+pytest>=8.0
+httpx>=0.27                  # FastAPI TestClient
+playwright>=1.40             # optional: browser smoke test, skipped if absent
