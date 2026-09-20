@@ -345,3 +345,55 @@ table.grid td .sw { display: inline-block; width: 9px; height: 9px; border-radiu
 .langswitch button + button { border-left: 1px solid var(--line-2); }
 .langswitch button[aria-pressed="true"] { background: var(--ink); color: #fff; font-weight: 600; }
 .langswitch button:hover[aria-pressed="false"] { background: var(--panel-2); color: var(--ink); }
+
+/* ── processing progress ─────────────────────────────────────────────────────
+ *
+ * Sits above the stage checklist and complements it: the bar answers "how far",
+ * the list answers "doing what". The percentage is interpolated from measured
+ * stage costs, so it does not stall at 90 % while the slowest step runs.
+ */
+.progress { margin: 0 0 16px; }
+.progress .track {
+  height: 8px; border-radius: 4px; background: var(--line);
+  overflow: hidden; position: relative;
+}
+.progress .fill {
+  height: 100%; background: var(--accent); border-radius: 4px;
+  transition: width .35s ease-out;
+}
+/* When the backend knows work is happening but not how much is left, the bar
+ * shows motion without claiming a figure. */
+/* The region the current stage covers when its internal progress is unknown:
+ * a dimmed band sweeping between where the bar has got to and where this stage
+ * ends. It says "somewhere in here" instead of naming a false percentage. */
+.progress .ghost {
+  position: absolute; top: 0; bottom: 0; overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.progress .ghost::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent,
+    color-mix(in srgb, var(--accent) 55%, transparent), transparent);
+  animation: pa-sweep 1.5s linear infinite;
+}
+@keyframes pa-sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) {
+  .progress .fill { transition: none; }
+  .progress .ghost::after { animation: none; }
+}
+.progress.done .fill { background: var(--accent); }
+.progress.failed .fill { background: var(--red); }
+
+.progress-line {
+  display: flex; align-items: baseline; gap: 10px; margin-top: 8px; font-size: 12px;
+}
+.progress-line .pct { font-weight: 600; font-size: 13px; min-width: 42px; }
+.progress-line .what { color: var(--ink-2); flex: 1; }
+.progress-line .elapsed { color: var(--ink-3); font-size: 11.5px; }
+.progress .counts { margin: 3px 0 0; font-size: 11.5px; color: var(--ink-3); }
+.progress .counts:empty { display: none; }
+.progress .slow {
+  margin: 7px 0 0; padding: 6px 9px; border-left: 3px solid var(--amber);
+  background: var(--amber-soft); color: #6B4E14; font-size: 11.5px; border-radius: 3px;
+}
+.progress .failnote { color: var(--red); font-weight: 550; }

@@ -77,16 +77,27 @@ def test_a_file_without_a_dwg_signature_is_refused_before_conversion(tmp_path):
 
 
 def test_converter_status_is_honest_either_way():
-    status = converter_status()
+    status = converter_status(reveal_paths=True)
     assert isinstance(status["available"], bool)
     if status["available"]:
         assert status["tool"] in ("libredwg", "oda_file_converter")
         assert status["path"] and os.path.exists(status["path"])
         assert status["version"]
     else:
-        assert "setup_command" in status, "say exactly how to fix it"
-        assert "install_dwg_support" in status["setup_command"]
+        assert status["fix"], "say exactly how to fix it"
         assert status["searched"], "say where it looked"
+
+
+def test_converter_status_withholds_host_paths_by_default():
+    """This dictionary is served over HTTP. Where a binary lives on the host is
+    information about the host, and no client has any use for it (§35)."""
+    status = converter_status()
+    assert "path" not in status
+    assert "searched" not in status
+    # What a client does need — whether DWG works, and with what — is still there.
+    assert "available" in status
+    if status["available"]:
+        assert status["tool"] and status["version"]
 
 
 def test_the_unavailable_error_carries_the_setup_command():

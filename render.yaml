@@ -1,0 +1,74 @@
+# Render blueprint — the deployment described in the repository rather than in a
+# dashboard, so it can be reviewed, changed in a pull request and recreated.
+#
+# Apply by pointing Render at this file (Blueprints → New Blueprint Instance),
+# or keep an existing service and treat this as the reference for its settings.
+#
+# See docs/DEPLOYMENT.md for what each choice is for, and for the plan sizing
+# evidence behind `plan` below.
+
+services:
+  - type: web
+    name: projected-area-analyzer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    repo: https://github.com/hemeiling/ProjectionArea
+    branch: main
+    region: oregon
+
+    # Docker, not the native Python runtime: reading a DWG needs GNU LibreDWG,
+    # which no Debian suite packages, so the converter is built into the image.
+    # The Dockerfile explains this at length.
+
+    # Cheap, and it fails when the converter is missing rather than only when the
+    # process is dead — a deployment that lost DWG support is the failure worth
+    # catching, and it looks perfectly healthy from the outside otherwise.
+    healthCheckPath: /health
+
+    # Sized from measurement, not from habit. Peak memory for the real drawings,
+    # via tools/measure_memory.py:
+    #
+    #     101 PDF  0.8 GB      103 DWG  2.5 GB
+    #     102 PDF  2.4 GB      101 DWG  4.0 GB      102 DWG  8.2 GB
+    #
+    # Free and Starter are both 512 MB, so neither can read *any* production
+    # drawing. 2c-8g (8 GB) is the smallest plan that handles both PDFs and the
+    # 101 and 103 DWGs with margin; the 97 MB 102 DWG needs 2c-16g.
+    #
+    # This is a cost decision worth making deliberately: on a smaller plan a
+    # production drawing does not fail gracefully, the process is killed part way
+    # through. The application explains that when it happens — the progress bar
+    # keeps what it earned and says the analysis was interrupted — but it cannot
+    # prevent it. docs/DEPLOYMENT.md has the full table and the reason the reader
+    # is this memory-hungry.
+    plan: 2c-8g
+
+    envVars:
+      # Render sets PORT itself; the application reads it and binds 0.0.0.0.
+      # Nothing else here is required — the service starts with no configuration
+      # at all, which is deliberate.
+
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # The ceiling on an upload, in megabytes. The default in the code is the
+      # same 200; it is stated here so raising it is a reviewable change rather
+      # than a dashboard edit nobody can see. Production DWGs reach 93 MB and
+      # their converted DXFs about 120 MB.
+      - key: MAX_UPLOAD_MB
+        value: "200"
+
+      # LIBREDWG_BIN is deliberately unset: the image puts dwg2dxf on PATH and
+      # the application finds it there. The variable exists for a host that puts
+      # it somewhere unusual, and is never required.
+
+      # CLAUDE_API_KEY and GEMINI_API_KEY are optional and absent by default.
+      # Nothing in the engine reads them — AI is for interpretation, never for
+      # measurement — so the service must start without them, and does. Add them
+      # as secrets in the dashboard if and when that changes; never in this file.
+
+    # Drawings are proprietary and the filesystem is ephemeral by design: an
+    # upload lives in a per-process temporary directory and is deleted when the
+    # job finishes, the TTL expires or the process stops. No disk is attached,
+    # and attaching one would mean customer drawings surviving a restart.

@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.api.routes import router
+from backend.api.routes import health as api_health, router
 from backend.config import ENGINE_VERSION
 from backend.store import STORE
 
@@ -89,11 +89,28 @@ if os.path.isdir(FRONTEND_DIR):
     app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 
+@app.get("/health", include_in_schema=False)
+def health() -> Any:
+    """The same report as ``/api/health``, at the path a platform expects.
+
+    Render, and most other hosts, want a health check at the root. Rather than
+    two implementations that can disagree, this is the same function.
+    """
+    return api_health()
+
+
 @app.get("/", include_in_schema=False)
 def viewer() -> Any:
     """Serve the analysis application."""
     if not os.path.exists(APP_HTML):
-        return JSONResponse({"error": f"Front end not found at {APP_HTML}"}, status_code=404)
+        # No path in the message: this is served to a browser, and where the
+        # file was expected is a fact about the host (§35). The log line below
+        # carries the detail for whoever can act on it.
+        logger.error("front end missing at %s", APP_HTML)
+        return JSONResponse(
+            {"error": "The front end is not installed in this deployment."},
+            status_code=404,
+        )
     return FileResponse(APP_HTML, media_type="text/html")
 
 

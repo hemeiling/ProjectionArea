@@ -1,0 +1,21 @@
+# Runtime dependencies. Installed both locally and in the deployment image.
+#
+# Kept at the repository root because that is where every deployment platform
+# looks first, including Render's native Python build. Test-only packages live
+# in requirements-dev.txt so the production image does not carry a browser
+# automation stack.
+#
+# Lower bounds rather than exact pins: this is an application with a small,
+# stable dependency set, and the geometry tests would catch a breaking change in
+# the one library where it would matter. The deployment image is reproducible
+# through its base image digest and this file together.
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9      # multipart/form-data uploads
+PyMuPDF>=1.24                # PDF parsing and native vector path extraction
+shapely>=2.0                 # planar geometry: noding, polygonize, boolean ops
+numpy>=1.24
+opencv-python-headless>=4.9  # scan conversion and raster tracing only; never the GUI build
+pillow>=10.0
+ezdxf>=1.4                   # DXF reading, and DWG once converted

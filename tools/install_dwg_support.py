@@ -126,7 +126,7 @@ def main(argv: "list[str] | None" = None) -> int:
     print("\n  DWG conversion component")
     print("  " + "-" * 46)
 
-    status = converter_status()
+    status = converter_status(reveal_paths=True)
     if status["available"] and not args.force:
         _say(f"already installed: {status['tool']} {status['version']}")
         _say(f"at {status['path']}")
@@ -149,7 +149,7 @@ def main(argv: "list[str] | None" = None) -> int:
     else:
         shutil.rmtree(workspace, ignore_errors=True)
 
-    status = converter_status()
+    status = converter_status(reveal_paths=True)
     if not status["available"]:
         print("\n  The build finished but dwg2dxf was not found afterwards.\n", file=sys.stderr)
         return 1

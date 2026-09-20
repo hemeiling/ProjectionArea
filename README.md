@@ -67,7 +67,7 @@ tracked file or in the commit history.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r backend/requirements.txt
+.venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python run.py
 ```
 
@@ -98,6 +98,34 @@ in a format that needs converting, not an error.
 The original planimeter, with its manual wand and polygon tools, is still served
 at **`/classic`**; it remains the fallback for drawings the automatic path cannot
 handle.
+
+## Deploying it
+
+```bash
+python -m uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+```
+
+`run.py` is the local entry point — free-port search, auto-reload, a clickable
+URL. In production the platform assigns the port and the process must bind it or
+fail, so a deployment runs uvicorn directly. (`run.py` also honours `PORT` if you
+point it at a host: it binds every interface and turns reload off.)
+
+The deployment target is **Render, from a container**, because reading a DWG needs
+GNU LibreDWG and no Debian release packages it. `Dockerfile` builds it from the
+GNU tarball with a checked hash; `render.yaml` describes the service;
+`GET /health` reports whether this instance can actually read PDF, DXF and DWG:
+
+```json
+{"status":"ok","pdf":true,"dxf":true,"dwg":true,"dwg_converter":"libredwg"}
+```
+
+Nothing is required in the environment beyond `PORT`. Both AI keys are optional
+and the measurement path never reads them.
+
+**Sizing is the one thing worth reading before deploying.** The real drawings need
+0.8–8.2 GB of memory, measured; Render's free and starter plans have 512 MB and
+cannot process any of them. See **`docs/DEPLOYMENT.md`** for the measured table,
+the plan recommendation and why the CAD reader is this hungry.
 
 > Always invoke tools as `.venv/bin/python -m <tool>`. The venv's console
 > scripts (`.venv/bin/uvicorn`, `.venv/bin/pytest`) hard-code the interpreter
@@ -767,6 +795,7 @@ another capability on top of an unvalidated one.
 | `CONSTITUTION.md` | the binding engineering rules this implementation must obey |
 | `CLAUDE.md` | how to work in this repository |
 | `docs/ENGINEERING_BRIEF.md` | the project direction and required pipeline the app is built against |
+| `docs/DEPLOYMENT.md` | running this somewhere other than a laptop: the image, the blueprint, measured memory and plan sizing |
 | `.env.example` | placeholders for the two optional AI keys; both are optional and unused by the measurement path |
 
 ## Engineering rules this implementation is bound by

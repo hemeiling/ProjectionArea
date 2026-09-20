@@ -1,0 +1,43 @@
+# What must never enter the build context.
+#
+# The first two entries are the important ones: the build context is uploaded to
+# the builder, so a customer drawing listed here is a drawing that does not leave
+# this machine (§35). .git is excluded for the same reason as much as for size.
+
+Inputs/
+samples/
+validation/
+*.dwg
+*.dxf
+
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials.json
+
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Not needed at runtime: the suite, the local tooling and the docs.
+tests/
+tools/
+docs/
+*.md
+!README.md
+
+audit*.png
+audit*.json
+.DS_Store
+.idea/
+.vscode/

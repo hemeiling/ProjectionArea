@@ -17,6 +17,7 @@ from backend.geometry.regions import detect_regions, detect_regions_from_page_im
 from backend.models import BBox, Region, Scale, ScaleCandidate, median_glyph_height
 from backend.pdf.document import PageAnalysis, analyze_page
 from backend.pdf.text import text_mask_boxes
+from backend.progress import NULL_PROGRESS, Progress
 
 
 @dataclass
@@ -62,17 +63,21 @@ class PreparedPage:
         }
 
 
-def prepare_page(doc: Any, page_number: int) -> PreparedPage:
+def prepare_page(
+    doc: Any, page_number: int, progress: Progress = NULL_PROGRESS
+) -> PreparedPage:
     """Read, classify and cluster one page, then attempt automatic calibration.
 
     Args:
         doc: An open ``fitz.Document``.
         page_number: 1-based page index.
+        progress: Optional observer, passed through to the page reader. It is
+            told what is happening and can change nothing about the result.
 
     Returns:
         A :class:`PreparedPage` ready for repeated area calculations.
     """
-    analysis = analyze_page(doc, page_number)
+    analysis = analyze_page(doc, page_number, progress)
 
     boxes = text_mask_boxes(analysis.text_items)
     role_counts = classify_primitives(

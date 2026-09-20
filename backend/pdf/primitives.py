@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from backend.config import Tolerances
 from backend.models import Point, Primitive, PrimitiveKind
 from backend.pdf.space import is_identity, map_points, page_space_matrix
+from backend.progress import NULL_PROGRESS, Progress
 
 #: Tolerance for deciding that two path items are actually connected. This is
 #: about PDF coordinate round-tripping, not about drawing gaps, so it is a tiny
@@ -308,7 +309,9 @@ def path_to_primitives(
     return primitives
 
 
-def extract_primitives(page: Any, tolerances: Tolerances) -> List[Primitive]:
+def extract_primitives(
+    page: Any, tolerances: Tolerances, progress: Progress = NULL_PROGRESS
+) -> List[Primitive]:
     """Extract every vector primitive on a page, in canonical page space.
 
     Coordinates come back in PyMuPDF page space: origin top-left, y increasing
@@ -332,8 +335,15 @@ def extract_primitives(page: Any, tolerances: Tolerances) -> List[Primitive]:
         Normalised primitives in drawing order.
     """
     primitives: List[Primitive] = []
-    for path_index, path in enumerate(page.get_drawings()):
+    paths = page.get_drawings()
+    # A production sheet carries hundreds of thousands of paths and this loop is
+    # the slowest part of reading a PDF, so it says how far it has got (§31).
+    total = len(paths)
+    for path_index, path in enumerate(paths):
         primitives.extend(path_to_primitives(path, tolerances, path_index, len(primitives)))
+        if path_index % 5000 == 0:
+            progress.advance(path_index, total)
+    progress.advance(total, total)
 
     matrix = page_space_matrix(page)
     if not is_identity(matrix):

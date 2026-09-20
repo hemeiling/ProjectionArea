@@ -13,6 +13,16 @@ Options::
     python run.py --no-reload      # don't restart on file changes
     python run.py --no-demo        # skip pre-generating demo drawings
     python run.py --open           # open a browser too
+
+This is the *local* entry point. It looks for a free port, enables auto-reload
+and prints a clickable URL — all of which are conveniences for a developer and
+wrong in production, where the platform assigns the port and expects the process
+to bind it or fail. A deployment therefore runs uvicorn directly::
+
+    python -m uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+
+Run this file with ``PORT`` set and it defers to that value and binds every
+interface, so the two paths agree when it matters. See docs/DEPLOYMENT.md.
 """
 
 from __future__ import annotations
@@ -25,6 +35,8 @@ import webbrowser
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
+
+from backend import runtime  # noqa: E402  (after sys.path is set)
 
 #: Tried in order when the requested port is busy.
 _PORT_ATTEMPTS = 12
@@ -42,7 +54,7 @@ def _venv_hint() -> str:
     return (
         "Dependencies are missing. Set up the environment and use its interpreter:\n\n"
         "    python3 -m venv .venv\n"
-        "    .venv/bin/pip install -r backend/requirements.txt\n"
+        "    .venv/bin/pip install -r requirements-dev.txt\n"
         f"    {runner} run.py\n"
     )
 
@@ -90,16 +102,35 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help="port to serve on (default: $PORT, else 8000 or the next free one)")
+    parser.add_argument(
+        "--host", default=None,
+        help="interface to bind (default: 0.0.0.0 when $PORT is set, else 127.0.0.1)")
     parser.add_argument("--no-reload", action="store_true", help="disable auto-restart")
+    parser.add_argument("--reload", action="store_true",
+                        help="force auto-restart even where it is off by default")
     parser.add_argument("--no-demo", action="store_true", help="skip demo pre-generation")
     parser.add_argument("--open", action="store_true", help="open a browser window")
     parser.add_argument("--no-open", action="store_true", help="never open a browser")
     args = parser.parse_args(argv)
 
     _check_imports()
-    port = _free_port(args.port)
+
+    host = args.host or runtime.bind_host()
+
+    # A platform-assigned port is not a suggestion: if it is taken, something is
+    # already wrong, and quietly serving on a different one would leave a
+    # healthy-looking process that nothing can reach. Only a local port is nudged
+    # to the next free one, because there the alternative is refusing to start
+    # over a stale server the developer has forgotten about.
+    assigned = runtime.port(0)
+    if assigned and args.port is None:
+        requested = port = assigned
+    else:
+        requested = args.port if args.port is not None else 8000
+        port = _free_port(requested)
 
     demo_count = 0
     if not args.no_demo:
@@ -109,6 +140,8 @@ def main(argv: "list[str] | None" = None) -> int:
             print(f"  ! demo drawings unavailable: {error}", file=sys.stderr)
 
     url = f"http://localhost:{port}/"
+    if host not in ("127.0.0.1", "localhost"):
+        url = f"http://{host}:{port}/"
     engine = "unknown"
     try:
         from backend.config import ENGINE_VERSION
@@ -116,6 +149,11 @@ def main(argv: "list[str] | None" = None) -> int:
         engine = ENGINE_VERSION
     except Exception:
         pass
+
+    # Watching the source tree is a developer convenience. On a host that
+    # assigns the port it is a second process and a file watcher for no benefit,
+    # so it is off there unless explicitly asked for.
+    reload = args.reload or (not args.no_reload and not assigned)
 
     print()
     print("  Projected Area Analyzer is running", f"· engine {engine}")
@@ -126,8 +164,8 @@ def main(argv: "list[str] | None" = None) -> int:
     print(f"  API docs: http://localhost:{port}/docs")
     if demo_count:
         print(f"  {demo_count} reference drawings ready on the landing screen")
-    if port != args.port:
-        print(f"  (port {args.port} was busy, using {port})")
+    if port != requested:
+        print(f"  (port {requested} was busy, using {port})")
     print("  Stop with Ctrl+C")
     print()
 
@@ -138,10 +176,10 @@ def main(argv: "list[str] | None" = None) -> int:
 
     uvicorn.run(
         "backend.main:app",
-        host=args.host,
+        host=host,
         port=port,
-        reload=not args.no_reload,
-        reload_dirs=[os.path.join(PROJECT_ROOT, "backend")] if not args.no_reload else None,
+        reload=reload,
+        reload_dirs=[os.path.join(PROJECT_ROOT, "backend")] if reload else None,
         log_level="info",
     )
     return 0

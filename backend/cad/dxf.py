@@ -45,6 +45,7 @@ from backend.cad.provenance import (
     CadText,
 )
 from backend.models import BBox, Point, Primitive, PrimitiveKind, Scale
+from backend.progress import NULL_PROGRESS, Progress
 
 #: How finely a curve is sampled. Matches the PDF path's intent: fine enough
 #: that flattening error is far below any drawing tolerance.
@@ -53,6 +54,10 @@ _MIN_ARC_SEGMENTS = 8
 
 #: Recursion guard for pathological / self-referencing block structures.
 _MAX_BLOCK_DEPTH = 12
+
+#: Report an entity count this often. Frequent enough that the bar moves on a
+#: big drawing, rare enough that reporting is not itself a cost.
+_PROGRESS_EVERY = 2000
 
 
 class DxfReadError(RuntimeError):
@@ -191,6 +196,10 @@ class _Reader:
         self.unsupported: Dict[str, int] = {}
         #: Set by the loader once the header has been read.
         self.mm_per_unit: Optional[float] = None
+        #: Progress reporting, defaulted so the reader works unobserved.
+        self.progress: Progress = NULL_PROGRESS
+        self.expected_entities: Optional[int] = None
+        self._seen = 0
         self.layer_colors: Dict[str, Optional[int]] = {}
 
     # ── primitive construction ───────────────────────────────────────────────
@@ -264,6 +273,12 @@ class _Reader:
 
     def visit(self, entities: Iterable[Any], context: "_Context") -> None:
         for entity in entities:
+            # Reading a production DXF is the slowest thing this application
+            # does — 2.4 million entities on the largest real drawing — so the
+            # count is reported as it goes rather than after.
+            self._seen += 1
+            if self._seen % _PROGRESS_EVERY == 0:
+                self.progress.advance(self._seen, self.expected_entities)
             kind = entity.dxftype()
             self.entity_counts[kind] = self.entity_counts.get(kind, 0) + 1
             handler = getattr(self, f"_on_{kind.lower()}", None)
@@ -532,7 +547,11 @@ def _block_xref_path(block: Any) -> Optional[str]:
         return None
 
 
-def load_dxf(path: str, include_paperspace: bool = False) -> CadDrawing:
+def load_dxf(
+    path: str,
+    include_paperspace: bool = False,
+    progress: Progress = NULL_PROGRESS,
+) -> CadDrawing:
     """Read a DXF file into primitives, text and dimensions, with provenance.
 
     Args:
@@ -615,6 +634,14 @@ def load_dxf(path: str, include_paperspace: bool = False) -> CadDrawing:
 
     reader = _Reader(doc, file_name)
     reader.mm_per_unit = info.mm_per_unit
+    reader.progress = progress
+    try:
+        # Modelspace knows its own length cheaply; block contents are walked on
+        # top of it, so this is a floor rather than an exact total. A floor is
+        # still a real number and beats an invented one.
+        reader.expected_entities = len(doc.modelspace())
+    except Exception:
+        reader.expected_entities = None
     for layer in doc.layers:
         entry = CadLayer(
             name=str(layer.dxf.name),
@@ -645,6 +672,7 @@ def load_dxf(path: str, include_paperspace: bool = False) -> CadDrawing:
     info.layouts = [str(name) for name in doc.layout_names()]
 
     reader.visit(doc.modelspace(), _Context(space="model"))
+    progress.advance(reader._seen, reader.expected_entities)
     if include_paperspace:
         for name in doc.layout_names():
             if name == "Model":

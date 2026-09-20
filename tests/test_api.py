@@ -71,7 +71,8 @@ def test_capabilities_reports_which_formats_can_be_read(client):
         assert formats["dwg"]["tool"]
         assert "converted locally" in formats["dwg"]["note"]
     else:
-        assert "setup_command" in formats["dwg"]
+        assert formats["dwg"]["fix"], "say what to do about it"
+        assert formats["dwg"]["advice"] in ("local_build", "deploy_image")
 
 
 def test_a_dwg_upload_is_accepted_as_a_job(client):
@@ -128,20 +129,30 @@ def test_a_corrupt_dwg_fails_the_job_with_a_reason_not_a_crash(client):
 
 
 def test_an_unknown_job_is_a_clear_404(client):
+    """An unknown job id is rarely a typo — jobs live in the process, so the
+    usual cause is that the process restarted under it. §31: say that, rather
+    than echoing the id back at a caller who already has it."""
     response = client.get("/api/jobs/nosuchjob")
     assert response.status_code == 404
-    assert "nosuchjob" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["kind"] == "job_lost"
+    assert detail["headline"] and detail["reason"] and detail["fix"]
+    assert "restart" in detail["reason"]
 
 
 def test_dwg_support_when_the_component_is_missing_is_actionable(client, monkeypatch):
-    """The component check happens before the job, so this stays a direct 503."""
-    """§31: name the component and the exact command, never a generic failure."""
+    """§31: name the component and the remedy, never a generic failure.
+
+    The component check happens before the job starts, so this stays a direct 503
+    rather than a job that fails a moment later.
+    """
     monkeypatch.setattr("backend.api.routes.converter_status", lambda: {
         "available": False,
         "component": "LibreDWG dwg2dxf",
-        "reason": "No local DWG converter was found on this machine.",
+        "reason": "No DWG converter was found in this environment.",
+        "fix": "Run: .venv/bin/python -m tools.install_dwg_support",
+        "advice": "local_build",
         "setup_command": ".venv/bin/python -m tools.install_dwg_support",
-        "searched": [],
     })
     response = client.post(
         "/api/documents",

@@ -16,6 +16,7 @@ import fitz
 from backend.config import Tolerances
 from backend.models import BBox, DrawingType, Primitive, TextItem
 from backend.pdf.primitives import extract_primitives
+from backend.progress import NULL_PROGRESS, Progress
 from backend.pdf.text import (
     DimensionText,
     detect_scale_ratio,
@@ -149,12 +150,15 @@ def classify_page(
     return DrawingType.UNKNOWN
 
 
-def analyze_page(doc: Any, page_number: int) -> PageAnalysis:
+def analyze_page(
+    doc: Any, page_number: int, progress: Progress = NULL_PROGRESS
+) -> PageAnalysis:
     """Read one page into a :class:`PageAnalysis`.
 
     Args:
         doc: An open ``fitz.Document``.
         page_number: 1-based page index.
+        progress: Optional observer; reading the paths is the slow part.
 
     Returns:
         The raw, unprocessed reading of the page.
@@ -170,7 +174,7 @@ def analyze_page(doc: Any, page_number: int) -> PageAnalysis:
     width, height = float(rect.width), float(rect.height)
     tolerances = Tolerances.for_page(width, height)
 
-    primitives = extract_primitives(page, tolerances)
+    primitives = extract_primitives(page, tolerances, progress)
     vector_ink = sum(p.length for p in primitives)
     image_count, coverage = _image_coverage(page, width * height)
 

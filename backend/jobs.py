@@ -22,6 +22,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from backend.progress import ProgressTracker
+
 #: Finished jobs are kept this long so a slow client can still collect them.
 JOB_TTL_SECONDS = 1800
 
@@ -41,13 +43,19 @@ class Job:
     error: Optional[Dict[str, Any]] = None
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+    #: Progress reporting for this job, when the work is instrumented.
+    #: Set when the work has a stage plan; drives the progress bar.
+    tracker: Optional[ProgressTracker] = None
+    #: The stage that was in flight when the job failed, so the bar can keep the
+    #: progress already earned and say where it stopped.
+    failed_stage: Optional[str] = None
 
     @property
     def elapsed(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "job_id": self.id,
             "file_name": self.file_name,
             "state": self.state,
@@ -57,8 +65,19 @@ class Job:
             "document_id": self.document_id,
             "result": self.result,
             "error": self.error,
+            "failed_stage": self.failed_stage,
             "elapsed_seconds": round(self.elapsed, 1),
         }
+        if self.tracker is not None:
+            snapshot = self.tracker.snapshot()
+            # A finished job is at 100 %; a failed one keeps whatever it earned,
+            # so the bar shows how far it got rather than resetting.
+            if self.state == "done":
+                snapshot["progress"] = 1.0
+                snapshot["completed_stages"] = snapshot["total_stages"]
+            payload.update(snapshot)
+            payload["elapsed_seconds"] = round(self.elapsed, 1)
+        return payload
 
 
 class JobStore:
@@ -68,16 +87,24 @@ class JobStore:
         self._lock = threading.RLock()
         self._jobs: Dict[str, Job] = {}
 
-    def start(self, file_name: str, work: Callable[["Job"], Dict[str, Any]]) -> Job:
+    def start(
+        self,
+        file_name: str,
+        work: Callable[["Job"], Dict[str, Any]],
+        tracker: Optional[ProgressTracker] = None,
+    ) -> Job:
         """Run ``work`` on a worker thread, reporting progress through the job.
 
         Args:
             file_name: What the user uploaded, for the progress display.
             work: Called with the job; should call :meth:`Job.advance` as it goes
                 and return the payload the client will collect.
+            tracker: Attached before the thread starts, so the worker never has
+                to wait for it and the client's first poll already knows the
+                stage plan.
         """
         self.sweep()
-        job = Job(id=uuid.uuid4().hex[:16], file_name=file_name)
+        job = Job(id=uuid.uuid4().hex[:16], file_name=file_name, tracker=tracker)
         with self._lock:
             self._jobs[job.id] = job
 
@@ -88,6 +115,7 @@ class JobStore:
                 job.stage = "complete"
             except Exception as error:  # surfaced to the client, not swallowed
                 job.state = "failed"
+                job.failed_stage = job.tracker.current_key if job.tracker else job.stage
                 job.error = _describe(error)
                 job.detail = job.error.get("headline", str(error))
             finally:
@@ -132,7 +160,9 @@ def _describe(error: Exception) -> Dict[str, Any]:
             "kind": "dwg_component_missing",
             "headline": "DWG support requires the local CAD conversion component.",
             "reason": str(error),
-            "fix": f"Run: {error.setup_command}",
+            "fix": error.fix,
+            "advice": error.case,
+            "setup_command": error.setup_command,
             "component": error.component,
         }
     if isinstance(error, DwgConversionFailed):
@@ -141,6 +171,25 @@ def _describe(error: Exception) -> Dict[str, Any]:
             "headline": "The drawing could not be converted.",
             "reason": str(error),
             "fix": "Check the file opens in AutoCAD, or export a DXF and upload that.",
+        }
+    if isinstance(error, MemoryError):
+        # Where Python sees the allocation fail rather than the kernel killing the
+        # process outright, say plainly what happened. A production DWG needs
+        # gigabytes to read: this is a sizing fact about the instance, not a fault
+        # in the drawing, and blaming the drawing would send the user looking in
+        # the wrong place (§31).
+        return {
+            "kind": "out_of_memory",
+            "headline": "This instance ran out of memory reading the drawing.",
+            "reason": (
+                "The drawing is larger than this instance can hold. Reading a "
+                "production DWG of two million entities needs several gigabytes, "
+                "and nothing was measured, so no partial result is reported."
+            ),
+            "fix": (
+                "Run this on an instance with more memory, or upload a smaller "
+                "export — a single view, or a DXF of the relevant layers."
+            ),
         }
     if isinstance(error, ValueError):
         text = str(error)

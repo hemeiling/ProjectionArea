@@ -72,6 +72,13 @@ async function setLanguage(lang, { rerender = true } = {}) {
     // Re-render whatever is on screen. The analysis is untouched: no request is
     // made and no state is cleared, so the drawing stays exactly as it was.
     if (!$("workspace").classList.contains("hide")) paintAll();
+    // A running job keeps running. Only its labels change, and they change now
+    // rather than at the next poll, which on a slow DWG is 700 ms of half-
+    // translated screen.
+    if (!$("processing").classList.contains("hide") && LAST_SNAP) {
+      renderProgress(LAST_SNAP);
+      renderTimeline(timelineFromJob(LAST_SNAP));
+    }
     renderDemoList();
   }
 }
@@ -136,24 +143,44 @@ function show(screen) {
 /* A DWG is converted before it can be read, and its scale comes from CAD units
  * rather than from measuring the drawing, so it gets its own honest sequence
  * instead of the PDF's labels reused. */
+/* Stage keys mirror backend/progress.py exactly, so the checklist and the bar
+ * are describing the same run rather than two parallel guesses. */
 const STAGES_PDF = [
-  ["load", "stage.load"],
+  ["loaded", "stage.load"],
   ["geometry", "stage.geometry"],
   ["regions", "stage.regions"],
   ["scale", "stage.scale"],
   ["candidates", "stage.candidates"],
   ["area", "stage.area"],
 ];
-const STAGES_CAD = [
-  ["load", "stage.loadDwg"],
-  ["convert", "stage.convert"],
+const STAGES_DXF = [
+  ["validated", "stage.load"],
   ["geometry", "stage.geometry"],
-  ["scale", "stage.scaleCad"],
-  ["regions", "stage.regionsCad"],
+  ["units", "stage.scaleCad"],
+  ["layers", "stage.regionsCad"],
   ["candidates", "stage.candidates"],
   ["area", "stage.area"],
 ];
+/* A DWG has a conversion step a DXF does not. It is absent from the DXF plan
+ * rather than shown as skipped: claiming a step that never ran would be a
+ * small lie in a tool whose whole point is not telling them. */
+const STAGES_DWG = [
+  ["validated", "stage.loadDwg"],
+  ["converted", "stage.convert"],
+  ["geometry", "stage.geometry"],
+  ["units", "stage.scaleCad"],
+  ["layers", "stage.regionsCad"],
+  ["candidates", "stage.candidates"],
+  ["area", "stage.area"],
+];
+const STAGE_PLANS = { pdf: STAGES_PDF, dxf: STAGES_DXF, dwg: STAGES_DWG };
 let STAGES = STAGES_PDF;
+
+/* Which count a stage is reporting, for the "281,400 / 421,517 primitives" line. */
+const STAGE_UNITS = {
+  geometry: "unit.primitives",
+  candidates: "unit.components",
+};
 const MARKS = {
   pending: "·", active: "…", done: "✓", warn: "⚠", input: "⚠",
   unsupported: "—", failed: "✕",
@@ -180,64 +207,221 @@ function notice(target, { headline, body, fix, kind }) {
 
 /* ── upload and processing ───────────────────────────────────────────────── */
 
+/* How long a stage may run before the UI says "still working" rather than
+ * leaving the reader to wonder whether it has hung. */
+const SLOW_STAGE_SECONDS = 20;
+
+let PROGRESS = { fraction: 0, state: "idle" };
+
+/* The most recent job snapshot. Kept so a language switch can repaint the bar
+ * and the timeline immediately, instead of leaving half the screen in the old
+ * language until the next poll arrives. Never used to advance anything. */
+let LAST_SNAP = null;
+
+function resetProgress() {
+  PROGRESS = { fraction: 0, state: "running", stageSince: Date.now(), stage: "" };
+  LAST_SNAP = null;
+  const block = $("progressBlock");
+  block.classList.remove("done", "failed", "indeterminate");
+  $("progressFill").style.width = "0%";
+  $("progressGhost").hidden = true;
+  $("progressPct").textContent = "0%";
+  $("progressWhat").textContent = "";
+  $("progressElapsed").textContent = "";
+  $("progressCounts").textContent = "";
+  $("progressSlow").hidden = true;
+}
+
+/* The heading says what the run is and, if it failed, how. Written through the
+ * i18n key rather than the text, so a language switch re-translates whichever
+ * heading is showing instead of reverting it to the generic one. */
+function setProcTitle(key) {
+  const el = $("procTitle");
+  el.dataset.i18n = key;
+  el.textContent = t(key);
+}
+
+/* Renders a backend progress snapshot. Nothing here invents a number: the
+ * fraction, the counts and the elapsed time all come from the job. */
+function renderProgress(snap) {
+  LAST_SNAP = snap;
+  const block = $("progressBlock");
+  // Monotonic on the client too, so a late-arriving poll cannot rewind the bar.
+  const fraction = Math.max(PROGRESS.fraction, snap.progress ?? 0);
+  PROGRESS.fraction = fraction;
+
+  if (snap.stage && snap.stage !== PROGRESS.stage) {
+    PROGRESS.stage = snap.stage;
+    PROGRESS.stageSince = Date.now();
+  }
+
+  $("progressFill").style.width = `${Math.round(fraction * 1000) / 10}%`;
+  $("progressPct").textContent = `${Math.round(fraction * 100)}%`;
+  $("progressElapsed").textContent = snap.elapsed_seconds != null
+    ? t("progress.elapsed", { seconds: snap.elapsed_seconds.toFixed(1) }) : "";
+
+  const failed = snap.state === "failed";
+  const done = snap.state === "done";
+  block.classList.toggle("failed", failed);
+  block.classList.toggle("done", done);
+
+  /* An unquantifiable stage gets an animated band over its own slice of the bar,
+   * between where progress has actually reached and where that stage ends. The
+   * span comes from the backend's measured weights, so the band is the real
+   * region of uncertainty rather than a guess at one. */
+  const indeterminate = Boolean(snap.indeterminate) && !done && !failed;
+  const ghost = $("progressGhost");
+  block.classList.toggle("indeterminate", indeterminate);
+  if (indeterminate && snap.stage_end > fraction) {
+    const from = Math.max(fraction, snap.stage_start ?? fraction);
+    ghost.style.left = `${from * 100}%`;
+    ghost.style.width = `${Math.max(0, snap.stage_end - from) * 100}%`;
+    ghost.hidden = false;
+  } else {
+    ghost.hidden = true;
+  }
+
+  if (done) {
+    $("progressWhat").textContent = t("progress.complete");
+    $("progressCounts").textContent = snap.elapsed_seconds != null
+      ? t("progress.total", { seconds: snap.elapsed_seconds.toFixed(1) }) : "";
+    $("progressSlow").hidden = true;
+    return;
+  }
+  if (failed) {
+    const stage = snap.failed_stage || snap.stage;
+    const label = STAGES.find(([key]) => key === stage);
+    $("progressWhat").innerHTML = `<span class="failnote">${
+      esc(t("progress.failedDuring", { stage: label ? t(label[1]) : stage }))}</span>`;
+    $("progressCounts").textContent = "";
+    $("progressSlow").hidden = true;
+    return;
+  }
+
+  $("progressWhat").textContent = t(`stageActive.${snap.stage}`, {}, snap.stage_detail || "");
+
+  /* Real counts where the backend has them; nothing where it does not. */
+  const unitKey = STAGE_UNITS[snap.stage];
+  if (snap.current && unitKey) {
+    const unit = t(unitKey);
+    $("progressCounts").textContent = snap.total
+      ? t("progress.counts", {
+          current: snap.current.toLocaleString(), total: snap.total.toLocaleString(), unit })
+      : t("progress.countsUnknown", { current: snap.current.toLocaleString(), unit });
+  } else {
+    $("progressCounts").textContent = "";
+  }
+
+  const stalled = (Date.now() - PROGRESS.stageSince) / 1000 > SLOW_STAGE_SECONDS;
+  $("progressSlow").hidden = !stalled;
+  if (stalled) $("progressSlow").textContent = t("progress.slow");
+}
+
+/* The job's stage records drive the checklist below the bar. */
+function timelineFromJob(snap) {
+  const states = {};
+  for (const [key] of STAGES) states[key] = { state: "pending" };
+  for (const record of snap.stages || []) {
+    if (!(record.stage in states)) continue;
+    states[record.stage] = {
+      state: record.done ? "done" : "active",
+      note: record.detail || "",
+    };
+  }
+  if (snap.state === "failed") {
+    const stage = snap.failed_stage || snap.stage;
+    if (stage in states) states[stage] = { state: "failed", note: t("stage.note.unreadable") };
+  }
+  if (snap.state === "done") for (const key of Object.keys(states)) states[key].state = "done";
+  return states;
+}
+
 async function handleFile(file) {
   $("uploadNotice").innerHTML = "";
   show("processing");
   $("procFile").textContent = file.name;
-  $("procTitle").textContent = t("proc.title");
   $("procNotice").innerHTML = "";
 
-  /* The extension is only a hint; the backend decides by signature. Picking the
-   * timeline up front means a DWG reads "DWG validated" from the first tick. */
-  STAGES = /\.(dwg|dxf)$/i.test(file.name) ? STAGES_CAD : STAGES_PDF;
-  if (/\.dwg$/i.test(file.name)) $("procTitle").textContent = t("proc.titleDwg");
+  /* The extension is only a hint; the backend decides by signature and the plan
+   * is re-picked from its reply. Choosing now means a DWG reads "DWG validated"
+   * from the first tick rather than starting wrong. */
+  const guessed = /\.dwg$/i.test(file.name) ? "dwg"
+    : /\.dxf$/i.test(file.name) ? "dxf" : "pdf";
+  STAGES = STAGE_PLANS[guessed];
+  setProcTitle(guessed === "dwg" ? "proc.titleDwg" : "proc.title");
 
-  const states = {};
-  STAGES.forEach(([k]) => (states[k] = { state: "pending" }));
-  states.load = { state: "active" };
-  renderTimeline(states);
+  resetProgress();
+  renderTimeline(timelineFromJob({ stages: [] }));
 
-  let doc;
+  let job;
   try {
     const body = new FormData();
     body.append("file", file);
-    doc = await call("/api/documents", { method: "POST", body });
-
-    /* A DWG is converted and parsed on a worker thread — the largest real
-     * drawing takes minutes — so the upload hands back a job and the timeline
-     * follows it rather than the browser sitting on an open request. */
-    if (doc.job_id) doc = await followJob(doc, states);
+    job = await call("/api/analyse", { method: "POST", body });
   } catch (err) {
     const d = err.detail;
     const missing = d?.kind === "dwg_component_missing";
-    const conversionFailed = d?.kind === "conversion_failed";
-    const emptyDrawing = d?.kind === "empty_drawing";
-    /* A DWG that reached conversion was a valid DWG: the file is the problem,
-     * or the component is, and those are different things to tell someone. */
-    states.load = (missing || conversionFailed || emptyDrawing)
-      ? { state: "done", note: t("stage.note.validDwg", { version: d.version || "" }).trim() }
-      : { state: "failed", note: t("stage.note.unreadable") };
-    for (const [k] of STAGES.slice(1)) states[k] = { state: "unsupported" };
-    if (states.convert) {
-      if (missing) states.convert = { state: "input", note: t("stage.note.componentRequired") };
-      else if (conversionFailed) states.convert = { state: "failed", note: t("stage.note.convertFailed") };
-      else if (emptyDrawing) states.convert = { state: "done", note: t("stage.note.convertedEmpty") };
-    }
-    renderTimeline(states);
-    $("procTitle").textContent =
-      missing ? t("proc.titleDwgMissing")
-      : conversionFailed ? t("proc.titleDwgFailed")
-      : emptyDrawing ? t("proc.titleEmpty")
-      : t("proc.titleUnreadable");
+    setProcTitle(missing ? "proc.titleDwgMissing" : "proc.titleUnreadable");
+    renderProgress({ state: "failed", progress: 0, failed_stage: STAGES[0][0] });
     notice("procNotice", {
-      headline: d?.headline || err.message,
-      body: d?.reason,
-      fix: d?.fix,
+      headline: d?.headline || err.message, body: d?.reason, fix: d?.fix,
       kind: missing ? "warn" : "error",
     });
     return;
   }
 
+  let snap = job;
+  try {
+    while (true) {
+      snap = await call(`/api/jobs/${job.job_id}`);
+      if (snap.plan) {
+        const plan = snap.plan.join(",");
+        for (const [kind, stages] of Object.entries(STAGE_PLANS)) {
+          if (stages.map(([k]) => k).join(",") === plan) STAGES = stages;
+        }
+      }
+      renderProgress(snap);
+      renderTimeline(timelineFromJob(snap));
+      if (snap.state === "done" || snap.state === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  } catch (err) {
+    /* The bar keeps the progress it earned; only the reason changes. A job that
+     * has vanished is the visible symptom of the server process restarting — on
+     * a small instance, usually because a large drawing exhausted its memory —
+     * so that case is named rather than reported as a generic failure. */
+    const lost = err.status === 404 || err.detail?.kind === "job_lost";
+    renderProgress({ state: "failed", progress: PROGRESS.fraction, failed_stage: snap.stage });
+    if (lost) setProcTitle("proc.titleLost");
+    notice("procNotice", {
+      headline: lost ? t("proc.lostHeadline") : t("proc.failed"),
+      body: lost ? t("proc.lostBody") : err.message,
+      fix: lost ? t("proc.lostFix") : (err.detail && err.detail.fix),
+      kind: "error",
+    });
+    return;
+  }
+
+  if (snap.state === "failed") {
+    const d = snap.error || {};
+    const missing = d.kind === "dwg_component_missing";
+    const conversionFailed = d.kind === "conversion_failed";
+    const emptyDrawing = d.kind === "empty_drawing";
+    setProcTitle(
+      missing ? "proc.titleDwgMissing"
+      : conversionFailed ? "proc.titleDwgFailed"
+      : emptyDrawing ? "proc.titleEmpty"
+      : "proc.titleUnreadable");
+    notice("procNotice", {
+      headline: d.headline || t("proc.failed"), body: d.reason, fix: d.fix,
+      kind: missing || emptyDrawing ? "warn" : "error",
+    });
+    return;
+  }
+
+  // ── adopt the finished result ──
+  const payload = snap.result;
+  const doc = payload.document;
   S.docId = doc.document_id;
   S.fileName = doc.file_name;
   S.kind = doc.source_kind || "pdf";
@@ -247,132 +431,19 @@ async function handleFile(file) {
   S.scaleSpec = { mode: "auto" };
   S.fpType = null;
   S.picks = [];
+  S.analysis = payload.analysis;
+  S.result = payload.area;
+  S.ignored = (payload.overlay && payload.overlay.primitives) || [];
 
-  /* The backend decides the kind by signature, so re-pick the timeline in case
-   * the extension lied, and fill in the conversion row for a DWG. */
-  const wantCad = S.kind !== "pdf";
-  if ((STAGES === STAGES_CAD) !== wantCad) {
-    STAGES = wantCad ? STAGES_CAD : STAGES_PDF;
-    for (const [k] of STAGES) if (!states[k]) states[k] = { state: "pending" };
-  }
-  states.load = S.conversion
-    ? { state: "done", note: `${S.conversion.dwg_signature} · ${S.conversion.dwg_version}` }
-    : { state: "done", note: t("stage.note.pages", {
-          kind: S.kind.toUpperCase(), n: doc.page_count }) };
-  if (states.convert) {
-    states.convert = S.conversion
-      ? { state: S.conversion.warnings.length ? "warn" : "done",
-          note: `${S.conversion.tool} ${S.conversion.tool_version} · ` +
-                `${S.conversion.duration_seconds}s · ` +
-                `${(S.conversion.intermediate_dxf_bytes / 1e6).toFixed(0)} MB DXF` }
-      : { state: "done", note: t("stage.note.readDirectly") };
-  }
-  states.geometry = { state: "active" };
-  renderTimeline(states);
+  if (S.kind === "pdf") await renderPdf(file);
 
-  // Render the drawing while the analysis runs. A CAD source has no page image,
-  // so its own linework is stroked onto the canvas once the geometry arrives.
-  const renderTask = S.kind === "pdf" ? renderPdf(file) : Promise.resolve();
-
-  try {
-    const analysis = await call(`/api/documents/${S.docId}/pages/${S.page}/analyze`);
-    S.analysis = analysis;
-    states.geometry = { state: "done",
-      note: t("stage.note.primitives", { n: analysis.primitive_count.toLocaleString() }) };
-
-    const views = analysis.regions.filter((r) => r.kind === "view");
-    states.regions = {
-      state: "done",
-      note: t("stage.note.regions", { regions: analysis.regions.length, views: views.length }),
-    };
-    if ((analysis.ambiguities || []).length) {
-      states.regions = { state: "warn", note: analysis.ambiguities[0].headline };
-    }
-    renderTimeline(states);
-
-    const roles = "dimension,annotation,centerline,hidden,sheet,hatch,uncertain";
-    S.ignored = (await call(
-      `/api/documents/${S.docId}/pages/${S.page}/geometry?roles=${roles}&max_primitives=8000`
-    )).primitives || [];
-
-    states.scale = analysis.scale?.verified
-      ? { state: "done", note: `${analysis.scale.source.replace(/_/g, " ")}` }
-      : { state: "input", note: S.kind === "pdf"
-          ? t("stage.note.scaleNeeded") : t("stage.note.unitsNotDeclared") };
-    if (S.kind !== "pdf" && S.cad) {
-      const layers = (S.cad.layers || []).filter((l) => l.entity_count).length;
-      const blocks = (S.cad.blocks || []).filter((b) => b.insert_count).length;
-      states.regions = { state: "done", note: t("stage.note.layers", { layers, blocks }) };
-    }
-    states.candidates = { state: "active" };
-    renderTimeline(states);
-
-    await computeArea({ silent: true });
-    const verified = S.result?.scale?.verified;
-    states.candidates = {
-      state: "done",
-      note: t("stage.note.readings", { n: S.result.footprint_interpretations.length }),
-    };
-    states.area = verified
-      ? { state: "done", note: areaText(readingUnits(currentReading())).value + " " +
-                               areaText(readingUnits(currentReading())).unit }
-      : { state: "input", note: t("stage.note.calibrateForArea") };
-    renderTimeline(states);
-
-    await renderTask;
-    setTimeout(() => {
-      show("workspace");
-      if (S.kind !== "pdf") { S.cadBox = cadExtent(); renderCad(); }
-      paintAll();
-      fitToWindow();
-    }, 380);
-  } catch (err) {
-    states.area = { state: "failed", note: err.message };
-    renderTimeline(states);
-    notice("procNotice", { headline: t("proc.failed"), body: err.message, kind: "error" });
-  }
-}
-
-/* Job stages, mapped onto the timeline rows the user is watching. */
-const JOB_STAGE_ROWS = {
-  validated: ["load", "done"],
-  converting: ["convert", "active"],
-  converted: ["convert", "done"],
-  reading: ["geometry", "active"],
-  read: ["geometry", "done"],
-  analysed: ["regions", "done"],
-  complete: ["regions", "done"],
-};
-
-async function followJob(job, states) {
-  const applyStage = (stage, detail) => {
-    const row = JOB_STAGE_ROWS[stage];
-    if (!row) return;
-    const [key, state] = row;
-    states[key] = { state, note: detail || "" };
-    if (state === "done" || state === "active") {
-      // Everything before a reached stage is necessarily finished.
-      const order = STAGES.map(([k]) => k);
-      for (const earlier of order.slice(0, order.indexOf(key))) {
-        if (states[earlier]?.state === "pending") states[earlier] = { state: "done" };
-      }
-    }
-    renderTimeline(states);
-  };
-
-  while (true) {
-    const status = await call(`/api/jobs/${job.job_id}`);
-    for (const done of status.stages_done) applyStage(done.stage, done.detail);
-    applyStage(status.stage, status.detail);
-
-    if (status.state === "failed") {
-      const err = new Error(status.error?.headline || "Processing failed");
-      err.detail = status.error;
-      throw err;
-    }
-    if (status.state === "done") return status.result;
-    await new Promise((resolve) => setTimeout(resolve, 900));
-  }
+  // Let 100 % be visible before moving on, so completion is seen not inferred.
+  setTimeout(() => {
+    show("workspace");
+    if (S.kind !== "pdf") { S.cadBox = cadExtent(); renderCad(); }
+    paintAll();
+    fitToWindow();
+  }, 500);
 }
 
 /* ── drawing render ──────────────────────────────────────────────────────── */
@@ -1284,7 +1355,9 @@ function renderCapabilities() {
     $("uploadNotice").innerHTML = `<div class="notice">
       <h4>${esc(t("dwg.notInstalledTitle"))}</h4>
       <p>${esc(t("dwg.notInstalledBody"))}</p>
-      <p class="fix">${esc(t("dwg.runCommand", { command: caps.dwg.setup_command || "" }))}</p>
+      <p class="fix">${esc(caps.dwg.advice === "deploy_image"
+        ? t("dwg.deployImage")
+        : t("dwg.runCommand", { command: caps.dwg.setup_command || "" }))}</p>
     </div>`;
   } else {
     line.textContent = t("drop.formats");

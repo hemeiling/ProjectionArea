@@ -24,6 +24,7 @@ import fitz
 
 from backend.config import DOCUMENT_TTL_SECONDS
 from backend.pipeline import PreparedPage, prepare_page
+from backend.progress import NULL_PROGRESS, Progress
 
 
 @dataclass
@@ -76,111 +77,165 @@ class DocumentStore:
     def root(self) -> str:
         return self._root
 
-    def add_cad(self, data: bytes, file_name: str) -> StoredDocument:
-        """Persist a DXF upload and read it through the CAD adapter.
+    # ── spooling ────────────────────────────────────────────────────────────
+    #
+    # A production DWG is 93 MB and its converted DXF is larger still. Reading
+    # one into a ``bytes`` before doing anything with it costs that much memory
+    # for the whole life of the job, on top of the copy that has to be on disk
+    # for the converter to read — on a 512 MB instance that is the difference
+    # between working and being killed. So an upload is streamed straight to a
+    # file in this store's directory, and every ingest below can start from a
+    # path instead of a buffer.
+
+    def spool_path(self, suffix: str) -> str:
+        """A fresh path in the store's directory for an incoming upload.
+
+        The file lands on the same filesystem the document will live on, so
+        adopting it afterwards is a rename rather than a copy.
+        """
+        self.sweep()
+        os.makedirs(self._root, exist_ok=True)
+        return os.path.join(self._root, f"incoming-{uuid.uuid4().hex}{suffix}")
+
+    def _adopt(self, spooled: str, suffix: str) -> Tuple[str, str]:
+        """Move a spooled upload to its document path. Returns (id, path)."""
+        os.makedirs(self._root, exist_ok=True)
+        document_id = uuid.uuid4().hex[:16]
+        path = os.path.join(self._root, f"{document_id}{suffix}")
+        os.replace(spooled, path)
+        return document_id, path
+
+    def _register(self, stored: "StoredDocument") -> "StoredDocument":
+        with self._lock:
+            self._documents[stored.id] = stored
+        return stored
+
+    @staticmethod
+    def discard(path: str) -> None:
+        """Delete a spooled or abandoned file, ignoring an already-gone one."""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    # ── ingest ──────────────────────────────────────────────────────────────
+    #
+    # Each format has a path-based ``adopt_*`` that takes a file already on disk
+    # — what the upload endpoint streams — and an ``add_*`` that takes bytes, for
+    # the demo catalogue and the tests, where the drawings are small and a buffer
+    # is the natural thing to have.
+
+    def adopt_cad(
+        self, spooled: str, file_name: str, progress: Progress = NULL_PROGRESS
+    ) -> StoredDocument:
+        """Take over a spooled DXF and read it through the CAD adapter.
+
+        Args:
+            spooled: A file from :meth:`spool_path`. Consumed either way: it
+                becomes the document, or it is deleted.
 
         Raises:
-            ValueError: If the bytes are not a readable DXF.
+            ValueError: If the file is not a readable DXF.
         """
         from backend.cad.dxf import DxfReadError, load_dxf
 
-        self.sweep()
-        os.makedirs(self._root, exist_ok=True)
-        document_id = uuid.uuid4().hex[:16]
-        path = os.path.join(self._root, f"{document_id}.dxf")
-        with open(path, "wb") as handle:
-            handle.write(data)
+        document_id, path = self._adopt(spooled, ".dxf")
         try:
-            drawing = load_dxf(path)
+            drawing = load_dxf(path, progress=progress)
         except DxfReadError as error:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError(str(error)) from error
         except Exception as error:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError(f"Not a readable DXF: {error}") from error
         if not drawing.primitives:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError("The DXF contains no readable geometry in model space")
 
         now = time.time()
-        stored = StoredDocument(
+        return self._register(StoredDocument(
             id=document_id, file_name=file_name, path=path, doc=None,
             created_at=now, last_used=now, cad=drawing,
-        )
-        with self._lock:
-            self._documents[document_id] = stored
-        return stored
+        ))
 
-    def add_dwg(self, data: bytes, file_name: str, on_stage: Any = None) -> StoredDocument:
-        """Persist a DWG upload, convert it locally, and read the result.
+    def adopt_dwg(self, spooled: str, file_name: str, on_stage: Any = None,
+                  progress: Progress = NULL_PROGRESS) -> StoredDocument:
+        """Take over a spooled DWG, convert it locally, and read the result.
 
         Raises:
-            DwgConversionUnavailable: No local converter is installed.
+            DwgConversionUnavailable: No converter is available here.
             ValueError: The file is not a DWG, or produced nothing readable.
         """
         from backend.cad.dwg import DwgConversionFailed, load_dwg
 
-        self.sweep()
-        os.makedirs(self._root, exist_ok=True)
-        document_id = uuid.uuid4().hex[:16]
-        path = os.path.join(self._root, f"{document_id}.dwg")
-        with open(path, "wb") as handle:
-            handle.write(data)
+        document_id, path = self._adopt(spooled, ".dwg")
         try:
-            drawing, conversion = load_dwg(path, file_name=file_name, on_stage=on_stage)
+            drawing, conversion = load_dwg(
+                path, file_name=file_name, on_stage=on_stage, progress=progress,
+            )
         except DwgConversionFailed as error:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError(str(error)) from error
         except Exception:
-            os.unlink(path)
+            self.discard(path)
             raise
         if not drawing.primitives:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError(
                 "The DWG converted successfully but carries no readable geometry "
                 "in model space."
             )
 
         now = time.time()
-        stored = StoredDocument(
+        return self._register(StoredDocument(
             id=document_id, file_name=file_name, path=path, doc=None,
             created_at=now, last_used=now, cad=drawing, conversion=conversion,
-        )
-        with self._lock:
-            self._documents[document_id] = stored
-        return stored
+        ))
 
-    def add(self, data: bytes, file_name: str) -> StoredDocument:
-        """Persist an upload and open it.
+    def adopt_pdf(self, spooled: str, file_name: str) -> StoredDocument:
+        """Take over a spooled PDF and open it.
 
         Raises:
-            ValueError: If the bytes are not a readable PDF.
+            ValueError: If the file is not a readable PDF.
         """
-        self.sweep()
-        # The OS temp cleaner (or a test tearing the app down) can remove the
-        # directory underneath us; recreate rather than fail the upload.
-        os.makedirs(self._root, exist_ok=True)
-        document_id = uuid.uuid4().hex[:16]
-        path = os.path.join(self._root, f"{document_id}.pdf")
-        with open(path, "wb") as handle:
-            handle.write(data)
+        document_id, path = self._adopt(spooled, ".pdf")
         try:
             doc = fitz.open(path)
         except Exception as error:
-            os.unlink(path)
+            self.discard(path)
             raise ValueError(f"Not a readable PDF: {error}") from error
         if doc.page_count == 0:
             doc.close()
-            os.unlink(path)
+            self.discard(path)
             raise ValueError("PDF contains no pages")
 
         now = time.time()
-        stored = StoredDocument(
-            id=document_id, file_name=file_name, path=path, doc=doc, created_at=now, last_used=now
-        )
-        with self._lock:
-            self._documents[document_id] = stored
-        return stored
+        return self._register(StoredDocument(
+            id=document_id, file_name=file_name, path=path, doc=doc,
+            created_at=now, last_used=now,
+        ))
+
+    def _spool_bytes(self, data: bytes, suffix: str) -> str:
+        path = self.spool_path(suffix)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def add_cad(
+        self, data: bytes, file_name: str, progress: Progress = NULL_PROGRESS
+    ) -> StoredDocument:
+        """Persist a DXF held in memory. See :meth:`adopt_cad`."""
+        return self.adopt_cad(self._spool_bytes(data, ".dxf"), file_name, progress)
+
+    def add_dwg(self, data: bytes, file_name: str, on_stage: Any = None,
+                progress: Progress = NULL_PROGRESS) -> StoredDocument:
+        """Persist a DWG held in memory. See :meth:`adopt_dwg`."""
+        return self.adopt_dwg(
+            self._spool_bytes(data, ".dwg"), file_name, on_stage, progress)
+
+    def add(self, data: bytes, file_name: str) -> StoredDocument:
+        """Persist a PDF held in memory. See :meth:`adopt_pdf`."""
+        return self.adopt_pdf(self._spool_bytes(data, ".pdf"), file_name)
 
     def get(self, document_id: str) -> StoredDocument:
         """Look up a document, refreshing its TTL.
@@ -195,7 +250,9 @@ class DocumentStore:
             stored.last_used = time.time()
             return stored
 
-    def prepared_page(self, document_id: str, page_number: int) -> Tuple[StoredDocument, PreparedPage]:
+    def prepared_page(
+        self, document_id: str, page_number: int, progress: Progress = NULL_PROGRESS
+    ) -> Tuple[StoredDocument, PreparedPage]:
         """Return the cached analysis for a page, computing it on first use."""
         stored = self.get(document_id)
         with self._lock:
@@ -209,7 +266,7 @@ class DocumentStore:
 
                     page = prepare_cad_page(stored.cad)
                 else:
-                    page = prepare_page(stored.doc, page_number)
+                    page = prepare_page(stored.doc, page_number, progress)
                 stored.pages[page_number] = page
             return stored, page
 

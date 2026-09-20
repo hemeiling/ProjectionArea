@@ -1,0 +1,101 @@
+# Continuous integration.
+#
+# Two things are checked, because they fail in different ways:
+#
+#   tests  — the engineering suite, including the browser tests. A geometry
+#            regression is the failure this project cares about most.
+#   image  — the deployment image actually builds, starts, and reports DWG
+#            support. The Dockerfile compiles GNU LibreDWG from source; nothing
+#            in the test suite can tell you whether that worked, and a broken
+#            image looks exactly like a working one until someone uploads a DWG.
+#
+# Render deploys `main` on push, so this runs on pushes to main as well as on
+# pull requests. It does not *block* that deploy: gating it needs Render's
+# auto-deploy turned off and a deploy hook called from here, or a branch
+# protection rule requiring these checks — see docs/DEPLOYMENT.md. Until then
+# this is the signal that says whether the commit that just deployed was sound.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # The browser tests are part of the suite, not an optional extra: this
+      # application's whole claim is that an engineer can see what was measured.
+      - name: Install the test browser
+        run: python -m playwright install --with-deps chromium
+
+      # No LibreDWG here on purpose. The DWG tests are written to skip when the
+      # converter is absent, and this job proves that they do — a suite that
+      # silently required a system CAD tool would fail for every new contributor.
+      # The image job below is what proves DWG support itself.
+      - name: Run the suite
+        run: python -m pytest -q
+
+  image:
+    name: Deployment image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t projected-area:ci .
+
+      - name: Start it the way the platform does
+        run: |
+          docker run -d --name pa -e PORT=10000 -p 10000:10000 projected-area:ci
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:10000/health > health.json; then break; fi
+            sleep 2
+          done
+          cat health.json
+
+      - name: The image must be able to do the job it exists for
+        run: |
+          python - <<'PY'
+          import json, sys
+          health = json.load(open("health.json"))
+          print(health)
+          problems = []
+          if health.get("status") != "ok":
+              problems.append("status is not ok")
+          for capability in ("pdf", "dxf", "dwg"):
+              if not health.get(capability):
+                  problems.append(f"{capability} unavailable in the image")
+          if health.get("dwg_converter") != "libredwg":
+              problems.append(f"unexpected converter: {health.get('dwg_converter')!r}")
+          # A path or an environment value here would be a leak, not a feature.
+          for key, value in health.items():
+              if isinstance(value, str) and value.startswith("/"):
+                  problems.append(f"{key} exposes a filesystem path")
+          if problems:
+              sys.exit("health check rejected: " + "; ".join(problems))
+          print("image healthy, DWG support present")
+          PY
+
+      - name: Container logs
+        if: always()
+        run: docker logs pa || true

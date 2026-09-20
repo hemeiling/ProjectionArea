@@ -41,10 +41,34 @@
 
 <!-- ── processing ──────────────────────────────────────────────────────── -->
 <main id="processing" class="hide" style="padding:40px 24px">
+  <!-- Reachable mid-run: switching language must never mean restarting a job
+       that has been parsing a 2.4-million-entity DWG for three minutes. -->
+  <div style="display:flex; justify-content:flex-end; margin-bottom:10px">
+    <div class="langswitch" data-i18n-title="lang.switchTitle" title="Interface language">
+      <button type="button" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" data-lang="zh-CN" aria-pressed="false">中文</button>
+    </div>
+  </div>
   <header class="brand" style="margin-bottom:22px">
     <h1 style="font-size:18px" id="procTitle" data-i18n="proc.title">Processing drawing</h1>
     <p class="mono" id="procFile" style="font-size:12px"></p>
   </header>
+  <div class="progress" id="progressBlock">
+    <div class="track" id="progressTrack">
+      <div class="fill" id="progressFill" style="width:0%"></div>
+      <!-- Spans the stage whose internal progress is unknown, so the reader can
+           see where the work is without a percentage being invented for it. -->
+      <div class="ghost" id="progressGhost" hidden></div>
+    </div>
+    <div class="progress-line">
+      <span class="pct mono" id="progressPct">0%</span>
+      <span class="what" id="progressWhat"></span>
+      <span class="elapsed mono" id="progressElapsed"></span>
+    </div>
+    <p class="counts mono" id="progressCounts"></p>
+    <p class="slow" id="progressSlow" hidden></p>
+  </div>
+
   <div class="timeline" id="timeline"></div>
   <div id="procNotice"></div>
   <div style="margin-top:16px; text-align:center">

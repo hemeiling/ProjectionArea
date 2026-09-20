@@ -344,7 +344,10 @@ def test_a_dwg_upload_shows_the_conversion_timeline(viewer_url, tmp_path):
         # Either the component is missing, or conversion ran and failed on the stub.
         page.wait_for_selector("#procNotice .notice", timeout=120000)
         notice = page.inner_text("#procNotice")
-        load_state = page.get_attribute('.stage[data-stage="load"]', "data-state")
+        # "validated" is the DWG plan's first stage; the signature was valid, so
+        # it has to read as passed even though the conversion behind it did not.
+        validated_state = page.get_attribute(
+            '.stage[data-stage="validated"]', "data-state")
         browser.close()
 
     assert labels[0] == "DWG validated"
@@ -363,7 +366,7 @@ def test_a_dwg_upload_shows_the_conversion_timeline(viewer_url, tmp_path):
 
     # Whatever went wrong, it is explained rather than shown as a bare error.
     assert notice.strip()
-    assert load_state == "done", "the DWG signature was valid; validation passed"
+    assert validated_state == "done", "the DWG signature was valid; validation passed"
     if "not installed" in title:
         assert "install_dwg_support" in notice, "name the exact setup command"
     else:
@@ -454,7 +457,13 @@ def test_a_calibrated_drawing_reports_its_confidence(viewer_url, drawings):
 
 
 def _switch(page, lang):
-    scope = "#landing" if page.is_visible("#landing") else ".topbar"
+    """Click the toggle belonging to whichever screen is showing."""
+    if page.is_visible("#landing"):
+        scope = "#landing"
+    elif page.is_visible("#processing"):
+        scope = "#processing"
+    else:
+        scope = ".topbar"
     page.click(f'{scope} [data-lang="{lang}"]')
     page.wait_for_timeout(700)
 
@@ -583,3 +592,213 @@ def test_no_english_ui_chrome_leaks_into_the_chinese_interface(viewer_url, drawi
     for leaked in ("Measured footprint", "Footprints", "Warnings", "Explain",
                    "Source geometry", "Bounding rectangle", "Geometry Union"):
         assert leaked not in rail, f"untranslated string in the Chinese UI: {leaked!r}"
+
+
+# ── processing progress ──────────────────────────────────────────────────────
+#
+# The bar exists because a production DWG takes minutes. What matters is not
+# that it animates but that every number on it came from the job: these watch
+# the real page drive a real analysis and assert the properties an engineer
+# relies on — it only moves forward, it reaches the end before the screen
+# changes, and a failure leaves the evidence of how far it got on screen.
+
+
+def _progress_state(page):
+    return page.evaluate(
+        """() => ({
+            pct: document.getElementById('progressPct').textContent,
+            what: document.getElementById('progressWhat').textContent,
+            counts: document.getElementById('progressCounts').textContent,
+            width: document.getElementById('progressFill').style.width,
+            cls: document.getElementById('progressBlock').className,
+            stages: [...document.querySelectorAll('.stage')].map(
+                (e) => e.dataset.stage + ':' + e.dataset.state),
+            workspace: !document.getElementById('workspace').classList.contains('hide'),
+        })"""
+    )
+
+
+def _watch_progress(page, path, samples=600):
+    """Upload, then record every distinct progress state until the job settles."""
+    page.set_input_files("#fileInput", path)
+    page.wait_for_selector("#processing:not(.hide)", timeout=30000)
+    seen = []
+    for _ in range(samples):
+        state = _progress_state(page)
+        if not seen or state != seen[-1]:
+            seen.append(state)
+        if state["workspace"] or "failed" in state["cls"]:
+            break
+        page.wait_for_timeout(100)
+    return seen
+
+
+def _percentages(seen):
+    return [int(s["pct"].rstrip("%")) for s in seen if s["pct"].endswith("%")]
+
+
+def test_the_progress_bar_only_ever_moves_forward(viewer_url, drawings):
+    """A bar that rewinds reads as a fault, whatever the backend meant by it."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        seen = _watch_progress(page, drawings["layout_1_100"]["path"])
+        browser.close()
+
+    percentages = _percentages(seen)
+    assert percentages, "the bar reported nothing at all"
+    assert all(b >= a for a, b in zip(percentages, percentages[1:])), (
+        f"progress went backwards: {percentages}"
+    )
+    widths = [float(s["width"].rstrip("%")) for s in seen if s["width"].endswith("%")]
+    assert all(b >= a - 1e-9 for a, b in zip(widths, widths[1:])), (
+        f"the filled width went backwards: {widths}"
+    )
+
+
+def test_completion_is_shown_before_the_workspace_replaces_it(viewer_url, drawings):
+    """100 % must be seen, not inferred from the result appearing."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        seen = _watch_progress(page, drawings["plate_with_holes"]["path"])
+        page.wait_for_selector("#workspace:not(.hide)", timeout=180000)
+        browser.close()
+
+    percentages = _percentages(seen)
+    assert 100 in percentages, f"the bar never reached 100 %: {percentages}"
+    hundred_at = percentages.index(100)
+    workspace_at = next(
+        (i for i, s in enumerate(seen) if s["workspace"]), len(seen))
+    assert hundred_at <= workspace_at, (
+        "100 % has to be on screen before the workspace takes over"
+    )
+    assert "done" in seen[-1]["cls"] or seen[-1]["workspace"]
+
+
+def test_completed_stages_are_reflected_in_the_bar(viewer_url, drawings):
+    """The checklist and the bar are two views of one job state, not two guesses."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        seen = _watch_progress(page, drawings["layout_1_100"]["path"])
+        browser.close()
+
+    assert seen, "nothing observed"
+    for state in seen:
+        assert state["stages"], "the detailed stage list stays beside the bar"
+
+    done = [sum(1 for st in s["stages"] if st.endswith(":done")) for s in seen]
+    percentages = _percentages(seen)
+    assert all(b >= a for a, b in zip(done, done[1:])), (
+        f"completed stages went backwards: {done}"
+    )
+    # A newly completed stage never comes with less of the bar filled.
+    pairs = list(zip(done, percentages))
+    for (done_a, pct_a), (done_b, pct_b) in zip(pairs, pairs[1:]):
+        if done_b > done_a:
+            assert pct_b >= pct_a, (
+                f"stage {done_b} completed but the bar fell: {pct_a} -> {pct_b}")
+    assert done[-1] > done[0], f"no stage ever completed: {done}"
+    assert done[-1] == len(seen[-1]["stages"]), "a finished job has every stage ticked"
+
+
+def test_real_counts_are_reported_inside_the_long_stage(viewer_url, drawings):
+    """Counts like "145,000 / 163,691 primitives" are the job's, or absent."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        seen = _watch_progress(page, drawings["obround_with_slot"]["path"])
+        browser.close()
+
+    ratios = [s["counts"] for s in seen if "/" in s["counts"]]
+    values = []
+    for text in ratios:
+        left, right = text.split("/", 1)
+        current = int("".join(ch for ch in left if ch.isdigit()))
+        total = int("".join(ch for ch in right if ch.isdigit()))
+        assert current <= total, f"a count exceeded its own total: {text!r}"
+        values.append(current)
+    assert all(b >= a for a, b in zip(values, values[1:])), values
+    # Synthetic fixtures are small enough to finish inside one poll, so an
+    # absent ratio is correct here; an ill-formed one never is.
+
+
+def test_a_failed_analysis_keeps_the_progress_it_earned(viewer_url, tmp_path):
+    """Where it stopped is the useful part, so failure must not reset the bar."""
+    stub = tmp_path / "truncated.dwg"
+    stub.write_bytes(b"AC1015" + bytes(800))  # a real DWG signature, no drawing
+
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        _watch_progress(page, str(stub))
+        page.wait_for_selector("#procNotice .notice", timeout=180000)
+        page.wait_for_timeout(400)
+        final = _progress_state(page)
+        notice = page.inner_text("#procNotice")
+        browser.close()
+
+    assert "failed" in final["cls"], "a failed run has to look failed"
+    assert float(final["width"].rstrip("%")) > 0, (
+        "the progress already earned is retained, not rewound to zero"
+    )
+    assert "Failed during" in final["what"], f"say which stage stopped: {final['what']!r}"
+    assert any(st.endswith(":failed") for st in final["stages"]), (
+        "and mark that stage in the checklist"
+    )
+    assert notice.strip(), "with the actionable explanation underneath"
+    assert not final["workspace"], "a failed run must not reach the workspace"
+
+
+def test_language_switches_mid_run_without_restarting_the_job(viewer_url, drawings):
+    """Reading the bar in Chinese must not cost a three-minute DWG its progress."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        posts = []
+        page.on("request", lambda r: posts.append(r.url)
+                if r.method == "POST" and "/api/analyse" in r.url else None)
+        page.goto(viewer_url)
+        page.wait_for_selector("#landing:not(.hide)", timeout=30000)
+        page.wait_for_timeout(500)
+
+        page.set_input_files("#fileInput", drawings["layout_1_100"]["path"])
+        page.wait_for_selector("#processing:not(.hide)", timeout=30000)
+        before = _progress_state(page)
+
+        # The switch has to be on the processing screen itself to be usable here.
+        page.click("#processing .langswitch button[data-lang='zh-CN']")
+        page.wait_for_timeout(400)
+        translated = _progress_state(page)
+        stage_labels = page.eval_on_selector_all(
+            "#timeline .stage .label", "els => els.map((e) => e.textContent)")
+
+        page.wait_for_selector("#workspace:not(.hide)", timeout=180000)
+        page.wait_for_timeout(1500)
+        name = page.inner_text("#rdName")
+        value = page.inner_text("#rdValue")
+        browser.close()
+
+    assert len(posts) == 1, f"the job was resubmitted on a language change: {posts}"
+    assert float(translated["width"].rstrip("%")) >= float(before["width"].rstrip("%")), (
+        "the bar must not rewind when the language changes"
+    )
+    assert any(re.search(r"[一-鿿]", label) for label in stage_labels), (
+        f"the stage list did not translate mid-run: {stage_labels}"
+    )
+    # And the job it was watching still produced the same measurement.
+    assert name == "几何并集面积"
+    assert _number(value) == pytest.approx(54.46, abs=0.05), (
+        "progress reporting and language must not touch the number"
+    )

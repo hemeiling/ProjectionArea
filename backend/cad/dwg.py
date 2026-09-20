@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.cad.dxf import CadDrawing, DxfReadError, load_dxf
+from backend.progress import NULL_PROGRESS, Progress
+from backend.runtime import CONVERTER_ENV, converter_hint, is_managed_host
 
 #: ``AC10xx`` release codes, from the DWG file signature.
 DWG_VERSIONS: Dict[str, str] = {
@@ -52,12 +54,19 @@ DWG_VERSIONS: Dict[str, str] = {
     "AC1032": "AutoCAD 2018+",
 }
 
-#: Where a locally built converter is looked for, before falling back to PATH.
+#: Where a converter is looked for when it is not on ``PATH``. Ordered by how
+#: specific each location is to a deliberate installation: this project's own
+#: local build first, then the conventional prefixes on Linux and macOS.
+#:
+#: ``PATH`` is consulted *before* this list (see :func:`find_converter`), which
+#: is what makes the container image work without configuration — the image puts
+#: ``dwg2dxf`` on ``PATH`` and nothing here needs to know where.
 _SEARCH_PATHS: Tuple[str, ...] = (
     os.path.expanduser("~/.local/libredwg/bin/dwg2dxf"),
     os.path.expanduser("~/.local/bin/dwg2dxf"),
     "/usr/local/bin/dwg2dxf",
-    "/opt/homebrew/bin/dwg2dxf",
+    "/opt/libredwg/bin/dwg2dxf",   # the container image's prefix
+    "/opt/homebrew/bin/dwg2dxf",   # macOS, Apple silicon
     "/usr/bin/dwg2dxf",
 )
 _ODA_PATHS: Tuple[str, ...] = (
@@ -70,6 +79,41 @@ _ODA_PATHS: Tuple[str, ...] = (
 CONVERSION_TIMEOUT_SECONDS = 900
 
 
+#: How to obtain the converter, on a developer machine. Actionable because it is
+#: a command the reader can actually run (§31).
+LOCAL_SETUP_COMMAND = ".venv/bin/python -m tools.install_dwg_support"
+
+#: The same problem on a deployed instance is not the operator's to fix from the
+#: browser, and telling them to run a local build script would be noise. The
+#: image is supposed to contain the converter, so its absence is a deployment
+#: fault and the message says so.
+HOSTED_SETUP_ADVICE = (
+    "This instance was deployed without the DWG conversion component. Deploy the "
+    "container image, which includes it, or upload a DXF or PDF export instead."
+)
+
+
+def setup_advice() -> Dict[str, str]:
+    """What to do about a missing converter, for where we are running.
+
+    Returns a *case* alongside the English text, not only a sentence: the browser
+    has to render this in English or Chinese, so the wording belongs to the UI's
+    catalogue and the decision of which wording applies belongs here. ``text`` is
+    for callers that are not the browser — logs, the API, the test suite.
+
+    Returns:
+        ``case`` is ``"local_build"`` or ``"deploy_image"``; ``command`` is the
+        exact command to run, empty when there is none to offer.
+    """
+    if is_managed_host():
+        return {"case": "deploy_image", "command": "", "text": HOSTED_SETUP_ADVICE}
+    return {
+        "case": "local_build",
+        "command": LOCAL_SETUP_COMMAND,
+        "text": f"Run: {LOCAL_SETUP_COMMAND}",
+    }
+
+
 class DwgConversionUnavailable(RuntimeError):
     """No local converter is installed.
 
@@ -78,11 +122,17 @@ class DwgConversionUnavailable(RuntimeError):
     """
 
     def __init__(self) -> None:
+        advice = setup_advice()
         super().__init__(
             "DWG support requires the local CAD conversion component. "
-            "Install it with: .venv/bin/python -m tools.install_dwg_support"
+            + advice["text"]
         )
-        self.setup_command = ".venv/bin/python -m tools.install_dwg_support"
+        #: A displayable sentence, phrased for this environment.
+        self.fix = advice["text"]
+        #: Which remedy applies, so a translated UI can word it itself.
+        self.case = advice["case"]
+        #: The bare command, where one exists; empty on a deployed instance.
+        self.setup_command = advice["command"]
         self.component = "LibreDWG dwg2dxf"
 
 
@@ -105,6 +155,9 @@ class DwgConversion:
     dwg_version: str
     tool: str
     tool_version: str
+    #: Where the converter was found. Deliberately absent from :meth:`as_dict`:
+    #: it is a fact about the host, and "libredwg 0.14" is the whole of what a
+    #: reader needs to reproduce the conversion (§24, §35).
     tool_path: str
     dxf_sha256: str = ""
     dxf_bytes: int = 0
@@ -125,7 +178,6 @@ class DwgConversion:
             "dwg_version": self.dwg_version,
             "tool": self.tool,
             "tool_version": self.tool_version,
-            "tool_path": self.tool_path,
             "intermediate_dxf_sha256": self.dxf_sha256,
             "intermediate_dxf_bytes": self.dxf_bytes,
             "duration_seconds": round(self.duration_seconds, 2),
@@ -167,22 +219,38 @@ class Converter:
 def find_converter() -> Optional[Converter]:
     """The best local converter available, or ``None``.
 
-    Looked up every call rather than cached at import, so installing the
+    Looked for in three places, in order of how explicit each one is:
+
+    1. ``LIBREDWG_BIN``, when a host has put the binary somewhere unusual.
+       Honoured but never required.
+    2. ``PATH`` — the normal case on a Linux image that installs the tool.
+    3. The known prefixes in :data:`_SEARCH_PATHS`, which cover this project's
+       own local build and the usual macOS and Linux locations.
+
+    Looked up on every call rather than cached at import, so installing the
     component does not require restarting the server.
     """
-    for candidate in _SEARCH_PATHS:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return Converter("libredwg", candidate, _dwg2dxf_version(candidate))
+    configured = converter_hint()
+    if configured and _is_executable(configured):
+        return Converter("libredwg", configured, _dwg2dxf_version(configured))
+
     found = shutil.which("dwg2dxf")
     if found:
         return Converter("libredwg", found, _dwg2dxf_version(found))
+    for candidate in _SEARCH_PATHS:
+        if _is_executable(candidate):
+            return Converter("libredwg", candidate, _dwg2dxf_version(candidate))
     for candidate in _ODA_PATHS:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
             return Converter("oda_file_converter", candidate, "unknown")
     found = shutil.which("ODAFileConverter")
     if found:
         return Converter("oda_file_converter", found, "unknown")
     return None
+
+
+def _is_executable(path: str) -> bool:
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
 def _dwg2dxf_version(path: str) -> str:
@@ -197,23 +265,38 @@ def _dwg2dxf_version(path: str) -> str:
     return "unknown"
 
 
-def converter_status() -> Dict[str, Any]:
-    """Whether DWG support is available, for the UI and for diagnostics."""
+def converter_status(reveal_paths: bool = False) -> Dict[str, Any]:
+    """Whether DWG support is available, for the UI and for diagnostics.
+
+    Args:
+        reveal_paths: Include absolute filesystem paths. Off by default because
+            this dictionary is served over HTTP, and where a binary lives on the
+            host is information about the host, not about the drawing (§35). The
+            local diagnostic tooling asks for them explicitly.
+    """
     converter = find_converter()
     if converter is None:
-        return {
+        advice = setup_advice()
+        status: Dict[str, Any] = {
             "available": False,
             "component": "LibreDWG dwg2dxf",
-            "reason": "No local DWG converter was found on this machine.",
-            "setup_command": ".venv/bin/python -m tools.install_dwg_support",
-            "searched": list(_SEARCH_PATHS),
+            "reason": "No DWG converter was found in this environment.",
+            "fix": advice["text"],
+            "advice": advice["case"],
+            "setup_command": advice["command"],
+            "configured_by": CONVERTER_ENV,
         }
-    return {
+        if reveal_paths:
+            status["searched"] = list(_SEARCH_PATHS)
+        return status
+    status = {
         "available": True,
         "tool": converter.tool,
         "version": converter.version,
-        "path": converter.path,
     }
+    if reveal_paths:
+        status["path"] = converter.path
+    return status
 
 
 def _run_libredwg(tool: Converter, source: str, target: str) -> List[str]:
@@ -302,6 +385,7 @@ def load_dwg(
     file_name: Optional[str] = None,
     keep_dxf_in: Optional[str] = None,
     on_stage: Optional[Any] = None,
+    progress: Progress = NULL_PROGRESS,
 ) -> Tuple[CadDrawing, DwgConversion]:
     """Convert a DWG locally and read it through the DXF adapter.
 
@@ -348,6 +432,9 @@ def load_dwg(
         tool_path=converter.path,
     )
 
+    progress.finish("validated", f"{signature} · {conversion.dwg_version}")
+    progress.begin("converted")
+
     workspace = tempfile.mkdtemp(prefix="dwg-convert-")
     target = os.path.join(workspace, os.path.splitext(os.path.basename(name))[0] + ".dxf")
     started = time.time()
@@ -364,6 +451,12 @@ def load_dwg(
         conversion.duration_seconds = time.time() - started
         conversion.dxf_bytes = os.path.getsize(target)
         conversion.dxf_sha256 = _sha256(target)
+        progress.finish(
+            "converted",
+            f"{converter.tool} {converter.version} · {conversion.duration_seconds:.2f}s · "
+            f"{conversion.dxf_bytes / 1e6:.0f} MB DXF",
+        )
+        progress.begin("geometry")
         if on_stage:
             on_stage(
                 "converted",
@@ -373,7 +466,7 @@ def load_dwg(
             on_stage("reading", "reading CAD geometry")
 
         try:
-            drawing = load_dxf(target)
+            drawing = load_dxf(target, progress=progress)
         except DxfReadError as error:
             # The converter wrote a file that is not readable DXF. From here that
             # is a conversion failure, not a mysterious parse error: the user
@@ -381,6 +474,7 @@ def load_dwg(
             raise DwgConversionFailed(
                 f"The DWG was converted but the result could not be read: {error}"
             ) from error
+        progress.finish("geometry", f"{len(drawing.primitives):,} primitives")
         conversion.metadata_warnings = _check_metadata(drawing)
 
         if keep_dxf_in:
