@@ -83,28 +83,6 @@ def test_upload_processes_and_reaches_the_workspace(viewer_url, drawings):
     assert overlay > 3, "the overlay must draw the measured geometry"
 
 
-def test_a_dwg_is_explained_not_failed(viewer_url, tmp_path):
-    """A valid DWG is an unsupported *format*, and the UI must say which."""
-    dwg = tmp_path / "line.dwg"
-    dwg.write_bytes(b"AC1015" + bytes(400))
-
-    with playwright_api.sync_playwright() as pw:
-        browser = _launch(pw)
-        page = browser.new_page(viewport={"width": 1500, "height": 950})
-        page.goto(viewer_url)
-        page.set_input_files("#fileInput", str(dwg))
-        page.wait_for_selector("#procNotice .notice", timeout=60000)
-        title = page.inner_text("#procTitle")
-        notice = page.inner_text("#procNotice")
-        first_stage = page.get_attribute('.stage[data-stage="load"]', "data-state")
-        browser.close()
-
-    assert title == "DWG detected"
-    assert "valid DWG" in notice
-    assert "DXF" in notice, "the fix must be stated"
-    assert first_stage == "unsupported", "unsupported is its own state, not failed"
-
-
 def test_footprint_readings_switch_the_value_and_the_overlay(viewer_url, drawings):
     """The product concept: several readings, and the drawing follows the choice."""
     with playwright_api.sync_playwright() as pw:
@@ -321,3 +299,89 @@ def test_viewer_zoom_controls_change_the_rendered_size(viewer_url, drawings):
 
     assert bigger > start
     assert hundred == "100%"
+
+
+# ── DWG as a first-class input ───────────────────────────────────────────────
+
+
+def test_dwg_is_offered_as_a_supported_format(viewer_url):
+    """DWG sits beside PDF and DXF, not in a footnote."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#formatLine", timeout=30000)
+        page.wait_for_timeout(600)
+        formats = page.inner_text("#formatLine")
+        accept = page.get_attribute("#fileInput", "accept")
+        browser.close()
+
+    assert "DWG" in formats
+    assert ".dwg" in accept, "the file picker must offer DWG"
+    assert "unsupported" not in formats.lower()
+
+
+def test_a_dwg_upload_shows_the_conversion_timeline(viewer_url, tmp_path):
+    """The DWG sequence is its own, and names conversion explicitly.
+
+    Driven with a DWG header and no drawing behind it: the point under test is
+    that the UI *routes* a DWG through validation and conversion and says so,
+    not that this particular file converts.
+    """
+    stub = tmp_path / "line.dwg"
+    stub.write_bytes(b"AC1015" + bytes(600))
+
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.set_input_files("#fileInput", str(stub))
+        page.wait_for_selector("#processing:not(.hide)", timeout=30000)
+        page.wait_for_timeout(1200)
+
+        labels = page.eval_on_selector_all(".stage .label", "els => els.map(e => e.textContent)")
+        title = page.inner_text("#procTitle")
+        # Either the component is missing, or conversion ran and failed on the stub.
+        page.wait_for_selector("#procNotice .notice", timeout=120000)
+        notice = page.inner_text("#procNotice")
+        load_state = page.get_attribute('.stage[data-stage="load"]', "data-state")
+        browser.close()
+
+    assert labels[0] == "DWG validated"
+    assert "CAD conversion completed" in labels, "conversion is a named stage"
+    assert "CAD units detected" in labels
+    assert "Layers / blocks analysed" in labels
+    # The file *was* a valid DWG, so the heading must say which thing went wrong.
+    assert title in (
+        "DWG support is not installed yet",
+        "DWG could not be converted",
+        "Drawing contains no geometry",
+    ), title
+    assert "Cannot read this file" != title, (
+        "a valid DWG that failed conversion is not an unreadable file"
+    )
+
+    # Whatever went wrong, it is explained rather than shown as a bare error.
+    assert notice.strip()
+    assert load_state == "done", "the DWG signature was valid; validation passed"
+    if "not installed" in title:
+        assert "install_dwg_support" in notice, "name the exact setup command"
+    else:
+        # Either the conversion failed, or it succeeded onto an empty drawing —
+        # both name the DWG rather than blaming the reader.
+        assert "convert" in notice.lower() or "no measurable geometry" in notice.lower()
+
+
+def test_the_layers_tab_invites_cad_rather_than_naming_only_dxf(viewer_url, drawings):
+    """A PDF has no layers; the message should point at DWG *and* DXF."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["plate_with_holes"]["path"])
+        page.click("#tabs button[data-tab=layers]")
+        page.wait_for_timeout(300)
+        text = page.inner_text("#layersPane")
+        browser.close()
+
+    assert "DWG" in text and "DXF" in text
+    assert "no layer information" in text.lower()

@@ -516,6 +516,9 @@ class Scale:
     cross_check_spread: Optional[float] = None
     #: Present only for a two-point calibration: the span the operator picked.
     calibration: Optional["Calibration"] = None
+    #: Set explicitly when a human supplied part of the scale. Left ``None`` it
+    #: is inferred from the source, so existing callers need no change.
+    stated_by_operator: Optional[bool] = None
 
     @property
     def operator_supplied(self) -> bool:
@@ -524,7 +527,14 @@ class Scale:
         Kept distinct from ``verified``: an operator-supplied scale is usable
         and auditable, but it was not *derived* from the drawing, so the UI must
         say so rather than presenting it as an automatic finding (§30).
+
+        A CAD drawing that does not declare ``$INSUNITS`` is the case that forced
+        this to be a field rather than a test on the source: its *coordinates*
+        are the drawing's own, but which physical unit they are in was stated by
+        a person, so the reading is part measured and part asserted.
         """
+        if self.stated_by_operator is not None:
+            return self.stated_by_operator
         return self.source is ScaleSource.USER_TWO_POINT
 
     @property

@@ -30,7 +30,7 @@ class ScaleSpec(BaseModel):
     hatch for a scale already established elsewhere.
     """
 
-    mode: Literal["auto", "two_point", "ratio", "mm_per_unit", "none"] = "auto"
+    mode: Literal["auto", "two_point", "ratio", "mm_per_unit", "cad_unit", "none"] = "auto"
     points: Optional[List[List[float]]] = Field(
         default=None, description="Two [x, y] points in PDF units, for two_point mode"
     )

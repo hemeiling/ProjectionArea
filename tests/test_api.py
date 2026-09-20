@@ -61,24 +61,100 @@ def test_upload_rejects_a_file_that_is_no_kind_of_drawing(client):
     assert detail["fix"]
 
 
-def test_a_dwg_upload_is_identified_and_explained_not_failed(client):
-    """§31: a valid DWG is a supported *format* we cannot read yet.
+def test_capabilities_reports_which_formats_can_be_read(client):
+    """The UI offers DWG only when the local converter is actually present."""
+    formats = client.get("/api/capabilities").json()["formats"]
+    assert formats["pdf"]["supported"] is True
+    assert formats["dxf"]["supported"] is True
+    assert "dwg" in formats
+    if formats["dwg"]["supported"]:
+        assert formats["dwg"]["tool"]
+        assert "converted locally" in formats["dwg"]["note"]
+    else:
+        assert "setup_command" in formats["dwg"]
 
-    The UI must be able to say so precisely, so the refusal carries the version,
-    why it cannot be read, and what to do — never a generic error.
+
+def test_a_dwg_upload_is_accepted_as_a_job(client):
+    """Converting a production DWG takes minutes, so the upload returns a job.
+
+    Holding the request open would leave the browser with nothing to show for
+    four minutes on the largest real drawing.
     """
     response = client.post(
         "/api/documents",
         files={"file": ("line.dwg", b"AC1015" + bytes(512), "application/octet-stream")},
     )
-    assert response.status_code == 415
+    assert response.status_code == 202
+    job = response.json()
+    assert job["job_id"]
+    assert job["state"] in ("running", "done", "failed")
+    assert job["file_name"] == "line.dwg"
+
+
+def test_a_corrupt_dwg_fails_the_job_with_a_reason_not_a_crash(client):
+    """A DWG signature with no DWG behind it is a conversion problem.
+
+    It must not be reported as "unsupported format": the format *is* supported,
+    this particular file could not be read — and the job says which.
+    """
+    import time
+
+    response = client.post(
+        "/api/documents",
+        files={"file": ("line.dwg", b"AC1015" + bytes(512), "application/octet-stream")},
+    )
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        status = client.get(f"/api/jobs/{job_id}").json()
+        if status["state"] in ("done", "failed"):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("the job never finished")
+
+    assert status["state"] == "failed", "nonsense bytes must not appear to succeed"
+    error = status["error"]
+    assert error["kind"] in (
+        "conversion_failed",     # the converter could not read it
+        "empty_drawing",         # it converted, but there is nothing to measure
+        "unreadable",
+        "dwg_component_missing",
+    )
+    assert error["headline"]
+    assert error.get("reason")
+
+
+def test_an_unknown_job_is_a_clear_404(client):
+    response = client.get("/api/jobs/nosuchjob")
+    assert response.status_code == 404
+    assert "nosuchjob" in response.json()["detail"]
+
+
+def test_dwg_support_when_the_component_is_missing_is_actionable(client, monkeypatch):
+    """The component check happens before the job, so this stays a direct 503."""
+    """§31: name the component and the exact command, never a generic failure."""
+    monkeypatch.setattr("backend.api.routes.converter_status", lambda: {
+        "available": False,
+        "component": "LibreDWG dwg2dxf",
+        "reason": "No local DWG converter was found on this machine.",
+        "setup_command": ".venv/bin/python -m tools.install_dwg_support",
+        "searched": [],
+    })
+    response = client.post(
+        "/api/documents",
+        files={"file": ("line.dwg", b"AC1015" + bytes(512), "application/octet-stream")},
+    )
+    assert response.status_code == 503
     detail = response.json()["detail"]
-    assert detail["kind"] == "dwg"
-    assert detail["version"] == "AC1015"
-    assert "valid DWG" in detail["headline"]
-    assert "no pure-Python DWG reader" in detail["reason"]
-    assert "DXF" in detail["fix"]
-    assert "declared units" in detail["why_dxf_is_better"]
+    assert detail["kind"] == "dwg_component_missing"
+    assert "local CAD conversion component" in detail["headline"]
+    assert "install_dwg_support" in detail["fix"]
+    assert "Nothing is uploaded anywhere" in detail["reason"], (
+        "say where the conversion happens — these are proprietary drawings"
+    )
 
 
 def test_a_dxf_upload_is_read_through_the_cad_adapter(client, tmp_path):

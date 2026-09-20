@@ -16,6 +16,8 @@ from backend.api.schemas import AreaRequest, PolygonMeasureRequest, ScaleSpec
 from backend.area.projected import compute_projected_area
 from backend.calibration.scale import scale_from_ratio, scale_from_two_points
 from backend.config import ENGINE_VERSION
+from backend.cad.dwg import DwgConversionUnavailable, converter_status
+from backend.jobs import JOBS, advance
 from backend.demo.catalogue import CATALOGUE, BY_ID, ensure_drawing, ground_truth
 from backend.geometry.polygons import ring_to_polygon, union_polygons
 from backend.geometry.regions import detect_title_block_ambiguity
@@ -40,6 +42,32 @@ _DEMO_DOCUMENTS: Set[str] = set()
 @router.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok", "engine_version": ENGINE_VERSION}
+
+
+@router.get("/capabilities")
+def capabilities() -> Dict[str, Any]:
+    """Which source formats this installation can actually read.
+
+    The UI asks so it can offer DWG honestly: as a supported input when the
+    local converter is present, and with the exact setup step when it is not.
+    """
+    dwg = converter_status()
+    return {
+        "formats": {
+            "pdf": {"supported": True, "note": "vector or scanned"},
+            "dxf": {"supported": True, "note": "read directly"},
+            "dwg": {
+                "supported": bool(dwg["available"]),
+                "note": (
+                    f"converted locally by {dwg['tool']} {dwg['version']}"
+                    if dwg["available"]
+                    else "requires the local CAD conversion component"
+                ),
+                **dwg,
+            },
+        },
+        "engine_version": ENGINE_VERSION,
+    }
 
 
 def _detect_kind(data: bytes, file_name: str) -> str:
@@ -83,26 +111,21 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     file_name = file.filename or "drawing"
     kind = _detect_kind(data, file_name)
 
-    if kind == "dwg":
-        version = data[:6].decode("ascii", "replace")
+    if kind == "dwg" and not converter_status()["available"]:
+        status = converter_status()
         raise HTTPException(
-            status_code=415,
+            status_code=503,
             detail={
-                "kind": "dwg",
-                "headline": "This is a valid DWG, but it cannot be read directly.",
-                "version": version,
+                "kind": "dwg_component_missing",
+                "headline": "DWG support requires the local CAD conversion component.",
+                "version": data[:6].decode("ascii", "replace"),
                 "reason": (
-                    "There is no pure-Python DWG reader, so the drawing has to be "
-                    "converted before its geometry can be measured."
+                    "The drawing is a valid DWG. Reading one needs a local converter, "
+                    "which is not installed on this machine. Nothing is uploaded "
+                    "anywhere — the conversion runs here."
                 ),
-                "fix": (
-                    "In AutoCAD choose Save As -> AutoCAD DXF, or convert the file "
-                    "locally with the free ODA File Converter, then upload the DXF."
-                ),
-                "why_dxf_is_better": (
-                    "The DXF also carries declared units, layers, blocks and real "
-                    "dimension values, none of which survive a printed PDF."
-                ),
+                "fix": f"Run: {status['setup_command']}",
+                "component": status["component"],
             },
         )
 
@@ -121,6 +144,12 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
             },
         )
 
+    if kind == "dwg":
+        # Converting and parsing a production DWG takes minutes. Holding the
+        # request open for that shows the user nothing; a job reports progress.
+        job = JOBS.start(file_name, lambda j: _ingest_dwg(j, data, file_name))
+        return JSONResponse(status_code=202, content=job.as_dict())
+
     try:
         if kind == "dxf":
             stored = STORE.add_cad(data, file_name)
@@ -128,6 +157,17 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         else:
             stored = STORE.add(data, file_name)
             summary = document_summary(stored.doc, stored.file_name)
+    except DwgConversionUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "kind": "dwg_component_missing",
+                "headline": "DWG support requires the local CAD conversion component.",
+                "reason": str(error),
+                "fix": f"Run: {error.setup_command}",
+                "component": error.component,
+            },
+        ) from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -136,10 +176,44 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     return summary
 
 
+def _ingest_dwg(job, data: bytes, file_name: str) -> Dict[str, Any]:
+    """Convert and read a DWG, reporting each stage as it completes."""
+    from backend.cad.dwg import dwg_signature
+
+    advance(job, "validated", f"{dwg_signature(data) or 'DWG'} signature")
+    advance(job, "converting", "converting locally to DXF")
+    stored = STORE.add_dwg(
+        data, file_name, on_stage=lambda stage, detail: advance(job, stage, detail)
+    )
+    advance(job, "read", f"{len(stored.cad.primitives):,} primitives")
+
+    summary = cad_document_summary(stored)
+    summary["document_id"] = stored.id
+    summary["source_kind"] = "dwg"
+    job.document_id = stored.id
+
+    layers = len([layer for layer in stored.cad.info.layers if layer.entity_count])
+    blocks = len([b for b in stored.cad.info.blocks if b.insert_count])
+    advance(job, "analysed", f"{layers} layer(s), {blocks} block(s)")
+    return summary
+
+
+@router.get("/jobs/{job_id}")
+def job_status(job_id: str) -> Dict[str, Any]:
+    """Progress of a background ingestion."""
+    try:
+        return JOBS.get(job_id).as_dict()
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id!r}") from None
+
+
 def cad_document_summary(stored) -> Dict[str, Any]:
-    """The DXF equivalent of ``document_summary``, in the same shape."""
+    """The CAD equivalent of ``document_summary``, in the same shape."""
     drawing = stored.cad
     info = drawing.summary()
+    if stored.conversion is not None:
+        # The source is a DWG; conversion is how it got here, not what it is.
+        info["conversion"] = stored.conversion.as_dict()
     box = drawing.bbox
     return {
         "file_name": stored.file_name,
@@ -239,6 +313,15 @@ def analyze(document_id: str, page_number: int) -> Dict[str, Any]:
     summary = prepared.summary()
     # Surfaced so the UI can say "review recommended" and point at the region.
     # Reported, never corrected (§7) — see detect_title_block_ambiguity.
+    if stored_kind_is_cad(_stored):
+        # A CAD drawing that does not declare its units can still be pinned in
+        # one click, using the dimensions it does state.
+        from backend.cad.dxf import dimension_evidence
+
+        summary["cad_dimension_evidence"] = dimension_evidence(_stored.cad)
+        if _stored.conversion is not None:
+            summary["conversion"] = _stored.conversion.as_dict()
+
     summary["ambiguities"] = [
         a
         for a in [
@@ -292,7 +375,7 @@ def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, 
     region_bbox, view_source, view_label = _resolve_region(prepared, request)
     region = prepared.region_by_id(request.region_id) if request.region_id else None
 
-    scale, scale_warnings = _resolve_scale(prepared, region, request.scale)
+    scale, scale_warnings = _resolve_scale(prepared, region, request.scale, stored)
 
     include_roles: Optional[Set[GeometryRole]] = None
     if request.include_roles:
@@ -385,6 +468,10 @@ def measure_polygon(request: PolygonMeasureRequest) -> Dict[str, Any]:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+def stored_kind_is_cad(stored) -> bool:
+    return getattr(stored, "cad", None) is not None
+
+
 def _prepared(document_id: str, page_number: int):
     try:
         return STORE.prepared_page(document_id, page_number)
@@ -411,8 +498,23 @@ def _resolve_region(prepared: PreparedPage, request: AreaRequest):
     return None, ViewSource.WHOLE_PAGE, "Whole page"
 
 
-def _resolve_scale(prepared: PreparedPage, region: Optional[Region], spec: ScaleSpec):
+def _resolve_scale(
+    prepared: PreparedPage, region: Optional[Region], spec: ScaleSpec, stored=None
+):
     """Turn a scale request into a :class:`Scale` plus any warnings."""
+    if spec.mode == "cad_unit":
+        if stored is None or stored.cad is None:
+            raise HTTPException(
+                status_code=400,
+                detail="cad_unit mode applies only to a CAD drawing (DWG or DXF)",
+            )
+        from backend.cad.dxf import scale_from_stated_unit
+
+        try:
+            return scale_from_stated_unit(stored.cad.info, spec.known_unit), []
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     if spec.mode == "auto":
         # A CAD drawing states its units, so there is nothing to re-derive: the
         # prepared page already carries a scale read from the file header, which

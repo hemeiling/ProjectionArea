@@ -43,21 +43,71 @@ def _median_text_height(text_items: Sequence[TextItem]) -> float:
     return median_glyph_height(text_items)
 
 
-def _overlap_fraction(box: BBox, boxes: Sequence[BBox]) -> float:
+class _BoxIndex:
+    """A uniform grid over the text boxes, so masking is not O(n x m).
+
+    Annotation masking asks, for every primitive, which text boxes it overlaps.
+    Scanning all of them is fine for a PDF page with a few dozen labels and
+    unusable on a CAD drawing: a real layout carries 421 000 primitives and 1 200
+    text entities, and the full scan took 55 s of a 90 s analysis. Bucketing the
+    boxes by cell makes each query touch only the few that can possibly overlap.
+
+    The answer is identical to the scan — this is an index, not an approximation.
+    """
+
+    __slots__ = ("_cells", "_size", "_boxes")
+
+    def __init__(self, boxes: Sequence[BBox]) -> None:
+        self._boxes = list(boxes)
+        self._cells: Dict[Tuple[int, int], List[int]] = {}
+        if not self._boxes:
+            self._size = 1.0
+            return
+        # Cell size tracks the typical box, so a cell holds a handful of them.
+        widths = sorted(max(b.width, 1e-6) for b in self._boxes)
+        heights = sorted(max(b.height, 1e-6) for b in self._boxes)
+        typical = max(widths[len(widths) // 2], heights[len(heights) // 2])
+        self._size = max(typical * 2.0, 1e-6)
+        for index, box in enumerate(self._boxes):
+            for key in self._keys(box):
+                self._cells.setdefault(key, []).append(index)
+
+    def _keys(self, box: BBox):
+        size = self._size
+        x0, y0 = int(box.x0 // size), int(box.y0 // size)
+        x1, y1 = int(box.x1 // size), int(box.y1 // size)
+        # A pathological box spanning the whole drawing would generate a huge
+        # key set; cap it and fall back to every cell it would have touched.
+        if (x1 - x0 + 1) * (y1 - y0 + 1) > 4096:
+            return list(self._cells)
+        return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+
+    def candidates(self, box: BBox) -> List[BBox]:
+        if not self._boxes:
+            return []
+        seen: set = set()
+        for key in self._keys(box):
+            for index in self._cells.get(key, ()):
+                seen.add(index)
+        return [self._boxes[i] for i in seen]
+
+
+def _overlap_fraction(box: BBox, boxes: Sequence[BBox], index: "Optional[_BoxIndex]" = None) -> float:
     """Largest single-box overlap fraction of ``box``.
 
     Uses the max rather than the sum so two adjacent text boxes cannot combine
     to falsely swallow a long profile line.
     """
+    nearby = index.candidates(box) if index is not None else boxes
     area = box.area
     if area <= 1e-9:
         # Degenerate (a perfectly horizontal/vertical line): use containment.
-        for other in boxes:
+        for other in nearby:
             if other.contains_point(box.center):
                 return 1.0
         return 0.0
     best = 0.0
-    for other in boxes:
+    for other in nearby:
         if box.intersects(other):
             best = max(best, box.intersection_area(other) / area)
     return best
@@ -150,6 +200,7 @@ def classify_primitives(
     from backend.pdf.text import text_mask_boxes
 
     boxes = list(text_boxes) if text_boxes is not None else text_mask_boxes(list(text_items))
+    box_index = _BoxIndex(boxes)
     text_height = _median_text_height(text_items)
     hatched = _detect_hatch(primitives)
 
@@ -177,7 +228,7 @@ def classify_primitives(
         elif prim.filled and not prim.stroked and box.diagonal <= _ARROWHEAD_TEXT_MULTIPLE * text_height:
             role, reason = GeometryRole.DIMENSION, "small solid marker (arrowhead/terminator)"
 
-        elif _overlap_fraction(box, boxes) >= _TEXT_OVERLAP_FRACTION:
+        elif _overlap_fraction(box, boxes, box_index) >= _TEXT_OVERLAP_FRACTION:
             role, reason = GeometryRole.ANNOTATION, "lies inside a text bounding box"
 
         elif prim.closed and _polygon_area(prim.points) < 1e-9 and not prim.filled:

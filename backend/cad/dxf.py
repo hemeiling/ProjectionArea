@@ -189,6 +189,8 @@ class _Reader:
         self.dimensions: List[CadDimension] = []
         self.entity_counts: Dict[str, int] = {}
         self.unsupported: Dict[str, int] = {}
+        #: Set by the loader once the header has been read.
+        self.mm_per_unit: Optional[float] = None
         self.layer_colors: Dict[str, Optional[int]] = {}
 
     # ── primitive construction ───────────────────────────────────────────────
@@ -237,6 +239,17 @@ class _Reader:
             source_file=self.file_name,
             raw_points=cleaned,
         )
+
+    def _flatness(self) -> float:
+        """Curve sampling tolerance, in drawing units.
+
+        Real layouts are drawn in millimetres at site scale, where a fixed
+        0.01-unit tolerance samples a 3 m arc into tens of thousands of points
+        for no benefit. 0.25 mm is far below any drawing tolerance and is scaled
+        through the file's own units when it declares them.
+        """
+        mm_per_unit = getattr(self, "mm_per_unit", None)
+        return 0.25 / mm_per_unit if mm_per_unit else 0.25
 
     def _is_dashed(self, entity: Any, layer: str) -> bool:
         name = str(getattr(entity.dxf, "linetype", "") or "").upper()
@@ -303,12 +316,24 @@ class _Reader:
         self._add(points, False, PrimitiveKind.BEZIER, entity, context)
 
     def _on_ellipse(self, entity: Any, context: "_Context") -> None:
-        points = [(p.x, p.y) for p in entity.flattening(distance=0.01)]
-        self._add(points, bool(entity.is_closed), PrimitiveKind.BEZIER, entity, context)
+        """Flatten an ELLIPSE, including partial elliptical arcs.
+
+        An ellipse has no ``is_closed`` attribute — it is closed when its
+        parameter range covers a full turn. Reading that off the params rather
+        than asking for a flag matters: a production drawing carried 2 521
+        ellipses, and treating the missing attribute as an unreadable entity
+        dropped every one of them.
+        """
+        start = float(getattr(entity.dxf, "start_param", 0.0) or 0.0)
+        end = float(getattr(entity.dxf, "end_param", math.tau) or math.tau)
+        closed = abs(end - start) >= math.tau - 1e-9
+        points = [(p.x, p.y) for p in entity.flattening(distance=self._flatness())]
+        self._add(points, closed, PrimitiveKind.BEZIER, entity, context)
 
     def _on_spline(self, entity: Any, context: "_Context") -> None:
-        points = [(p.x, p.y) for p in entity.flattening(distance=0.01)]
-        self._add(points, bool(entity.closed), PrimitiveKind.CURVE_CHAIN, entity, context)
+        points = [(p.x, p.y) for p in entity.flattening(distance=self._flatness())]
+        closed = bool(getattr(entity, "closed", False))
+        self._add(points, closed, PrimitiveKind.CURVE_CHAIN, entity, context)
 
     def _on_solid(self, entity: Any, context: "_Context") -> None:
         corners = []
@@ -589,6 +614,7 @@ def load_dxf(path: str, include_paperspace: bool = False) -> CadDrawing:
         setattr(info, target, (x, y))
 
     reader = _Reader(doc, file_name)
+    reader.mm_per_unit = info.mm_per_unit
     for layer in doc.layers:
         entry = CadLayer(
             name=str(layer.dxf.name),
@@ -689,3 +715,68 @@ def scale_from_cad_units(info: CadDocumentInfo) -> "Scale":
             "read from the file header; nothing was measured or matched",
         ],
     )
+
+
+def scale_from_stated_unit(info: CadDocumentInfo, unit: str) -> "Scale":
+    """Scale for a drawing whose coordinates are CAD units of a stated size.
+
+    A DXF that leaves ``$INSUNITS`` at 0 still has exact coordinates and exact
+    dimension entities — what it does not say is which physical unit those
+    numbers are in. That is a question a person can answer in one click by
+    reading the drawing's own dimensions, and it is far better evidence than
+    picking two points on a picture.
+
+    The result is marked operator-stated: the geometry is the drawing's, the
+    unit is the engineer's (§30).
+
+    Args:
+        info: The document header.
+        unit: One of the length units in :data:`backend.units.LENGTH_TO_MM`.
+
+    Raises:
+        ValueError: If ``unit`` is not a known length unit.
+    """
+    from backend.models import Scale, ScaleSource
+    from backend.units import LENGTH_TO_MM
+
+    if unit not in LENGTH_TO_MM:
+        raise ValueError(f"Unsupported unit {unit!r}; expected one of {sorted(LENGTH_TO_MM)}")
+    mm_per_unit = LENGTH_TO_MM[unit]
+    return Scale(
+        mm_per_unit=mm_per_unit,
+        source=ScaleSource.CAD_UNITS,
+        confidence=0.92,
+        stated_by_operator=True,
+        detail=(
+            f"The drawing does not declare its units ($INSUNITS = {info.insunits}). "
+            f"One drawing unit was stated as 1 {unit} by the operator, so "
+            f"1 unit = {mm_per_unit:g} mm."
+        ),
+        evidence=[
+            f"$INSUNITS = {info.insunits} (undeclared)",
+            f"operator stated the drawing unit as {unit}",
+            "coordinates are the drawing's own; only the unit was supplied",
+        ],
+    )
+
+
+def dimension_evidence(drawing: "CadDrawing", limit: int = 12) -> Dict[str, Any]:
+    """The drawing's own dimension entities, for confirming its unit.
+
+    A DIMENSION states what it measures in drawing units. Showing those numbers
+    lets an engineer recognise the drawing — "that is the 75 m line" — and pick
+    the unit, instead of calibrating against a picture.
+    """
+    values = [d.measurement for d in drawing.dimensions if d.measurement]
+    values.sort(reverse=True)
+    box = drawing.bbox
+    return {
+        "count": len(values),
+        "measurements": [round(v, 2) for v in values[:limit]],
+        "largest": round(values[0], 2) if values else None,
+        "extent_units": (
+            [round(box.width, 2), round(box.height, 2)] if box else None
+        ),
+        "units_declared": drawing.info.units_declared,
+        "insunits": drawing.info.insunits,
+    }

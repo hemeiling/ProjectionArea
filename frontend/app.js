@@ -10,7 +10,7 @@
 const API = location.origin;
 
 const S = {
-  docId: null, fileName: "", kind: "pdf", page: 1,
+  docId: null, fileName: "", kind: "pdf", page: 1, conversion: null,
   pdf: null, pdfPage: null, cad: null,
   analysis: null, result: null, ignored: [],
   scaleSpec: { mode: "auto" },
@@ -65,7 +65,10 @@ function show(screen) {
   }
 }
 
-const STAGES = [
+/* A DWG is converted before it can be read, and its scale comes from CAD units
+ * rather than from measuring the drawing, so it gets its own honest sequence
+ * instead of the PDF's labels reused. */
+const STAGES_PDF = [
   ["load", "File loaded"],
   ["geometry", "Geometry extracted"],
   ["regions", "Drawing regions identified"],
@@ -73,6 +76,16 @@ const STAGES = [
   ["candidates", "Footprint candidates created"],
   ["area", "Area calculated"],
 ];
+const STAGES_CAD = [
+  ["load", "DWG validated"],
+  ["convert", "CAD conversion completed"],
+  ["geometry", "Geometry extracted"],
+  ["scale", "CAD units detected"],
+  ["regions", "Layers / blocks analysed"],
+  ["candidates", "Footprint candidates created"],
+  ["area", "Area calculated"],
+];
+let STAGES = STAGES_PDF;
 const MARKS = {
   pending: "·", active: "…", done: "✓", warn: "⚠", input: "⚠",
   unsupported: "—", failed: "✕",
@@ -106,6 +119,11 @@ async function handleFile(file) {
   $("procTitle").textContent = "Processing drawing";
   $("procNotice").innerHTML = "";
 
+  /* The extension is only a hint; the backend decides by signature. Picking the
+   * timeline up front means a DWG reads "DWG validated" from the first tick. */
+  STAGES = /\.(dwg|dxf)$/i.test(file.name) ? STAGES_CAD : STAGES_PDF;
+  if (/\.dwg$/i.test(file.name)) $("procTitle").textContent = "Converting and analysing DWG";
+
   const states = {};
   STAGES.forEach(([k]) => (states[k] = { state: "pending" }));
   states.load = { state: "active" };
@@ -116,18 +134,38 @@ async function handleFile(file) {
     const body = new FormData();
     body.append("file", file);
     doc = await call("/api/documents", { method: "POST", body });
+
+    /* A DWG is converted and parsed on a worker thread — the largest real
+     * drawing takes minutes — so the upload hands back a job and the timeline
+     * follows it rather than the browser sitting on an open request. */
+    if (doc.job_id) doc = await followJob(doc, states);
   } catch (err) {
     const d = err.detail;
-    states.load = { state: d?.kind === "dwg" ? "unsupported" : "failed",
-                    note: d?.kind === "dwg" ? "DXF export required" : "unreadable" };
-    STAGES.slice(1).forEach(([k]) => (states[k] = { state: "unsupported" }));
+    const missing = d?.kind === "dwg_component_missing";
+    const conversionFailed = d?.kind === "conversion_failed";
+    const emptyDrawing = d?.kind === "empty_drawing";
+    /* A DWG that reached conversion was a valid DWG: the file is the problem,
+     * or the component is, and those are different things to tell someone. */
+    states.load = (missing || conversionFailed || emptyDrawing)
+      ? { state: "done", note: `valid DWG ${d.version || ""}`.trim() }
+      : { state: "failed", note: "unreadable" };
+    for (const [k] of STAGES.slice(1)) states[k] = { state: "unsupported" };
+    if (states.convert) {
+      if (missing) states.convert = { state: "input", note: "component required" };
+      else if (conversionFailed) states.convert = { state: "failed", note: "could not be converted" };
+      else if (emptyDrawing) states.convert = { state: "done", note: "converted, but empty" };
+    }
     renderTimeline(states);
-    $("procTitle").textContent = d?.kind === "dwg" ? "DWG detected" : "Cannot read this file";
+    $("procTitle").textContent =
+      missing ? "DWG support is not installed yet"
+      : conversionFailed ? "DWG could not be converted"
+      : emptyDrawing ? "Drawing contains no geometry"
+      : "Cannot read this file";
     notice("procNotice", {
       headline: d?.headline || err.message,
-      body: [d?.reason, d?.why_dxf_is_better].filter(Boolean).join(" "),
+      body: d?.reason,
       fix: d?.fix,
-      kind: d?.kind === "dwg" ? "warn" : "error",
+      kind: missing ? "warn" : "error",
     });
     return;
   }
@@ -136,17 +174,36 @@ async function handleFile(file) {
   S.fileName = doc.file_name;
   S.kind = doc.source_kind || "pdf";
   S.cad = doc.cad || null;
+  S.conversion = (doc.cad && doc.cad.conversion) || null;
   S.page = doc.suggested_page || 1;
   S.scaleSpec = { mode: "auto" };
   S.fpType = null;
   S.picks = [];
 
-  states.load = { state: "done", note: `${S.kind.toUpperCase()} · ${doc.page_count} page(s)` };
+  /* The backend decides the kind by signature, so re-pick the timeline in case
+   * the extension lied, and fill in the conversion row for a DWG. */
+  const wantCad = S.kind !== "pdf";
+  if ((STAGES === STAGES_CAD) !== wantCad) {
+    STAGES = wantCad ? STAGES_CAD : STAGES_PDF;
+    for (const [k] of STAGES) if (!states[k]) states[k] = { state: "pending" };
+  }
+  states.load = S.conversion
+    ? { state: "done", note: `${S.conversion.dwg_signature} · ${S.conversion.dwg_version}` }
+    : { state: "done", note: `${S.kind.toUpperCase()} · ${doc.page_count} page(s)` };
+  if (states.convert) {
+    states.convert = S.conversion
+      ? { state: S.conversion.warnings.length ? "warn" : "done",
+          note: `${S.conversion.tool} ${S.conversion.tool_version} · ` +
+                `${S.conversion.duration_seconds}s · ` +
+                `${(S.conversion.intermediate_dxf_bytes / 1e6).toFixed(0)} MB DXF` }
+      : { state: "done", note: "read directly" };
+  }
   states.geometry = { state: "active" };
   renderTimeline(states);
 
-  // Render the drawing while the analysis runs.
-  const renderTask = S.kind === "pdf" ? renderPdf(file) : Promise.resolve(renderCad());
+  // Render the drawing while the analysis runs. A CAD source has no page image,
+  // so its own linework is stroked onto the canvas once the geometry arrives.
+  const renderTask = S.kind === "pdf" ? renderPdf(file) : Promise.resolve();
 
   try {
     const analysis = await call(`/api/documents/${S.docId}/pages/${S.page}/analyze`);
@@ -170,7 +227,13 @@ async function handleFile(file) {
 
     states.scale = analysis.scale?.verified
       ? { state: "done", note: `${analysis.scale.source.replace(/_/g, " ")}` }
-      : { state: "input", note: "Scale requires confirmation" };
+      : { state: "input", note: S.kind === "pdf"
+          ? "Scale requires confirmation" : "Units not declared by the drawing" };
+    if (S.kind !== "pdf" && S.cad) {
+      const layers = (S.cad.layers || []).filter((l) => l.entity_count).length;
+      const blocks = (S.cad.blocks || []).filter((b) => b.insert_count).length;
+      states.regions = { state: "done", note: `${layers} layer(s), ${blocks} block(s)` };
+    }
     states.candidates = { state: "active" };
     renderTimeline(states);
 
@@ -187,11 +250,58 @@ async function handleFile(file) {
     renderTimeline(states);
 
     await renderTask;
-    setTimeout(() => { show("workspace"); paintAll(); fitToWindow(); }, 380);
+    setTimeout(() => {
+      show("workspace");
+      if (S.kind !== "pdf") { S.cadBox = cadExtent(); renderCad(); }
+      paintAll();
+      fitToWindow();
+    }, 380);
   } catch (err) {
     states.area = { state: "failed", note: err.message };
     renderTimeline(states);
     notice("procNotice", { headline: "Analysis failed", body: err.message, kind: "error" });
+  }
+}
+
+/* Job stages, mapped onto the timeline rows the user is watching. */
+const JOB_STAGE_ROWS = {
+  validated: ["load", "done"],
+  converting: ["convert", "active"],
+  converted: ["convert", "done"],
+  reading: ["geometry", "active"],
+  read: ["geometry", "done"],
+  analysed: ["regions", "done"],
+  complete: ["regions", "done"],
+};
+
+async function followJob(job, states) {
+  const applyStage = (stage, detail) => {
+    const row = JOB_STAGE_ROWS[stage];
+    if (!row) return;
+    const [key, state] = row;
+    states[key] = { state, note: detail || "" };
+    if (state === "done" || state === "active") {
+      // Everything before a reached stage is necessarily finished.
+      const order = STAGES.map(([k]) => k);
+      for (const earlier of order.slice(0, order.indexOf(key))) {
+        if (states[earlier]?.state === "pending") states[earlier] = { state: "done" };
+      }
+    }
+    renderTimeline(states);
+  };
+
+  while (true) {
+    const status = await call(`/api/jobs/${job.job_id}`);
+    for (const done of status.stages_done) applyStage(done.stage, done.detail);
+    applyStage(status.stage, status.detail);
+
+    if (status.state === "failed") {
+      const err = new Error(status.error?.headline || "Processing failed");
+      err.detail = status.error;
+      throw err;
+    }
+    if (status.state === "done") return status.result;
+    await new Promise((resolve) => setTimeout(resolve, 900));
   }
 }
 
@@ -216,10 +326,22 @@ async function paintPage() {
   await S.pdfPage.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 }
 
-/* A DXF has no page to rasterise. The geometry itself is the drawing, so it is
- * stroked straight onto the canvas from the primitives the backend returned. */
+/* The extent of everything the backend sent us, in drawing units. */
+function cadExtent() {
+  const pts = [];
+  for (const prim of S.ignored) for (const p of prim.points) pts.push(p);
+  for (const item of S.result?.footprint_interpretations || []) {
+    for (const ringPts of item.outer || []) for (const p of ringPts) pts.push(p);
+  }
+  if (!pts.length) return null;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+}
+
+/* A CAD source has no page to rasterise. The geometry itself is the drawing, so
+ * the counted linework is stroked onto the canvas — §5: the vectors are drawn,
+ * never re-traced from an image. */
 function renderCad() {
-  const box = S.cadBox || null;
   const canvas = $("pageCanvas");
   const w = 1000, h = 700;
   canvas.width = Math.round(w * S.zoom);
@@ -228,6 +350,21 @@ function renderCad() {
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!S.cadBox) return;
+
+  ctx.lineWidth = 0.6;
+  ctx.strokeStyle = "rgba(18,24,27,.55)";
+  ctx.beginPath();
+  let drawn = 0;
+  for (const prim of S.ignored) {
+    if (prim.layer && S.hiddenLayers.has(prim.layer)) continue;
+    const pts = prim.points;
+    if (pts.length < 2 || ++drawn > 60000) continue;
+    const a = px(pts[0]);
+    ctx.moveTo(a[0], a[1]);
+    for (let i = 1; i < pts.length; i++) { const q = px(pts[i]); ctx.lineTo(q[0], q[1]); }
+  }
+  ctx.stroke();
 }
 
 /* Page-space -> canvas-space. For a PDF this is PDF units at the current zoom;
@@ -413,8 +550,10 @@ function renderReading() {
 
   const badges = [];
   badges.push(`<span class="badge ${item.semantics}">${item.semantics}</span>`);
-  if (scale?.operator_supplied && scale?.verified) {
+  if (scale?.operator_supplied && scale?.verified && scale?.calibration) {
     badges.push(`<span class="badge manual">Operator calibrated</span>`);
+  } else if (scale?.operator_supplied && scale?.verified) {
+    badges.push(`<span class="badge manual">Operator-stated units</span>`);
   } else if (scale?.source === "cad_declared_units") {
     badges.push(`<span class="badge confirmed">CAD $INSUNITS</span>`);
   } else if (!scale?.verified) {
@@ -475,6 +614,20 @@ function renderCalibration() {
   const scale = S.result?.scale;
   const host = $("calibBlock");
   if (scale?.verified && !S.picking) {
+    if (scale.operator_supplied && !scale.calibration && S.kind !== "pdf") {
+      host.innerHTML = `<div class="calib">
+        <div class="badges"><span class="badge manual">Operator-stated units</span></div>
+        <div class="result" style="margin-top:8px">1 drawing unit =
+          ${num(scale.mm_per_unit, 4)} mm</div>
+        <p style="margin:0;font-size:11.5px;color:var(--ink-2)">${esc(scale.detail || "")}</p>
+        <button class="ghost" id="restateUnit" style="margin-top:8px">Change unit</button>
+      </div>`;
+      $("restateUnit").onclick = () => {
+        S.scaleSpec = { mode: "auto" };
+        computeArea().then(paintAll);
+      };
+      return;
+    }
     if (scale.operator_supplied && scale.calibration) {
       const c = scale.calibration;
       host.innerHTML = `<div class="calib">
@@ -489,6 +642,46 @@ function renderCalibration() {
     } else {
       host.innerHTML = "";
     }
+    return;
+  }
+
+  /* A CAD drawing has exact coordinates and states its own dimensions; what it
+   * may not say is which physical unit they are in. That is one question with a
+   * short answer, so it is asked directly instead of sending the engineer off to
+   * pick two points on a picture. */
+  const cadEvidence = S.analysis?.cad_dimension_evidence;
+  if (S.kind !== "pdf" && cadEvidence && !cadEvidence.units_declared) {
+    const dims = (cadEvidence.measurements || []).slice(0, 6)
+      .map((v) => num(v, 1)).join("   ·   ");
+    host.innerHTML = `<div class="calib">
+      <div class="badges"><span class="badge warn">Units not declared</span></div>
+      <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-2)">
+        This drawing leaves <span class="mono">$INSUNITS</span> at 0, so it does not
+        say which unit its coordinates are in. Its own dimensions measure:</p>
+      ${dims ? `<div class="result" style="margin-top:7px">${esc(dims)}</div>` : ""}
+      <p style="margin:0 0 7px;font-size:11.5px;color:var(--ink-2)">
+        Extent ${cadEvidence.extent_units
+          ? `${num(cadEvidence.extent_units[0], 0)} × ${num(cadEvidence.extent_units[1], 0)}`
+          : "—"} drawing units. One drawing unit is:</p>
+      <div class="fields">
+        <select id="cadUnit">
+          <option value="mm">millimetres (mm)</option>
+          <option value="cm">centimetres (cm)</option>
+          <option value="m">metres (m)</option>
+          <option value="in">inches (in)</option>
+          <option value="ft">feet (ft)</option>
+        </select>
+        <button class="primary" id="applyCadUnit">Apply</button>
+      </div>
+      <p style="margin:0;font-size:11px;color:var(--ink-2)">
+        The geometry is the drawing's own; only the unit is yours, so the result
+        is labelled operator-stated.</p>
+    </div>`;
+    $("applyCadUnit").onclick = async () => {
+      S.scaleSpec = { mode: "cad_unit", known_unit: $("cadUnit").value };
+      await computeArea();
+      paintAll();
+    };
     return;
   }
 
@@ -694,12 +887,31 @@ function renderDetail() {
   const r = S.result, a = S.analysis;
   if (!r) { $("detailPane").innerHTML = ""; return; }
   const g = r.geometry;
+  const conv = S.conversion;
   const rows = [
     ["Method", r.method.replace(/_/g, " ")],
-    ["Source kind", S.kind.toUpperCase()],
+    ["Source", S.kind.toUpperCase()],
+  ];
+  if (conv) {
+    rows.push(
+      ["DWG version", `${conv.dwg_signature} · ${conv.dwg_version}`],
+      ["Processing path", conv.path],
+      ["Conversion", `successful · ${conv.tool} ${conv.tool_version} · ${conv.duration_seconds}s`],
+      ["Converter warnings", String(conv.warnings.length)],
+      ["Source SHA-256", conv.source_sha256.slice(0, 16) + "…"],
+      ["Intermediate DXF", `${(conv.intermediate_dxf_bytes / 1e6).toFixed(1)} MB · ` +
+                           conv.intermediate_dxf_sha256.slice(0, 16) + "…"],
+    );
+  }
+  if (S.cad) {
+    rows.push(["CAD units", S.cad.units.declared
+      ? `${S.cad.units.name} ($INSUNITS ${S.cad.units.insunits})`
+      : `not declared ($INSUNITS ${S.cad.units.insunits})`]);
+  }
+  rows.push(
     ["Region", `${r.view.label} (${r.view.source.replace(/_/g, " ")})`],
     ["Page rotation", a ? `${a.rotation}°` : "—"],
-    ["Page size", a ? `${a.width_pt} × ${a.height_pt}` : "—"],
+    ["Extent", a ? `${a.width_pt} × ${a.height_pt}` : "—"],
     ["Primitives", g.raw_primitives.toLocaleString()],
     ["Counted", g.profile_primitives.toLocaleString()],
     ["Excluded", g.ignored_primitives.toLocaleString()],
@@ -712,7 +924,7 @@ function renderDetail() {
     ["mm per unit", r.scale.verified ? num(r.scale.mm_per_unit, 6) : "—"],
     ["Implied ratio", r.scale.implied_ratio || "—"],
     ["Engine", `${r.engine_version} · ${r.timestamp}`],
-  ];
+  );
   const roles = Object.entries(g.role_counts || {})
     .sort((x, y) => y[1] - x[1])
     .map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toLocaleString()}</td></tr>`).join("");
@@ -732,10 +944,12 @@ const ACI = { 1: "#FF0000", 2: "#FFFF00", 3: "#00FF00", 4: "#00FFFF", 5: "#0000F
               6: "#FF00FF", 7: "#333333", 8: "#808080", 9: "#C0C0C0" };
 
 function renderLayersPane() {
-  if (S.kind !== "dxf" || !S.cad) {
+  /* Any CAD source has layers — a DXF read directly, or a DWG converted
+   * locally. Only a PDF has none. */
+  if (!S.cad) {
     $("layersPane").innerHTML = `<p style="color:var(--ink-2)">
-      CAD layers are available when a DXF is loaded. A PDF export carries no layer
-      information — that is the main reason the DXF is the better source.</p>`;
+      CAD layers are available when a DWG or DXF is loaded. A printed PDF carries no
+      layer information — that is the main reason the CAD file is the better source.</p>`;
     return;
   }
   const layers = (S.cad.layers || []).filter((l) => l.entity_count > 0);
@@ -877,6 +1091,29 @@ for (const tab of $("tabs").querySelectorAll("button[data-tab]")) {
     }
   };
 }
+
+/* Say honestly which formats this installation can read. DWG needs a local
+ * converter, so the landing screen reflects whether it is actually present. */
+(async function showCapabilities() {
+  try {
+    const caps = (await call("/api/capabilities")).formats;
+    const line = $("formatLine");
+    if (!line) return;
+    if (!caps.dwg.supported) {
+      line.innerHTML = `PDF · DXF · <span style="color:var(--amber)">DWG (setup required)</span>`;
+      line.title = caps.dwg.reason || "";
+      const host = $("uploadNotice");
+      host.innerHTML = `<div class="notice">
+        <h4>DWG support is not installed</h4>
+        <p>DWG files are converted locally — nothing is uploaded anywhere — but the
+           conversion component is not present yet.</p>
+        <p class="fix">Run: <span class="mono">${esc(caps.dwg.setup_command || "")}</span></p>
+      </div>`;
+    } else {
+      line.title = caps.dwg.note || "";
+    }
+  } catch (e) { /* the landing screen still works without this */ }
+})();
 
 /* Reference drawings, generated and measured by the real backend. */
 (async function loadDemos() {

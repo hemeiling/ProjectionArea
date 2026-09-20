@@ -44,9 +44,14 @@ class StoredDocument:
     last_used: float
     pages: Dict[int, PreparedPage] = field(default_factory=dict)
     cad: Any = None
+    #: Set when the source was a DWG converted locally to DXF. The source stays
+    #: a DWG — this records how it got here, not what it became.
+    conversion: Any = None
 
     @property
     def kind(self) -> str:
+        if self.conversion is not None:
+            return "dwg"
         return "dxf" if self.cad is not None else "pdf"
 
     def close(self) -> None:
@@ -106,6 +111,45 @@ class DocumentStore:
             self._documents[document_id] = stored
         return stored
 
+    def add_dwg(self, data: bytes, file_name: str, on_stage: Any = None) -> StoredDocument:
+        """Persist a DWG upload, convert it locally, and read the result.
+
+        Raises:
+            DwgConversionUnavailable: No local converter is installed.
+            ValueError: The file is not a DWG, or produced nothing readable.
+        """
+        from backend.cad.dwg import DwgConversionFailed, load_dwg
+
+        self.sweep()
+        os.makedirs(self._root, exist_ok=True)
+        document_id = uuid.uuid4().hex[:16]
+        path = os.path.join(self._root, f"{document_id}.dwg")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        try:
+            drawing, conversion = load_dwg(path, file_name=file_name, on_stage=on_stage)
+        except DwgConversionFailed as error:
+            os.unlink(path)
+            raise ValueError(str(error)) from error
+        except Exception:
+            os.unlink(path)
+            raise
+        if not drawing.primitives:
+            os.unlink(path)
+            raise ValueError(
+                "The DWG converted successfully but carries no readable geometry "
+                "in model space."
+            )
+
+        now = time.time()
+        stored = StoredDocument(
+            id=document_id, file_name=file_name, path=path, doc=None,
+            created_at=now, last_used=now, cad=drawing, conversion=conversion,
+        )
+        with self._lock:
+            self._documents[document_id] = stored
+        return stored
+
     def add(self, data: bytes, file_name: str) -> StoredDocument:
         """Persist an upload and open it.
 
@@ -157,7 +201,10 @@ class DocumentStore:
         with self._lock:
             page = stored.pages.get(page_number)
             if page is None:
-                if stored.kind == "dxf":
+                if stored.cad is not None:
+                    # Any CAD source — a DXF read directly, or a DWG converted
+                    # locally. Branching on `kind` would miss the DWG, whose
+                    # kind is "dwg" precisely so the UI keeps saying DWG.
                     from backend.cad.pipeline import prepare_cad_page
 
                     page = prepare_cad_page(stored.cad)
