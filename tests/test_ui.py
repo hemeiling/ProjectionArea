@@ -802,3 +802,63 @@ def test_language_switches_mid_run_without_restarting_the_job(viewer_url, drawin
     assert _number(value) == pytest.approx(54.46, abs=0.05), (
         "progress reporting and language must not touch the number"
     )
+
+
+def test_the_drawing_extent_survives_a_production_sized_point_count(viewer_url):
+    """A real DWG sends hundreds of thousands of points to the overlay.
+
+    `Math.min(...xs)` passes each one as a function argument and throws a
+    RangeError somewhere in the tens of thousands. That aborted the whole
+    workspace render, so a production drawing arrived with an empty result card
+    and no overlay — while a smaller one, under the argument limit, worked. Driven
+    here with synthetic points, because the production drawings are not in git and
+    the bug is about their size, not their content.
+    """
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+
+        extent = page.evaluate(
+            """() => {
+                // One primitive carrying 400,000 points, which is the order a
+                // production DWG reaches and well past the spread limit.
+                const points = new Array(400000);
+                for (let i = 0; i < points.length; i++) points[i] = [i % 5000, -(i % 700)];
+                points.push([-12.5, 900.25]);       // the true minimum x, maximum y
+                window.__state.ignored = [{ points }];
+                window.__state.result = { footprint_interpretations: [
+                    { outer: [[[7000, -1500]]] },   // the true maximum x, minimum y
+                ] };
+                return cadExtent();
+            }"""
+        )
+        browser.close()
+
+    assert not errors, f"rendering the extent threw: {errors}"
+    assert extent is not None
+    assert extent["x0"] == -12.5
+    assert extent["x1"] == 7000
+    assert extent["y0"] == -1500
+    assert extent["y1"] == 900.25
+
+
+def test_the_drawing_extent_is_absent_when_there_is_no_geometry(viewer_url):
+    """Nothing to measure is not an extent of zero; it is no extent."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        extent = page.evaluate(
+            """() => {
+                window.__state.ignored = [];
+                window.__state.result = { footprint_interpretations: [] };
+                return cadExtent();
+            }"""
+        )
+        browser.close()
+    assert extent is None

@@ -122,10 +122,11 @@ GNU tarball with a checked hash; `render.yaml` describes the service;
 Nothing is required in the environment beyond `PORT`. Both AI keys are optional
 and the measurement path never reads them.
 
-**Sizing is the one thing worth reading before deploying.** The real drawings need
-0.8–8.2 GB of memory, measured; Render's free and starter plans have 512 MB and
-cannot process any of them. See **`docs/DEPLOYMENT.md`** for the measured table,
-the plan recommendation and why the CAD reader is this hungry.
+**Sizing is the one thing worth reading before deploying.** Measured end to end,
+the production drawings need **0.9 GB to 11.7 GB** of memory; Render's free and
+starter plans have 512 MB and cannot process any of them. See
+**`docs/DEPLOYMENT.md`** for the measured table, the plan recommendation, and the
+two pieces of engineering that would bring it down.
 
 > Always invoke tools as `.venv/bin/python -m <tool>`. The venv's console
 > scripts (`.venv/bin/uvicorn`, `.venv/bin/pytest`) hard-code the interpreter

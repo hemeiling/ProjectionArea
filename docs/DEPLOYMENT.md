@@ -51,60 +51,82 @@ Nothing is required. The service starts with no environment set beyond `PORT`.
 
 ## Memory: the thing that decides the plan
 
-Measured with `tools/measure_memory.py`, which runs each drawing in a fresh
-process and reports peak resident size for the application and for the converter
-child separately. **These numbers are from macOS 26.5 on arm64, Python 3.9** —
-evidence about this machine. Linux figures will differ somewhat, but not by the
-order of magnitude that decides the plan.
+Measured against the five production drawings, **end to end through the running
+application** — upload, convert, read, footprint candidates, area — with a freshly
+started server for each so its peak belongs to that drawing alone. Python does not
+return freed memory to the OS promptly, so a reused server carries the previous
+drawing's high-water mark and every figure after the first is inflated.
 
-"Needs" is the larger of the two columns beside it, not their sum: `dwg2dxf` has
-exited before a single entity is parsed, so the two peaks never coincide.
+**macOS 26.5, arm64, Python 3.9.** Evidence about this machine; Linux will differ
+somewhat, but not by the order of magnitude that decides the plan.
 
-| Drawing | Input | Primitives | App | Converter | Needs | Time |
+| Drawing | Input | Convert | Intermediate DXF | Primitives | Wall | Peak RSS |
 |---|---|---|---|---|---|---|
-| 101 PDF | 2.3 MB | 313,138 | 798 MB | — | **0.8 GB** | 6.8 s |
-| 102 PDF | 7.0 MB | 959,931 | 2,417 MB | — | **2.4 GB** | 21.6 s |
-| 103 DWG | 30.1 MB | 421,517 | 2,526 MB | 441 MB | **2.5 GB** | 39.6 s |
-| 101 DWG | 28.2 MB | 893,476 | 3,968 MB | 470 MB | **4.0 GB** | 48.1 s |
-| 102 DWG | 97.1 MB | 2,374,784 | 8,166 MB | 1,551 MB | **8.2 GB** | 287 s |
+| 101 PDF | 2.3 MB | — | — | 313,138 | 16 s | **0.9 GB** |
+| 102 PDF | 7.0 MB | — | — | 959,931 | 41 s | **2.6 GB** |
+| 103 DWG | 30.1 MB | 1.6 s | 120.1 MB | 421,517 | 102 s | **6.7 GB** |
+| 101 DWG | 28.2 MB | 1.4 s | 111.7 MB | 893,476 | 161 s | **9.4 GB** |
+| 102 DWG | 97.1 MB | 5.0 s | 381.4 MB | 2,374,784 | 496 s | **11.7 GB** |
 
-The 102 DWG converts to a 120 MB DXF and takes 4.8 minutes end to end, of which
-conversion is a small part — the time and the memory both go on reading 2.4
-million entities.
+Conversion is never the expensive part: LibreDWG turns the 97 MB DWG into 381 MB
+of DXF in five seconds. The time and the memory both go on reading the result and
+reconstructing faces from it.
+
+An earlier version of this table was measured with `tools/measure_memory.py`,
+which stops after `prepare_page` and never runs the footprint and area stages —
+the expensive ones. It understated the 101 DWG by more than half (4.0 GB against
+9.4 GB). Use the table above; the tool remains useful for comparing the *reading*
+cost of two drawings, which is what it measures.
 
 ### What this means for plan sizing
 
-Render's plans, for reference: Free and Starter are both 512 MB, Standard
-(`1c-2g`) is 2 GB, Pro (`2c-4g`) is 4 GB, then `2c-8g` and `2c-16g`.
+Render's plans: Free and Starter are both 512 MB, Standard (`1c-2g`) 2 GB, Pro
+(`2c-4g`) 4 GB, then `2c-8g` and `2c-16g`.
 
 | Plan | RAM | What it can actually do |
 |---|---|---|
-| Free / Starter | 512 MB | Demo drawings and the interface only. **No real drawing fits** — the smallest needs 0.8 GB. |
-| Standard `1c-2g` | 2 GB | The 101 PDF. Fails on everything else. |
-| Pro `2c-4g` | 4 GB | Both PDFs, the 103 DWG. Borderline on the 101 DWG at 4.0 GB against a 4 GB limit. |
-| `2c-8g` | 8 GB | Both PDFs and the 101 and 103 DWGs, with margin. **Recommended minimum** for production drawings. |
-| `2c-16g` | 16 GB | Adds the 102 DWG (8.2 GB). |
+| Free / Starter | 512 MB | Demo drawings and the interface only. **No production drawing fits** — the smallest needs 0.9 GB. |
+| Standard `1c-2g` | 2 GB | The 101 PDF. |
+| Pro `2c-4g` | 4 GB | Both PDFs. No DWG. |
+| `2c-8g` | 8 GB | Adds the 103 DWG (6.7 GB). Not the other two. |
+| `2c-16g` | 16 GB | **All five**, the largest at 11.7 GB. |
 
-`render.yaml` sets `2c-8g`. That is a real cost decision, so it is stated rather
-than buried: a smaller plan will not fail gracefully on a production drawing, it
-will have the process killed part way through — which the application now explains
-("Analysis interrupted", with the progress it had reached), but cannot avoid.
+`render.yaml` asks for `2c-16g`, because that is the smallest plan on which every
+production drawing this tool was built for actually completes. If DWG support can
+wait, `2c-8g` runs both PDFs and the 103 with margin and is materially cheaper —
+change one line. Either way this is a deliberate cost decision, which is why the
+numbers above are here rather than a bare recommendation.
+
+On a smaller plan a production drawing does not fail gracefully: the process is
+killed part way through. The application explains that when it happens — the bar
+keeps the progress it earned and the heading reads "Analysis interrupted" — but it
+cannot prevent it.
 
 Nothing in the engine was weakened to fit a smaller instance. A projected area
 that is wrong because the server was economising is worse than no answer.
 
 ### Why it is this large, and what would fix it
 
-**The workload is memory-bound in the CAD reader, not in the web layer.** About
-3.4 KB of Python objects per entity, times 2.4 million entities, is where the
-gigabytes go. The upload path itself now costs one 1 MiB chunk.
+**The workload is memory-bound in the CAD reader and the face reconstruction, not
+in the web layer.** The 102 DWG becomes 2.37 million primitives, 6.9 million
+segments and 175,231 faces, all as Python objects. The upload path itself now
+costs one 1 MiB chunk.
 
-The fix, if the large DWGs have to run on a small instance, is to stop holding
-every primitive as a Python object: read entities in a streaming pass and keep
-coordinates in numpy arrays rather than dataclasses. That is a real piece of
-engineering with its own correctness risk — every geometry test exists to protect
-exactly this code — so it is recorded here as the highest-value follow-up rather
-than attempted as part of deployment preparation.
+Two separate follow-ups, both real engineering rather than configuration:
+
+1. **Hold geometry in numpy arrays rather than per-primitive dataclasses**, and
+   read entities in a streaming pass. This is what would move the 102 DWG from
+   11.7 GB to something a 4 GB instance could serve.
+2. **Stop sending the whole result in one response.** The 102 DWG's job payload is
+   **44.7 MB** — 27.9 MB of it the full polygon geometry of all five footprint
+   readings, and a further 15.8 MB of components that largely duplicate them. On
+   localhost this is invisible. Over the internet it is the single thing most
+   likely to make a deployed instance feel broken, and it also costs the server
+   that much memory to serialise at the very end of a job. The fix is to return
+   the summary and fetch geometry for the reading the operator actually selected.
+
+Both are recorded rather than attempted here: they touch the code every geometry
+test exists to protect, and deployment preparation is the wrong moment for that.
 
 ### When an instance runs out of memory
 
@@ -185,3 +207,23 @@ calibration workflow, upload the 102 PDF, upload a DXF, upload a DWG and watch
 the conversion stages, confirm the progress bar moves during a large job, and
 export JSON and CSV. Use the real production drawings for this and never commit
 them.
+
+### Local acceptance, for comparison
+
+All five production drawings, each through the real page against a freshly started
+server. Progress was monotonic in every run, reached 100 % before the workspace
+replaced it, animated every stage whose internal progress is unknown, loaded the
+result card, and left no conversion workspace or spooled upload behind.
+
+| Drawing | Result |
+|---|---|
+| 101 PDF | scale unverified — no text layer to calibrate from |
+| 102 PDF | scale unverified — no text layer to calibrate from |
+| 103 DWG | **2,024.95 m²** · 3,388 components, 3,405 holes · 23 layers (15 used), 197 blocks (46 inserted) · `$INSUNITS 4` |
+| 101 DWG | scale unverified — `$INSUNITS 0`, unitless, and only 4 dimensions · 15,051 components · 11 layers (4 used), 109 blocks (100 inserted) |
+| 102 DWG | **89,646.90 m²** · 11,715 components, 24,855 holes · 160 layers (95 used), 1,866 blocks (262 inserted) · `$INSUNITS 4` |
+
+Two of the five decline to state an area. That is the intended behaviour, not a
+gap: a drawing that declares no units and carries no dimension consensus cannot
+be measured without an operator calibrating two points, and inventing a scale
+would be the one unforgivable failure for this tool.

@@ -478,16 +478,29 @@ async function paintPage() {
   await S.pdfPage.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 }
 
-/* The extent of everything the backend sent us, in drawing units. */
+/* The extent of everything the backend sent us, in drawing units.
+ *
+ * One pass, no spread. `Math.min(...xs)` passes every coordinate as a separate
+ * function argument, which overflows the call stack somewhere in the tens of
+ * thousands: on a production DWG this is hundreds of thousands of points, and the
+ * RangeError it threw aborted the whole workspace render, so the drawing appeared
+ * with an empty result card and no overlay. Accumulating instead also avoids
+ * building three arrays the size of the drawing. */
 function cadExtent() {
-  const pts = [];
-  for (const prim of S.ignored) for (const p of prim.points) pts.push(p);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const consider = (p) => {
+    const [x, y] = p;
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+  };
+  for (const prim of S.ignored) for (const p of prim.points) consider(p);
   for (const item of S.result?.footprint_interpretations || []) {
-    for (const ringPts of item.outer || []) for (const p of ringPts) pts.push(p);
+    for (const ringPts of item.outer || []) for (const p of ringPts) consider(p);
   }
-  if (!pts.length) return null;
-  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
-  return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+  if (x0 === Infinity) return null;
+  return { x0, y0, x1, y1 };
 }
 
 /* A CAD source has no page to rasterise. The geometry itself is the drawing, so

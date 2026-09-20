@@ -26,23 +26,27 @@ services:
     # catching, and it looks perfectly healthy from the outside otherwise.
     healthCheckPath: /health
 
-    # Sized from measurement, not from habit. Peak memory for the real drawings,
-    # via tools/measure_memory.py:
+    # Sized from measurement, not from habit. Peak memory of the whole job —
+    # upload, convert, read, footprint candidates, area — for each production
+    # drawing, on a freshly started server so the figures do not carry each
+    # other's high-water marks:
     #
-    #     101 PDF  0.8 GB      103 DWG  2.5 GB
-    #     102 PDF  2.4 GB      101 DWG  4.0 GB      102 DWG  8.2 GB
+    #     101 PDF  0.9 GB      103 DWG   6.7 GB
+    #     102 PDF  2.6 GB      101 DWG   9.4 GB      102 DWG  11.7 GB
     #
     # Free and Starter are both 512 MB, so neither can read *any* production
-    # drawing. 2c-8g (8 GB) is the smallest plan that handles both PDFs and the
-    # 101 and 103 DWGs with margin; the 97 MB 102 DWG needs 2c-16g.
+    # drawing. 2c-16g (16 GB) is the smallest plan on which all five complete.
     #
-    # This is a cost decision worth making deliberately: on a smaller plan a
-    # production drawing does not fail gracefully, the process is killed part way
-    # through. The application explains that when it happens — the progress bar
-    # keeps what it earned and says the analysis was interrupted — but it cannot
-    # prevent it. docs/DEPLOYMENT.md has the full table and the reason the reader
-    # is this memory-hungry.
-    plan: 2c-8g
+    # If DWG can wait, 2c-8g runs both PDFs and the 103 with margin and costs
+    # materially less — change this one line. On anything smaller a production
+    # drawing does not fail gracefully: the process is killed part way through.
+    # The application explains that (the bar keeps what it earned and the heading
+    # reads "Analysis interrupted") but cannot prevent it.
+    #
+    # docs/DEPLOYMENT.md has the full table, and the two pieces of engineering
+    # that would bring this down — numpy-backed geometry, and not returning a
+    # 44 MB result in one response.
+    plan: 2c-16g
 
     envVars:
       # Render sets PORT itself; the application reads it and binds 0.0.0.0.
