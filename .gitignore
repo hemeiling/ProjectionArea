@@ -66,6 +66,12 @@ audit*.json
 # regenerated from the drawings, and the drawings themselves are confidential.
 validation/
 
+# Golden production baselines (tools/baseline.py). Derived from customer drawings,
+# which are not in this repository either, so the baselines are not committed.
+# Keep them alongside the drawings; the tool that produces and checks them is
+# tracked, which is the part that has to be reviewable.
+baselines/
+
 # OS / editor cruft
 .DS_Store
 .idea/
