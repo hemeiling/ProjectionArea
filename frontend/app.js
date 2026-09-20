@@ -9,6 +9,73 @@
 
 const API = location.origin;
 
+/* ── i18n ────────────────────────────────────────────────────────────────────
+ *
+ * One catalogue per language, keyed by stable identifiers. Nothing user-facing
+ * is written literally in this file or in the HTML: `t(key, params)` is the only
+ * way a string reaches the screen.
+ *
+ * Engineering identifiers are deliberately *not* translated — file names, layer
+ * and block names, entity types, handles, units and every number stay exactly as
+ * the drawing and the engine produced them. Translating a layer called
+ * `中心线层` into English, or a number into a localised format, would corrupt the
+ * record this tool exists to keep.
+ */
+const LANGS = { en: "en", "zh-CN": "zh-CN" };
+const LANG_KEY = "projected-area.lang";
+let LANG = "en";
+const CATALOGUE = { en: {}, "zh-CN": {} };
+
+function t(key, params = {}, fallback = null) {
+  const table = CATALOGUE[LANG] || {};
+  let text = table[key];
+  if (text === undefined) text = CATALOGUE.en[key];
+  if (text === undefined) return fallback !== null ? fallback : key;
+  return String(text).replace(/\{(\w+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match);
+}
+
+async function loadCatalogue(lang) {
+  if (Object.keys(CATALOGUE[lang] || {}).length) return;
+  try {
+    CATALOGUE[lang] = await (await fetch(`/static/i18n/${lang}.json`)).json();
+  } catch (e) {
+    CATALOGUE[lang] = CATALOGUE[lang] || {};
+  }
+}
+
+/* Static markup carries keys, so switching language re-renders it in place —
+ * no duplicated pages, and the loaded drawing is never disturbed. */
+function applyStaticText() {
+  document.documentElement.lang = LANG === "zh-CN" ? "zh-CN" : "en";
+  for (const el of document.querySelectorAll("[data-i18n]")) {
+    el.textContent = t(el.dataset.i18n);
+  }
+  for (const el of document.querySelectorAll("[data-i18n-title]")) {
+    el.title = t(el.dataset.i18nTitle);
+  }
+  for (const el of document.querySelectorAll("[data-i18n-placeholder]")) {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
+  }
+}
+
+async function setLanguage(lang, { rerender = true } = {}) {
+  if (!LANGS[lang]) return;
+  await loadCatalogue(lang);
+  LANG = lang;
+  try { localStorage.setItem(LANG_KEY, lang); } catch (e) { /* private window */ }
+  for (const btn of document.querySelectorAll("[data-lang]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.lang === lang));
+  }
+  applyStaticText();
+  if (rerender) {
+    // Re-render whatever is on screen. The analysis is untouched: no request is
+    // made and no state is cleared, so the drawing stays exactly as it was.
+    if (!$("workspace").classList.contains("hide")) paintAll();
+    renderDemoList();
+  }
+}
+
 const S = {
   docId: null, fileName: "", kind: "pdf", page: 1, conversion: null,
   pdf: null, pdfPage: null, cad: null,
@@ -23,6 +90,7 @@ const S = {
     rect: false, calibration: true, warnings: true,
   },
   hiddenLayers: new Set(),
+  capabilities: null, demos: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -69,21 +137,21 @@ function show(screen) {
  * rather than from measuring the drawing, so it gets its own honest sequence
  * instead of the PDF's labels reused. */
 const STAGES_PDF = [
-  ["load", "File loaded"],
-  ["geometry", "Geometry extracted"],
-  ["regions", "Drawing regions identified"],
-  ["scale", "Scale / units evaluated"],
-  ["candidates", "Footprint candidates created"],
-  ["area", "Area calculated"],
+  ["load", "stage.load"],
+  ["geometry", "stage.geometry"],
+  ["regions", "stage.regions"],
+  ["scale", "stage.scale"],
+  ["candidates", "stage.candidates"],
+  ["area", "stage.area"],
 ];
 const STAGES_CAD = [
-  ["load", "DWG validated"],
-  ["convert", "CAD conversion completed"],
-  ["geometry", "Geometry extracted"],
-  ["scale", "CAD units detected"],
-  ["regions", "Layers / blocks analysed"],
-  ["candidates", "Footprint candidates created"],
-  ["area", "Area calculated"],
+  ["load", "stage.loadDwg"],
+  ["convert", "stage.convert"],
+  ["geometry", "stage.geometry"],
+  ["scale", "stage.scaleCad"],
+  ["regions", "stage.regionsCad"],
+  ["candidates", "stage.candidates"],
+  ["area", "stage.area"],
 ];
 let STAGES = STAGES_PDF;
 const MARKS = {
@@ -92,11 +160,11 @@ const MARKS = {
 };
 
 function renderTimeline(states) {
-  $("timeline").innerHTML = STAGES.map(([key, label]) => {
+  $("timeline").innerHTML = STAGES.map(([key, labelKey]) => {
     const st = states[key] || { state: "pending" };
     return `<div class="stage" data-stage="${key}" data-state="${st.state}">
       <span class="mark">${MARKS[st.state] || "·"}</span>
-      <span class="label">${esc(label)}</span>
+      <span class="label">${esc(t(labelKey))}</span>
       <span class="note">${esc(st.note || "")}</span>
     </div>`;
   }).join("");
@@ -116,13 +184,13 @@ async function handleFile(file) {
   $("uploadNotice").innerHTML = "";
   show("processing");
   $("procFile").textContent = file.name;
-  $("procTitle").textContent = "Processing drawing";
+  $("procTitle").textContent = t("proc.title");
   $("procNotice").innerHTML = "";
 
   /* The extension is only a hint; the backend decides by signature. Picking the
    * timeline up front means a DWG reads "DWG validated" from the first tick. */
   STAGES = /\.(dwg|dxf)$/i.test(file.name) ? STAGES_CAD : STAGES_PDF;
-  if (/\.dwg$/i.test(file.name)) $("procTitle").textContent = "Converting and analysing DWG";
+  if (/\.dwg$/i.test(file.name)) $("procTitle").textContent = t("proc.titleDwg");
 
   const states = {};
   STAGES.forEach(([k]) => (states[k] = { state: "pending" }));
@@ -147,20 +215,20 @@ async function handleFile(file) {
     /* A DWG that reached conversion was a valid DWG: the file is the problem,
      * or the component is, and those are different things to tell someone. */
     states.load = (missing || conversionFailed || emptyDrawing)
-      ? { state: "done", note: `valid DWG ${d.version || ""}`.trim() }
-      : { state: "failed", note: "unreadable" };
+      ? { state: "done", note: t("stage.note.validDwg", { version: d.version || "" }).trim() }
+      : { state: "failed", note: t("stage.note.unreadable") };
     for (const [k] of STAGES.slice(1)) states[k] = { state: "unsupported" };
     if (states.convert) {
-      if (missing) states.convert = { state: "input", note: "component required" };
-      else if (conversionFailed) states.convert = { state: "failed", note: "could not be converted" };
-      else if (emptyDrawing) states.convert = { state: "done", note: "converted, but empty" };
+      if (missing) states.convert = { state: "input", note: t("stage.note.componentRequired") };
+      else if (conversionFailed) states.convert = { state: "failed", note: t("stage.note.convertFailed") };
+      else if (emptyDrawing) states.convert = { state: "done", note: t("stage.note.convertedEmpty") };
     }
     renderTimeline(states);
     $("procTitle").textContent =
-      missing ? "DWG support is not installed yet"
-      : conversionFailed ? "DWG could not be converted"
-      : emptyDrawing ? "Drawing contains no geometry"
-      : "Cannot read this file";
+      missing ? t("proc.titleDwgMissing")
+      : conversionFailed ? t("proc.titleDwgFailed")
+      : emptyDrawing ? t("proc.titleEmpty")
+      : t("proc.titleUnreadable");
     notice("procNotice", {
       headline: d?.headline || err.message,
       body: d?.reason,
@@ -189,14 +257,15 @@ async function handleFile(file) {
   }
   states.load = S.conversion
     ? { state: "done", note: `${S.conversion.dwg_signature} · ${S.conversion.dwg_version}` }
-    : { state: "done", note: `${S.kind.toUpperCase()} · ${doc.page_count} page(s)` };
+    : { state: "done", note: t("stage.note.pages", {
+          kind: S.kind.toUpperCase(), n: doc.page_count }) };
   if (states.convert) {
     states.convert = S.conversion
       ? { state: S.conversion.warnings.length ? "warn" : "done",
           note: `${S.conversion.tool} ${S.conversion.tool_version} · ` +
                 `${S.conversion.duration_seconds}s · ` +
                 `${(S.conversion.intermediate_dxf_bytes / 1e6).toFixed(0)} MB DXF` }
-      : { state: "done", note: "read directly" };
+      : { state: "done", note: t("stage.note.readDirectly") };
   }
   states.geometry = { state: "active" };
   renderTimeline(states);
@@ -208,12 +277,13 @@ async function handleFile(file) {
   try {
     const analysis = await call(`/api/documents/${S.docId}/pages/${S.page}/analyze`);
     S.analysis = analysis;
-    states.geometry = { state: "done", note: `${analysis.primitive_count.toLocaleString()} primitives` };
+    states.geometry = { state: "done",
+      note: t("stage.note.primitives", { n: analysis.primitive_count.toLocaleString() }) };
 
     const views = analysis.regions.filter((r) => r.kind === "view");
     states.regions = {
       state: "done",
-      note: `${analysis.regions.length} region(s), ${views.length} view(s)`,
+      note: t("stage.note.regions", { regions: analysis.regions.length, views: views.length }),
     };
     if ((analysis.ambiguities || []).length) {
       states.regions = { state: "warn", note: analysis.ambiguities[0].headline };
@@ -228,11 +298,11 @@ async function handleFile(file) {
     states.scale = analysis.scale?.verified
       ? { state: "done", note: `${analysis.scale.source.replace(/_/g, " ")}` }
       : { state: "input", note: S.kind === "pdf"
-          ? "Scale requires confirmation" : "Units not declared by the drawing" };
+          ? t("stage.note.scaleNeeded") : t("stage.note.unitsNotDeclared") };
     if (S.kind !== "pdf" && S.cad) {
       const layers = (S.cad.layers || []).filter((l) => l.entity_count).length;
       const blocks = (S.cad.blocks || []).filter((b) => b.insert_count).length;
-      states.regions = { state: "done", note: `${layers} layer(s), ${blocks} block(s)` };
+      states.regions = { state: "done", note: t("stage.note.layers", { layers, blocks }) };
     }
     states.candidates = { state: "active" };
     renderTimeline(states);
@@ -241,12 +311,12 @@ async function handleFile(file) {
     const verified = S.result?.scale?.verified;
     states.candidates = {
       state: "done",
-      note: `${S.result.footprint_interpretations.length} reading(s)`,
+      note: t("stage.note.readings", { n: S.result.footprint_interpretations.length }),
     };
     states.area = verified
       ? { state: "done", note: areaText(readingUnits(currentReading())).value + " " +
                                areaText(readingUnits(currentReading())).unit }
-      : { state: "input", note: "Calibrate to obtain a physical area" };
+      : { state: "input", note: t("stage.note.calibrateForArea") };
     renderTimeline(states);
 
     await renderTask;
@@ -259,7 +329,7 @@ async function handleFile(file) {
   } catch (err) {
     states.area = { state: "failed", note: err.message };
     renderTimeline(states);
-    notice("procNotice", { headline: "Analysis failed", body: err.message, kind: "error" });
+    notice("procNotice", { headline: t("proc.failed"), body: err.message, kind: "error" });
   }
 }
 
@@ -394,29 +464,32 @@ function toPage(clientX, clientY) {
 
 /* ── overlay ─────────────────────────────────────────────────────────────── */
 
-const FP_STYLE = {
-  geometry_union: { colour: "#1F6F63", label: "Geometry Union" },
-  enclosing_boundary: { colour: "#A9711B", label: "Enclosing Boundary" },
-  internal_union: { colour: "#2F8E7E", label: "Internal Union" },
-  convex_envelope: { colour: "#3E6392", label: "Convex Envelope" },
-  bounding_rectangle: { colour: "#6C5A93", label: "Bounding Rectangle" },
-  conveyor_footprint: { colour: "#55636A", label: "Conveyor Footprint" },
-  guarded_area: { colour: "#55636A", label: "Guarded Area" },
-  line_footprint: { colour: "#55636A", label: "Production Line Footprint" },
+const FP_COLOURS = {
+  geometry_union: "#1F6F63",
+  enclosing_boundary: "#A9711B",
+  internal_union: "#2F8E7E",
+  convex_envelope: "#3E6392",
+  bounding_rectangle: "#6C5A93",
+  conveyor_footprint: "#55636A",
+  guarded_area: "#55636A",
+  line_footprint: "#55636A",
 };
+/* The reading's display name is a translated label; its colour is not. */
+const fpLabel = (type, fallback) => t(`fpName.${type}`, {}, fallback || type);
+const fpColour = (type) => FP_COLOURS[type] || "#1F6F63";
 const OVERLAY_LAYERS = [
-  ["source", "Source geometry", "rgba(85,99,106,.34)"],
-  ["counted", "Counted geometry", "rgba(31,111,99,.55)"],
-  ["excluded", "Excluded geometry", "rgba(85,99,106,.55)"],
-  ["dimensions", "Dimensions / annotation", "rgba(85,99,106,.25)"],
-  ["holes", "Holes", "rgba(154,52,18,.55)"],
-  ["footprint", "Selected footprint", "rgba(31,111,99,.32)"],
-  ["boundary", "Enclosing boundary", "rgba(169,113,27,.45)"],
-  ["internal", "Internal geometry", "rgba(47,142,126,.45)"],
-  ["envelope", "Convex envelope", "rgba(62,99,146,.45)"],
-  ["rect", "Bounding rectangle", "rgba(108,90,147,.45)"],
-  ["calibration", "Calibration span", "rgba(154,52,18,.85)"],
-  ["warnings", "Ambiguous regions", "rgba(169,113,27,.55)"],
+  ["source", "rgba(85,99,106,.34)"],
+  ["counted", "rgba(31,111,99,.55)"],
+  ["excluded", "rgba(85,99,106,.55)"],
+  ["dimensions", "rgba(85,99,106,.25)"],
+  ["holes", "rgba(154,52,18,.55)"],
+  ["footprint", "rgba(31,111,99,.32)"],
+  ["boundary", "rgba(169,113,27,.45)"],
+  ["internal", "rgba(47,142,126,.45)"],
+  ["envelope", "rgba(62,99,146,.45)"],
+  ["rect", "rgba(108,90,147,.45)"],
+  ["calibration", "rgba(154,52,18,.85)"],
+  ["warnings", "rgba(169,113,27,.55)"],
 ];
 
 const ring = (pts) => "M" + pts.map((p) => { const q = px(p); return `${q[0].toFixed(1)},${q[1].toFixed(1)}`; }).join("L") + "Z";
@@ -462,14 +535,14 @@ function paintOverlay() {
       const item = byType[type];
       if (!item) continue;
       for (const r of item.outer || []) {
-        out.push(`<path d="${ring(r)}" fill="none" stroke="${FP_STYLE[type].colour}"
+        out.push(`<path d="${ring(r)}" fill="none" stroke="${fpColour(type)}"
           stroke-width="${hair * 1.3}" stroke-dasharray="5 3.5" stroke-opacity=".95"/>`);
       }
     }
 
     const sel = currentReading();
     if (S.layers.footprint && sel && (sel.outer || []).length) {
-      const tint = FP_STYLE[sel.type]?.colour || "#1F6F63";
+      const tint = fpColour(sel.type);
       const d = (sel.outer || []).map(ring)
         .concat(S.layers.holes ? (sel.holes || []).map(ring) : []).join(" ");
       out.push(`<path d="${d}" fill-rule="evenodd" fill="${tint}" fill-opacity=".26"
@@ -538,49 +611,123 @@ function paintAll() {
 function renderReading() {
   const item = currentReading();
   const scale = S.result?.scale;
-  if (!item) { $("rdName").textContent = "No geometry reconstructed"; return; }
+  if (!item) { $("rdName").textContent = t("ws.noGeometry"); return; }
 
-  $("rdName").textContent = FP_STYLE[item.type]?.label || item.name;
+  $("rdName").textContent = fpLabel(item.type, item.name);
   const a = areaText(item.units);
   $("rdValue").innerHTML = item.units
     ? `${a.value}<small>${a.unit}</small>`
-    : `Not available<small>scale unverified</small>`;
+    : `${esc(t("ws.notAvailable"))}<small>${esc(t("ws.scaleUnverified"))}</small>`;
   $("rdAlt").textContent = item.units ? altText(item.units) : "";
   $("rdMeans").textContent = item.means;
 
-  const badges = [];
-  badges.push(`<span class="badge ${item.semantics}">${item.semantics}</span>`);
+  const badges = [`<span class="badge ${item.semantics}">${t("sem." + item.semantics)}</span>`];
   if (scale?.operator_supplied && scale?.verified && scale?.calibration) {
-    badges.push(`<span class="badge manual">Operator calibrated</span>`);
+    badges.push(`<span class="badge manual">${t("badge.operatorCalibrated")}</span>`);
   } else if (scale?.operator_supplied && scale?.verified) {
-    badges.push(`<span class="badge manual">Operator-stated units</span>`);
+    badges.push(`<span class="badge manual">${t("badge.operatorUnits")}</span>`);
   } else if (scale?.source === "cad_declared_units") {
-    badges.push(`<span class="badge confirmed">CAD $INSUNITS</span>`);
+    badges.push(`<span class="badge confirmed">${t("badge.cadUnits")}</span>`);
   } else if (!scale?.verified) {
-    badges.push(`<span class="badge warn">Scale requires confirmation</span>`);
-  }
-  if (S.result?.confidence) {
-    badges.push(`<span class="badge">Confidence ${S.result.confidence.percent}%</span>`);
+    badges.push(`<span class="badge warn">${t("scale.requiresConfirmation")}</span>`);
   }
   $("rdBadges").innerHTML = badges.join("");
+  renderStatusGrid(item, scale);
+  renderPrimaryAction(scale);
+}
+
+/* Four separate facts, shown as four.
+ *
+ * A single "Confidence 0 %" reads as "the analysis is worthless". On a drawing
+ * whose scale is unknown that is wrong twice over: the geometry was extracted
+ * perfectly, and the zero is the deliberate refusal to claim a physical area
+ * without a scale (§3). Splitting them says what actually happened. */
+function renderStatusGrid(item, scale) {
+  const r = S.result, g = r?.geometry;
+  if (!g) { $("rdStatus").innerHTML = ""; return; }
+
+  const rows = [];
+  /* A raster trace legitimately has no vector primitives at all, so success is
+   * judged on what came out — reconstructed components — not on what went in. */
+  const extracted = g.components > 0 && g.outer_contours > 0;
+  rows.push([t("status.geometry"), extracted ? "ok" : "warn",
+    extracted ? t("status.geometryOk") : t("status.geometryNone"),
+    extracted ? t("status.geometrySub", {
+      components: g.components.toLocaleString(), holes: g.holes.toLocaleString() }) : ""]);
+
+  const scaleState = !scale?.verified ? "warn" : "ok";
+  const scaleText = !scale?.verified
+    ? t("scale.requiresConfirmation")
+    : scale.operator_supplied
+      ? (scale.calibration ? t("badge.operatorCalibrated") : t("badge.operatorUnits"))
+      : t("scale.derived", { source: t("scaleSource." + scale.source, {}, scale.source) });
+  rows.push([t("status.scale"), scaleState, scaleText,
+    scale?.verified ? `${num(scale.mm_per_unit, 4)} mm/unit` : ""]);
+
+  rows.push([t("status.meaning"), item?.provisional ? "warn" : "ok",
+    t("sem." + (item?.semantics || "geometric")),
+    item?.provisional ? t("status.meaningProvisionalSub") : t("status.meaningGeometricSub")]);
+
+  const haveArea = Boolean(item?.units);
+  rows.push([t("status.physicalArea"), haveArea ? "ok" : "none",
+    haveArea ? `${areaText(item.units).value} ${areaText(item.units).unit}`
+             : t("status.areaUnavailable"),
+    haveArea && r.confidence
+      ? t("status.confidenceIs", { pct: r.confidence.percent })
+      : t("status.confidenceAfterCalibration")]);
+
+  $("rdStatus").innerHTML = rows.map(([k, cls, v, sub]) =>
+    `<div class="srow"><span class="sk">${esc(k)}</span>
+      <span class="sv ${cls}">${esc(v)}${sub ? `<span class="sub">${esc(sub)}</span>` : ""}</span>
+    </div>`).join("");
+}
+
+/* Calibration is the one thing standing between this drawing and a number, so
+ * it is offered right beside the result rather than inside a tab. */
+function renderPrimaryAction(scale) {
+  const host = $("rdPrimaryAction");
+  if (!host) return;
+  if (scale?.verified || S.picking) { host.innerHTML = ""; return; }
+
+  const cadNeedsUnit = S.kind !== "pdf" && S.analysis?.cad_dimension_evidence
+    && !S.analysis.cad_dimension_evidence.units_declared;
+  host.innerHTML = `<div class="cta">
+    <button class="primary" id="ctaCalibrate">${
+      cadNeedsUnit ? esc(t("cta.stateUnits")) : esc(t("cta.calibrate"))}</button>
+    <p class="hint">${esc(cadNeedsUnit ? t("cta.stateUnitsHint") : t("cta.calibrateHint"))}</p>
+  </div>`;
+  $("ctaCalibrate").onclick = () => {
+    for (const tab of $("tabs").querySelectorAll("button")) {
+      tab.setAttribute("aria-selected", tab.dataset.tab === "footprints");
+    }
+    for (const pane of document.querySelectorAll(".pane")) {
+      pane.classList.toggle("on", pane.dataset.pane === "footprints");
+    }
+    if (cadNeedsUnit) {
+      $("calibBlock").scrollIntoView({ block: "nearest" });
+      $("cadUnit")?.focus();
+    } else {
+      startCalibration();
+    }
+  };
 }
 
 function renderFootprints() {
   const list = S.result?.footprint_interpretations || [];
   const current = currentReading();
   $("fpList").innerHTML = list.map((item) => {
-    const style = FP_STYLE[item.type] || {};
     const a = areaText(item.units);
     const on = current && item.type === current.type;
     return `<button type="button" class="fp" data-fp="${esc(item.type)}" aria-pressed="${on}">
       <span class="row1">
-        <span class="nm"><i class="sw" style="background:${style.colour || "#1F6F63"}"></i>${esc(style.label || item.name)}</span>
+        <span class="nm"><i class="sw" style="background:${fpColour(item.type)}"></i>${
+          esc(fpLabel(item.type, item.name))}</span>
         <span class="val">${item.units ? `${a.value} ${a.unit}` : "—"}</span>
       </span>
       <span class="why">${esc(item.means)}</span>
-      ${item.provisional ? `<span class="req">Provisional — meaning not confirmed</span>` : ""}
+      ${item.provisional ? `<span class="req">${esc(t("fp.provisionalTag"))}</span>` : ""}
     </button>`;
-  }).join("") || `<p style="color:var(--ink-2)">No readings — nothing was reconstructed.</p>`;
+  }).join("") || `<p style="color:var(--ink-2)">${esc(t("fp.none"))}</p>`;
 
   for (const btn of $("fpList").querySelectorAll("button[data-fp]")) {
     btn.onclick = () => { S.fpType = btn.dataset.fp; renderReading(); renderFootprints();
@@ -591,18 +738,18 @@ function renderFootprints() {
   $("fpPending").innerHTML = pending.map((item) => `
     <div class="fp unavailable" data-fp-pending="${esc(item.type)}">
       <span class="row1">
-        <span class="nm">${esc(FP_STYLE[item.type]?.label || item.name)}</span>
-        <span class="val">Not yet available</span>
+        <span class="nm">${esc(fpLabel(item.type, item.name))}</span>
+        <span class="val">${esc(t("fp.notYetAvailable"))}</span>
       </span>
       <span class="why">${esc(item.means)}</span>
-      <span class="req">Requires ${esc(item.requires)}</span>
+      <span class="req">${esc(t("fp.requires", { what: item.requires }))}</span>
     </div>`).join("");
 }
 
 function renderOverlayLayers() {
-  $("overlayLayers").innerHTML = OVERLAY_LAYERS.map(([key, label, colour]) =>
+  $("overlayLayers").innerHTML = OVERLAY_LAYERS.map(([key, colour]) =>
     `<label><input type="checkbox" data-layer="${key}" ${S.layers[key] ? "checked" : ""}>
-      <i style="background:${colour}"></i>${esc(label)}</label>`).join("");
+      <i style="background:${colour}"></i>${esc(t("overlay." + key))}</label>`).join("");
   for (const input of $("overlayLayers").querySelectorAll("input[data-layer]")) {
     input.onchange = () => { S.layers[input.dataset.layer] = input.checked; paintOverlay(); };
   }
@@ -616,11 +763,12 @@ function renderCalibration() {
   if (scale?.verified && !S.picking) {
     if (scale.operator_supplied && !scale.calibration && S.kind !== "pdf") {
       host.innerHTML = `<div class="calib">
-        <div class="badges"><span class="badge manual">Operator-stated units</span></div>
-        <div class="result" style="margin-top:8px">1 drawing unit =
-          ${num(scale.mm_per_unit, 4)} mm</div>
+        <div class="badges"><span class="badge manual">${esc(t("badge.operatorUnits"))}</span></div>
+        <div class="result" style="margin-top:8px">${
+          esc(t("cadUnit.stated", { mm: num(scale.mm_per_unit, 4) }))}</div>
         <p style="margin:0;font-size:11.5px;color:var(--ink-2)">${esc(scale.detail || "")}</p>
-        <button class="ghost" id="restateUnit" style="margin-top:8px">Change unit</button>
+        <button class="ghost" id="restateUnit" style="margin-top:8px">${
+          esc(t("cadUnit.change"))}</button>
       </div>`;
       $("restateUnit").onclick = () => {
         S.scaleSpec = { mode: "auto" };
@@ -631,12 +779,19 @@ function renderCalibration() {
     if (scale.operator_supplied && scale.calibration) {
       const c = scale.calibration;
       host.innerHTML = `<div class="calib">
-        <div class="badges"><span class="badge manual">Operator calibrated</span></div>
-        <div class="result" style="margin-top:8px">${esc(c.label)} / ${num(c.span_units, 2)} units
-          = ${num(scale.mm_per_unit, 4)} mm/unit</div>
-        <p style="margin:0;font-size:11.5px;color:var(--ink-2)">The span you measured is drawn on
-          the drawing in red. This scale was supplied by you, not verified from the drawing.</p>
-        <button class="ghost" id="recalibrate" style="margin-top:8px">Recalibrate</button>
+        <div class="badges"><span class="badge manual">${esc(t("badge.operatorCalibrated"))}</span></div>
+        <div class="kv" style="margin-top:8px">
+          <div class="r"><span class="k">${esc(t("cal.declaredDistance"))}</span>
+            <span class="v">${esc(c.label)}</span></div>
+          <div class="r"><span class="k">${esc(t("cal.measuredSpan"))}</span>
+            <span class="v">${num(c.span_units, 2)}</span></div>
+          <div class="r"><span class="k">${esc(t("cal.resultingScale"))}</span>
+            <span class="v">${num(scale.mm_per_unit, 4)} mm/unit</span></div>
+        </div>
+        <p style="margin:7px 0 0;font-size:11.5px;color:var(--ink-2)">${
+          esc(t("cal.drawnOnDrawing"))}<br>${esc(t("cal.notVerified"))}</p>
+        <button class="ghost" id="recalibrate" style="margin-top:8px">${
+          esc(t("cal.recalibrate"))}</button>
       </div>`;
       $("recalibrate").onclick = startCalibration;
     } else {
@@ -651,31 +806,22 @@ function renderCalibration() {
    * pick two points on a picture. */
   const cadEvidence = S.analysis?.cad_dimension_evidence;
   if (S.kind !== "pdf" && cadEvidence && !cadEvidence.units_declared) {
-    const dims = (cadEvidence.measurements || []).slice(0, 6)
-      .map((v) => num(v, 1)).join("   ·   ");
+    const dims = (cadEvidence.measurements || []).slice(0, 6).map((v) => num(v, 1)).join("   ·   ");
+    const units = ["mm", "cm", "m", "in", "ft"];
     host.innerHTML = `<div class="calib">
-      <div class="badges"><span class="badge warn">Units not declared</span></div>
-      <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-2)">
-        This drawing leaves <span class="mono">$INSUNITS</span> at 0, so it does not
-        say which unit its coordinates are in. Its own dimensions measure:</p>
+      <div class="badges"><span class="badge warn">${esc(t("cadUnit.title"))}</span></div>
+      <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-2)">${esc(t("cadUnit.explain"))}</p>
       ${dims ? `<div class="result" style="margin-top:7px">${esc(dims)}</div>` : ""}
-      <p style="margin:0 0 7px;font-size:11.5px;color:var(--ink-2)">
-        Extent ${cadEvidence.extent_units
-          ? `${num(cadEvidence.extent_units[0], 0)} × ${num(cadEvidence.extent_units[1], 0)}`
-          : "—"} drawing units. One drawing unit is:</p>
+      <p style="margin:0 0 7px;font-size:11.5px;color:var(--ink-2)">${
+        esc(t("cadUnit.extent", {
+          w: cadEvidence.extent_units ? num(cadEvidence.extent_units[0], 0) : "—",
+          h: cadEvidence.extent_units ? num(cadEvidence.extent_units[1], 0) : "—" }))}</p>
       <div class="fields">
-        <select id="cadUnit">
-          <option value="mm">millimetres (mm)</option>
-          <option value="cm">centimetres (cm)</option>
-          <option value="m">metres (m)</option>
-          <option value="in">inches (in)</option>
-          <option value="ft">feet (ft)</option>
-        </select>
-        <button class="primary" id="applyCadUnit">Apply</button>
+        <select id="cadUnit">${units.map((u) =>
+          `<option value="${u}">${esc(t("cadUnit." + u))}</option>`).join("")}</select>
+        <button class="primary" id="applyCadUnit">${esc(t("cadUnit.apply"))}</button>
       </div>
-      <p style="margin:0;font-size:11px;color:var(--ink-2)">
-        The geometry is the drawing's own; only the unit is yours, so the result
-        is labelled operator-stated.</p>
+      <p style="margin:0;font-size:11px;color:var(--ink-2)">${esc(t("cadUnit.note"))}</p>
     </div>`;
     $("applyCadUnit").onclick = async () => {
       S.scaleSpec = { mode: "cad_unit", known_unit: $("cadUnit").value };
@@ -687,29 +833,31 @@ function renderCalibration() {
 
   const step = S.picking ? (S.picks.length < 2 ? S.picks.length + 1 : 3) : 0;
   host.innerHTML = `<div class="calib">
-    <div class="badges"><span class="badge warn">Scale requires confirmation</span></div>
+    <div class="badges"><span class="badge warn">${esc(t("scale.requiresConfirmation"))}</span></div>
     <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-2)">
-      ${esc(scale?.detail || "No scale could be established from the drawing.")}</p>
+      ${esc(scale?.detail || t("cal.noScaleDetail"))}</p>
     ${S.picking ? `
       <ol class="steps">
-        <li class="${step === 1 ? "active" : ""}">Click the first point of a known dimension</li>
-        <li class="${step === 2 ? "active" : ""}">Click the second point</li>
-        <li class="${step === 3 ? "active" : ""}">Enter the real distance and apply</li>
+        <li class="${step === 1 ? "active" : ""}">${esc(t("cal.step1"))}</li>
+        <li class="${step === 2 ? "active" : ""}">${esc(t("cal.step2"))}</li>
+        <li class="${step === 3 ? "active" : ""}">${esc(t("cal.step3"))}</li>
       </ol>
       <p class="picked">${S.picks.map((p, i) =>
-        `P${i + 1} ${num(p[0], 2)}, ${num(p[1], 2)}`).join("   ") || "No points picked yet"}</p>
+        `P${i + 1} ${num(p[0], 2)}, ${num(p[1], 2)}`).join("   ") || esc(t("cal.noPicks"))}</p>
       ${S.picks.length === 2 ? `<div class="result" id="calPreview"></div>` : ""}
       <div class="fields">
-        <input type="number" id="knownLength" placeholder="Known distance" step="any">
+        <input type="number" id="knownLength" placeholder="${esc(t("cal.knownDistance"))}" step="any">
         <select id="knownUnit">
           <option value="mm">mm</option><option value="cm">cm</option>
           <option value="m">m</option><option value="in">in</option><option value="ft">ft</option>
         </select>
       </div>
       <button class="primary" id="applyCal" ${S.picks.length === 2 ? "" : "disabled"}
-        style="width:100%">Apply calibration</button>
-      <button class="ghost" id="cancelCal" style="width:100%;margin-top:5px">Cancel</button>
-    ` : `<button class="primary" id="startCal" style="width:100%;margin-top:9px">Calibrate Drawing</button>`}
+        style="width:100%">${esc(t("cal.apply"))}</button>
+      <button class="ghost" id="cancelCal" style="width:100%;margin-top:5px">${
+        esc(t("cal.cancel"))}</button>
+    ` : `<button class="primary" id="startCal" style="width:100%;margin-top:9px">${
+        esc(t("cta.calibrate"))}</button>`}
   </div>`;
 
   if (S.picking) {
@@ -740,8 +888,8 @@ function updateCalPreview() {
   const span = Math.hypot(b[0] - a[0], b[1] - a[1]);
   const raw = parseFloat($("knownLength").value);
   const factor = { mm: 1, cm: 10, m: 1000, in: 25.4, ft: 304.8 }[$("knownUnit").value] || 1;
-  box.innerHTML = `Drawing span: ${num(span, 2)} units` +
-    (raw > 0 ? `<br>Calculated scale: ${num((raw * factor) / span, 4)} mm/unit` : "");
+  box.innerHTML = esc(t("cal.span", { span: num(span, 2) })) +
+    (raw > 0 ? `<br>${esc(t("cal.computed", { mm: num((raw * factor) / span, 4) }))}` : "");
 }
 
 async function applyCalibration() {
@@ -780,64 +928,80 @@ async function computeArea(opts = {}) {
 
 /* ── warnings, explain, detail, layers ───────────────────────────────────── */
 
-const WHY = {
-  "no embedded": "Without text there are no dimensions to calibrate from, so the scale must be supplied by hand.",
-  "operator": "The scale was supplied by a person, not derived from the drawing, so the area inherits that judgement.",
-  "annotation": "Annotation counted as geometry inflates envelopes and bounding rectangles.",
-  "boundary": "If this boundary is the site rather than a machine, the number answers a different question.",
-  "semantic meaning is not confirmed": "This is a geometric construction. What it represents has not been established, so do not quote it as a named physical region.",
-  "stroked annotation": "Annotation drawn as lines is counted as geometry, which enlarges envelopes and bounding rectangles.",
+/* Warnings the UI composes from structured backend state. Each is a catalogue
+ * key with a "why it matters" line, so both languages read naturally instead of
+ * being a translated sentence fragment.
+ *
+ * Warnings that the *engine* produces as free text stay in the language the
+ * engine wrote them: they are the engineering record, shared verbatim by the
+ * JSON API, the CLI and this viewer, and rewording them here would mean the
+ * report and the screen no longer say the same thing. */
+const UI_WARNING_WHY = {
+  "warn.noScale": "warn.noScaleWhy",
+  "warn.operatorScale": "warn.operatorScaleWhy",
+  "warn.noPdfText": "warn.noPdfTextWhy",
+  "warn.strokedAnnotation": "warn.strokedAnnotationWhy",
+  "warn.provisionalMeaning": "warn.provisionalMeaningWhy",
 };
-function whyItMatters(text) {
-  const lower = text.toLowerCase();
-  for (const key of Object.keys(WHY)) if (lower.includes(key)) return WHY[key];
-  return null;
-}
 
 function renderWarnings() {
   const result = S.result, item = currentReading();
   if (!result) { $("warningsPane").innerHTML = ""; return; }
 
-  const warnings = [...(result.warnings || [])];
-  for (const w of item?.warnings || []) if (!warnings.includes(w)) warnings.push(w);
-
-  /* Facts the engine records in structured fields rather than as warning text.
-   * Surfaced here because they change how much the number can be trusted; each
-   * is read from backend state, never inferred. */
+  /* {key, params} for warnings this UI raises; plain strings for the engine's
+   * own, which are shown exactly as it wrote them. */
+  const entries = [];
   if (!result.scale?.verified) {
-    warnings.unshift("No verified scale, so no physical area is reported for this drawing.");
+    entries.push({ key: "warn.noScale" });
   } else if (result.scale.operator_supplied) {
-    warnings.unshift("Scale was operator calibrated, not derived from the drawing.");
+    entries.push({ key: "warn.operatorScale" });
   }
+  /* The engine pairs its common warnings with a stable code; those are shown in
+   * the reader's language. Anything uncoded is a finding written by the engine
+   * and is shown in its own words, so the screen and the JSON report agree. */
+  const coded = result.warnings_coded || (result.warnings || []).map((w) => ({ text: w }));
+  for (const w of coded) {
+    entries.push(w.code ? { key: "msg." + w.code, text: w.text } : { text: w.text });
+  }
+  const seen = new Set(coded.map((w) => w.text));
+  for (const w of item?.warnings || []) if (!seen.has(w)) entries.push({ text: w });
   if (S.kind === "pdf" && S.analysis && S.analysis.text_span_count === 0) {
-    warnings.push("No embedded PDF text was found; dimension annotation is stroked geometry.");
+    entries.push({ key: "warn.noPdfText" });
+    const excluded = result.geometry.raw_primitives
+      ? result.geometry.ignored_primitives / result.geometry.raw_primitives : 0;
+    if (excluded < 0.2) entries.push({ key: "warn.strokedAnnotation" });
   }
   if (item?.provisional) {
-    warnings.push(`${FP_STYLE[item.type]?.label || item.name} semantic meaning is not confirmed.`);
+    entries.push({ key: "warn.provisionalMeaning",
+                   params: { name: fpLabel(item.type, item.name) } });
   }
-  const excludedShare = result.geometry.raw_primitives
-    ? result.geometry.ignored_primitives / result.geometry.raw_primitives : 0;
-  if (S.kind === "pdf" && S.analysis?.text_span_count === 0 && excludedShare < 0.2) {
-    warnings.push("Stroked annotation geometry may inflate the envelope and bounding rectangle.");
+  for (const amb of S.analysis?.ambiguities || []) {
+    entries.push({ text: `${amb.headline}: ${amb.reason}` });
   }
-  for (const amb of S.analysis?.ambiguities || []) warnings.push(`${amb.headline}: ${amb.reason}`);
 
-  const count = warnings.length;
-  $("warnCount").textContent = count;
-  $("warnCount").classList.toggle("hide", count === 0);
+  $("warnCount").textContent = entries.length;
+  $("warnCount").classList.toggle("hide", entries.length === 0);
 
   const assumptions = [...(result.assumptions || []), ...(item?.assumptions || [])]
     .filter((v, i, a) => a.indexOf(v) === i);
 
-  $("warningsPane").innerHTML = (count ? `
+  const items = entries.map((entry) => {
+    /* A coded entry falls back to the engine's own wording if the catalogue
+     * has no translation for it yet. */
+    const text = entry.key
+      ? t(entry.key, entry.params || {}, entry.text ? entry.text.split("\n")[0] : null)
+      : entry.text.split("\n")[0];
+    const whyKey = entry.key ? UI_WARNING_WHY[entry.key] : null;
+    const why = whyKey ? t(whyKey) : null;
+    return `<li>${esc(text)}${why ? `<span class="why">${esc(why)}</span>` : ""}</li>`;
+  }).join("");
+
+  $("warningsPane").innerHTML = (entries.length ? `
     <div class="review">
-      <h4>Review required</h4>
-      <ul>${warnings.map((w) => {
-        const why = whyItMatters(w);
-        return `<li>${esc(w.split("\n")[0])}${why ? `<span class="why">${esc(why)}</span>` : ""}</li>`;
-      }).join("")}</ul>
-    </div>` : `<p style="color:var(--ink-2)">No warnings for this reading.</p>`) +
-    (assumptions.length ? `<h4>Assumptions</h4>
+      <h4>${esc(t("warn.reviewRequired"))}</h4>
+      <ul>${items}</ul>
+    </div>` : `<p style="color:var(--ink-2)">${esc(t("warn.none"))}</p>`) +
+    (assumptions.length ? `<h4>${esc(t("warn.assumptions"))}</h4>
       <ul class="assumptions">${assumptions.map((a) => `<li>${esc(a)}</li>`).join("")}</ul>` : "");
 }
 
@@ -847,35 +1011,40 @@ function renderExplain() {
   const g = r.geometry, scale = r.scale;
   const a = areaText(item?.units);
 
+  const scaleLine = scale?.verified
+    ? `${scale.operator_supplied
+          ? (scale.calibration ? t("explain.operatorCalibrated") : t("badge.operatorUnits"))
+          : scale.source === "cad_declared_units" ? t("explain.cadUnits") : t("explain.derived")}<br>
+       ${scale.calibration
+         ? `<span class="mono">${esc(scale.calibration.label)} / ${
+              num(scale.calibration.span_units, 2)}</span><br>` : ""}
+       <span class="mono">= ${num(scale.mm_per_unit, 4)} mm/unit</span>
+       ${(scale.evidence || []).length
+         ? `<ul>${scale.evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}`
+    : t("explain.scaleNotVerified");
+
   const steps = [
-    ["Source", `${esc(S.fileName)}<br><span class="mono">${S.kind.toUpperCase()}${
+    [t("explain.source"), `${esc(S.fileName)}<br><span class="mono">${S.kind.toUpperCase()}${
       S.cad ? ` · ${esc(S.cad.dxf_version)}` : ""}</span>`],
-    ["Drawing", S.kind === "pdf" ? `Page ${r.page}` : "Model space"],
-    ["Scale", scale?.verified
-      ? `${scale.operator_supplied ? "Operator calibrated" :
-          scale.source === "cad_declared_units" ? "CAD $INSUNITS" : "Derived from the drawing"}<br>
-         ${scale.calibration
-           ? `<span class="mono">${esc(scale.calibration.label)} / ${num(scale.calibration.span_units, 2)} units</span><br>`
-           : ""}
-         <span class="mono">= ${num(scale.mm_per_unit, 4)} mm/unit</span>
-         ${(scale.evidence || []).length
-           ? `<ul>${scale.evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}`
-      : "Not verified — no physical area is reported"],
-    ["Geometry", `<span class="mono">${g.raw_primitives.toLocaleString()}</span> primitives ·
-      <span class="mono">${g.profile_primitives.toLocaleString()}</span> counted ·
-      <span class="mono">${g.ignored_primitives.toLocaleString()}</span> excluded`],
-    ["Interpretation", item
-      ? `${esc(FP_STYLE[item.type]?.label || item.name)}<br>Semantic status:
-         <b>${esc(item.semantics)}</b>
+    [t("explain.drawing"), S.kind === "pdf" ? t("explain.page", { n: r.page }) : t("explain.modelSpace")],
+    [t("explain.scale"), scaleLine],
+    [t("explain.geometry"), `<span class="mono">${t("explain.geometryLine", {
+        total: g.raw_primitives.toLocaleString(),
+        counted: g.profile_primitives.toLocaleString(),
+        excluded: g.ignored_primitives.toLocaleString() })}</span>`],
+    [t("explain.interpretation"), item
+      ? `${esc(fpLabel(item.type, item.name))}<br>${esc(t("explain.semanticStatus"))}:
+         <b>${esc(t("sem." + item.semantics))}</b>
          ${(item.evidence || []).length
            ? `<ul>${item.evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>` : ""}`
       : "—"],
-    ["Area", `${esc(r.method.replace(/_/g, " "))}<br>${g.outer_contours} outer ring(s),
-      ${g.holes} hole(s)${r.subtract_holes ? " subtracted" : " kept"}`],
-    ["Result", item?.units
+    [t("explain.area"), `${esc(r.method.replace(/_/g, " "))}<br>${t("explain.areaLine", {
+        outer: g.outer_contours, holes: g.holes,
+        holeAction: r.subtract_holes ? t("explain.holesSubtracted") : t("explain.holesKept") })}`],
+    [t("explain.result"), item?.units
       ? `<span class="mono" style="font-size:14px"><b>${a.value} ${a.unit}</b></span><br>
          <span class="mono">${esc(altText(item.units))}</span>`
-      : "Not available without a verified scale"],
+      : t("explain.resultUnavailable")],
   ];
 
   $("explainFlow").innerHTML = steps.map(([k, v], i) =>
@@ -886,45 +1055,47 @@ function renderExplain() {
 function renderDetail() {
   const r = S.result, a = S.analysis;
   if (!r) { $("detailPane").innerHTML = ""; return; }
-  const g = r.geometry;
-  const conv = S.conversion;
+  const g = r.geometry, conv = S.conversion;
+
   const rows = [
-    ["Method", r.method.replace(/_/g, " ")],
-    ["Source", S.kind.toUpperCase()],
+    [t("detail.method"), r.method.replace(/_/g, " ")],
+    [t("detail.source"), S.kind.toUpperCase()],
   ];
   if (conv) {
     rows.push(
-      ["DWG version", `${conv.dwg_signature} · ${conv.dwg_version}`],
-      ["Processing path", conv.path],
-      ["Conversion", `successful · ${conv.tool} ${conv.tool_version} · ${conv.duration_seconds}s`],
-      ["Converter warnings", String(conv.warnings.length)],
-      ["Source SHA-256", conv.source_sha256.slice(0, 16) + "…"],
-      ["Intermediate DXF", `${(conv.intermediate_dxf_bytes / 1e6).toFixed(1)} MB · ` +
-                           conv.intermediate_dxf_sha256.slice(0, 16) + "…"],
+      [t("detail.dwgVersion"), `${conv.dwg_signature} · ${conv.dwg_version}`],
+      [t("detail.processingPath"), conv.path],
+      [t("detail.conversion"), t("detail.conversionOk", {
+        tool: conv.tool, version: conv.tool_version, seconds: conv.duration_seconds })],
+      [t("detail.converterWarnings"), String(conv.warnings.length)],
+      [t("detail.sourceHash"), conv.source_sha256.slice(0, 16) + "…"],
+      [t("detail.intermediateDxf"), `${(conv.intermediate_dxf_bytes / 1e6).toFixed(1)} MB · ` +
+        conv.intermediate_dxf_sha256.slice(0, 16) + "…"],
     );
   }
   if (S.cad) {
-    rows.push(["CAD units", S.cad.units.declared
-      ? `${S.cad.units.name} ($INSUNITS ${S.cad.units.insunits})`
-      : `not declared ($INSUNITS ${S.cad.units.insunits})`]);
+    rows.push([t("detail.cadUnits"), S.cad.units.declared
+      ? t("detail.cadUnitsDeclared", { name: S.cad.units.name, n: S.cad.units.insunits })
+      : t("detail.cadUnitsUndeclared", { n: S.cad.units.insunits })]);
   }
   rows.push(
-    ["Region", `${r.view.label} (${r.view.source.replace(/_/g, " ")})`],
-    ["Page rotation", a ? `${a.rotation}°` : "—"],
-    ["Extent", a ? `${a.width_pt} × ${a.height_pt}` : "—"],
-    ["Primitives", g.raw_primitives.toLocaleString()],
-    ["Counted", g.profile_primitives.toLocaleString()],
-    ["Excluded", g.ignored_primitives.toLocaleString()],
-    ["Segments", g.segments.toLocaleString()],
-    ["Faces", g.faces.toLocaleString()],
-    ["Components", g.components.toLocaleString()],
-    ["Outer rings", g.outer_contours],
-    ["Holes", g.holes],
-    ["Scale source", r.scale.source.replace(/_/g, " ")],
-    ["mm per unit", r.scale.verified ? num(r.scale.mm_per_unit, 6) : "—"],
-    ["Implied ratio", r.scale.implied_ratio || "—"],
-    ["Engine", `${r.engine_version} · ${r.timestamp}`],
+    [t("detail.region"), `${r.view.label} (${r.view.source.replace(/_/g, " ")})`],
+    [t("detail.rotation"), a ? `${a.rotation}°` : "—"],
+    [t("detail.extent"), a ? `${a.width_pt} × ${a.height_pt}` : "—"],
+    [t("detail.primitives"), g.raw_primitives.toLocaleString()],
+    [t("detail.counted"), g.profile_primitives.toLocaleString()],
+    [t("detail.excluded"), g.ignored_primitives.toLocaleString()],
+    [t("detail.segments"), g.segments.toLocaleString()],
+    [t("detail.faces"), g.faces.toLocaleString()],
+    [t("detail.components"), g.components.toLocaleString()],
+    [t("detail.outerRings"), String(g.outer_contours)],
+    [t("detail.holes"), String(g.holes)],
+    [t("detail.scaleSource"), t("scaleSource." + r.scale.source, {}, r.scale.source)],
+    [t("detail.mmPerUnit"), r.scale.verified ? num(r.scale.mm_per_unit, 6) : "—"],
+    [t("detail.impliedRatio"), r.scale.implied_ratio || "—"],
+    [t("detail.engine"), `${r.engine_version} · ${r.timestamp}`],
   );
+
   const roles = Object.entries(g.role_counts || {})
     .sort((x, y) => y[1] - x[1])
     .map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.toLocaleString()}</td></tr>`).join("");
@@ -933,11 +1104,13 @@ function renderDetail() {
   $("detailPane").innerHTML =
     `<div class="kv">${rows.map(([k, v]) =>
       `<div class="r"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`).join("")}</div>
-     <h4>Classification</h4>
-     <table class="grid"><thead><tr><th>Role</th><th style="text-align:right">Count</th></tr></thead>
+     <h4>${esc(t("detail.classification"))}</h4>
+     <table class="grid"><thead><tr><th>${esc(t("detail.role"))}</th>
+       <th style="text-align:right">${esc(t("detail.count"))}</th></tr></thead>
        <tbody>${roles}</tbody></table>` +
-    (repairs.length ? `<h4>Repairs</h4><table class="grid"><tbody>${repairs.map((x) =>
-      `<tr><td>${esc(x.type)}</td><td class="n">${x.count.toLocaleString()}</td></tr>`).join("")}</tbody></table>` : "");
+    (repairs.length ? `<h4>${esc(t("detail.repairs"))}</h4><table class="grid"><tbody>${
+      repairs.map((x) => `<tr><td>${esc(x.type)}</td>
+        <td class="n">${x.count.toLocaleString()}</td></tr>`).join("")}</tbody></table>` : "");
 }
 
 const ACI = { 1: "#FF0000", 2: "#FFFF00", 3: "#00FF00", 4: "#00FFFF", 5: "#0000FF",
@@ -947,19 +1120,21 @@ function renderLayersPane() {
   /* Any CAD source has layers — a DXF read directly, or a DWG converted
    * locally. Only a PDF has none. */
   if (!S.cad) {
-    $("layersPane").innerHTML = `<p style="color:var(--ink-2)">
-      CAD layers are available when a DWG or DXF is loaded. A printed PDF carries no
-      layer information — that is the main reason the CAD file is the better source.</p>`;
+    $("layersPane").innerHTML =
+      `<p style="color:var(--ink-2)">${esc(t("layers.noneForPdf"))}</p>`;
     return;
   }
   const layers = (S.cad.layers || []).filter((l) => l.entity_count > 0);
   const blocks = (S.cad.blocks || []).filter((b) => b.insert_count > 0);
+
+  /* Layer and block names are engineering identifiers and are never translated
+   * — they are how a drafter finds them in AutoCAD. */
   $("layersPane").innerHTML = `
-    <p style="color:var(--ink-2);font-size:11.5px;margin:0 0 9px">
-      Layer names are shown exactly as the file records them. No business meaning is
-      assigned to them.</p>
+    <p style="color:var(--ink-2);font-size:11.5px;margin:0 0 9px">${esc(t("layers.verbatim"))}</p>
     <table class="grid"><thead><tr>
-      <th>Show</th><th>Layer</th><th>Linetype</th><th style="text-align:right">Entities</th>
+      <th>${esc(t("layers.show"))}</th><th>${esc(t("layers.layer"))}</th>
+      <th>${esc(t("layers.linetype"))}</th>
+      <th style="text-align:right">${esc(t("layers.entities"))}</th>
     </tr></thead><tbody>${layers.map((l) => `
       <tr class="${S.hiddenLayers.has(l.name) ? "off" : ""}" data-layer-row="${esc(l.name)}">
         <td><input type="checkbox" data-cad-layer="${esc(l.name)}"
@@ -968,23 +1143,27 @@ function renderLayersPane() {
         <td>${esc(l.linetype || "—")}</td>
         <td class="n">${l.entity_count.toLocaleString()}</td>
       </tr>`).join("")}</tbody></table>
-    ${blocks.length ? `<h4>Blocks</h4>
-      <table class="grid"><thead><tr><th>Block</th><th>XREF</th>
-        <th style="text-align:right">Entities</th><th style="text-align:right">Placed</th></tr></thead>
-      <tbody>${blocks.map((b) => `<tr><td>${esc(b.name)}</td><td>${b.is_xref ? "yes" : ""}</td>
+    ${blocks.length ? `<h4>${esc(t("layers.blocks"))}</h4>
+      <table class="grid"><thead><tr><th>${esc(t("layers.block"))}</th>
+        <th>${esc(t("layers.xref"))}</th>
+        <th style="text-align:right">${esc(t("layers.entities"))}</th>
+        <th style="text-align:right">${esc(t("layers.placed"))}</th></tr></thead>
+      <tbody>${blocks.map((b) => `<tr><td>${esc(b.name)}</td><td>${b.is_xref ? "✓" : ""}</td>
         <td class="n">${b.entity_count.toLocaleString()}</td>
         <td class="n">${b.insert_count.toLocaleString()}</td></tr>`).join("")}</tbody></table>` : ""}
-    <h4>Units</h4>
-    <div class="kv"><div class="r"><span class="k">$INSUNITS</span>
+    <h4>${esc(t("layers.units"))}</h4>
+    <div class="kv"><div class="r"><span class="k">${esc(t("layers.insunits"))}</span>
       <span class="v">${S.cad.units.insunits} (${esc(S.cad.units.name)})</span></div>
-      <div class="r"><span class="k">mm per unit</span>
+      <div class="r"><span class="k">${esc(t("layers.mmPerUnit"))}</span>
       <span class="v">${S.cad.units.mm_per_unit ?? "—"}</span></div></div>`;
 
   for (const input of $("layersPane").querySelectorAll("input[data-cad-layer]")) {
     input.onchange = () => {
       const name = input.dataset.cadLayer;
       if (input.checked) S.hiddenLayers.delete(name); else S.hiddenLayers.add(name);
-      renderLayersPane(); paintOverlay();
+      renderLayersPane();
+      if (S.kind !== "pdf") renderCad();
+      paintOverlay();
     };
   }
 }
@@ -1094,39 +1273,61 @@ for (const tab of $("tabs").querySelectorAll("button[data-tab]")) {
 
 /* Say honestly which formats this installation can read. DWG needs a local
  * converter, so the landing screen reflects whether it is actually present. */
-(async function showCapabilities() {
-  try {
-    const caps = (await call("/api/capabilities")).formats;
-    const line = $("formatLine");
-    if (!line) return;
-    if (!caps.dwg.supported) {
-      line.innerHTML = `PDF · DXF · <span style="color:var(--amber)">DWG (setup required)</span>`;
-      line.title = caps.dwg.reason || "";
-      const host = $("uploadNotice");
-      host.innerHTML = `<div class="notice">
-        <h4>DWG support is not installed</h4>
-        <p>DWG files are converted locally — nothing is uploaded anywhere — but the
-           conversion component is not present yet.</p>
-        <p class="fix">Run: <span class="mono">${esc(caps.dwg.setup_command || "")}</span></p>
-      </div>`;
-    } else {
-      line.title = caps.dwg.note || "";
-    }
-  } catch (e) { /* the landing screen still works without this */ }
-})();
+/* The landing screen states which formats this installation can read. DWG needs
+ * a local converter, so it says so rather than assuming. */
+function renderCapabilities() {
+  const caps = S.capabilities, line = $("formatLine");
+  if (!caps || !line) return;
+  if (!caps.dwg.supported) {
+    line.textContent = t("drop.formatsDwgSetup");
+    line.title = caps.dwg.reason || "";
+    $("uploadNotice").innerHTML = `<div class="notice">
+      <h4>${esc(t("dwg.notInstalledTitle"))}</h4>
+      <p>${esc(t("dwg.notInstalledBody"))}</p>
+      <p class="fix">${esc(t("dwg.runCommand", { command: caps.dwg.setup_command || "" }))}</p>
+    </div>`;
+  } else {
+    line.textContent = t("drop.formats");
+    line.title = caps.dwg.note || "";
+    $("uploadNotice").innerHTML = "";
+  }
+}
 
-/* Reference drawings, generated and measured by the real backend. */
-(async function loadDemos() {
+/* Reference drawings, generated and measured by the real backend. Their titles
+ * come from the backend catalogue and stay in its language — they name the
+ * fixtures, not the interface. */
+function renderDemoList() {
+  if (!S.demos) return;
+  $("demoGrid").innerHTML = S.demos.slice(0, 4).map((d) =>
+    `<button type="button" data-demo="${esc(d.id)}">
+      <span class="t">${esc(d.title)}</span>
+      <span class="d">${esc(d.exercises)}</span>
+    </button>`).join("");
+  for (const btn of $("demoGrid").querySelectorAll("button[data-demo]")) {
+    btn.onclick = () => openDemo(btn.dataset.demo);
+  }
+}
+
+(async function bootstrap() {
+  let stored = null;
+  try { stored = localStorage.getItem(LANG_KEY); } catch (e) { /* private window */ }
+  const preferred = stored || (navigator.language || "").toLowerCase().startsWith("zh")
+    ? (stored || "zh-CN") : "en";
+  await loadCatalogue("en");
+  await setLanguage(LANGS[preferred] ? preferred : "en", { rerender: false });
+
+  for (const btn of document.querySelectorAll("[data-lang]")) {
+    btn.onclick = () => setLanguage(btn.dataset.lang);
+  }
+
   try {
-    const data = await call("/api/demo");
-    $("demoGrid").innerHTML = (data.drawings || []).slice(0, 4).map((d) =>
-      `<button type="button" data-demo="${esc(d.id)}">
-        <span class="t">${esc(d.title)}</span>
-        <span class="d">${esc(d.exercises)}</span>
-      </button>`).join("");
-    for (const btn of $("demoGrid").querySelectorAll("button[data-demo]")) {
-      btn.onclick = () => openDemo(btn.dataset.demo);
-    }
+    S.capabilities = (await call("/api/capabilities")).formats;
+    renderCapabilities();
+  } catch (e) { /* the landing screen still works without this */ }
+
+  try {
+    S.demos = (await call("/api/demo")).drawings || [];
+    renderDemoList();
   } catch (e) {
     $("demoRow").classList.add("hide");
   }

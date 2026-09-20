@@ -313,3 +313,35 @@ table.grid td .sw { display: inline-block; width: 9px; height: 9px; border-radiu
   .rail { border-top: 1px solid var(--line); }
   .viewer { border-right: 0; }
 }
+
+/* ── status decomposition and the primary call to action ─────────────────── */
+
+/* One "0 %" badge reads as "the analysis failed". It did not: the geometry was
+ * extracted perfectly and only the physical scale is missing. These are four
+ * separate facts and are shown as four. */
+.statusgrid { display: grid; gap: 0; margin-top: 11px; border-top: 1px solid var(--line); }
+.statusgrid .srow {
+  display: grid; grid-template-columns: 104px 1fr; gap: 10px; align-items: baseline;
+  padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 11.5px;
+}
+.statusgrid .sk { color: var(--ink-2); }
+.statusgrid .sv { font-weight: 550; }
+.statusgrid .sv.ok { color: var(--accent); }
+.statusgrid .sv.warn { color: var(--amber); }
+.statusgrid .sv.none { color: var(--ink-3); font-weight: 500; }
+.statusgrid .sv .sub { display: block; font-weight: 400; color: var(--ink-3); font-size: 11px; }
+
+.cta { margin-top: 11px; }
+.cta button { width: 100%; padding: 9px 12px; font-size: 13px; font-weight: 550; }
+.cta .hint { margin: 5px 0 0; font-size: 11px; color: var(--ink-2); line-height: 1.45; }
+
+/* Language toggle: a segmented control, quiet enough to ignore. */
+.langswitch { display: inline-flex; border: 1px solid var(--line-2); border-radius: 4px;
+  overflow: hidden; }
+.langswitch button {
+  border: 0; border-radius: 0; background: var(--panel); padding: 4px 10px;
+  font-size: 11.5px; color: var(--ink-2); line-height: 1.6;
+}
+.langswitch button + button { border-left: 1px solid var(--line-2); }
+.langswitch button[aria-pressed="true"] { background: var(--ink); color: #fff; font-weight: 600; }
+.langswitch button:hover[aria-pressed="false"] { background: var(--panel-2); color: var(--ink); }

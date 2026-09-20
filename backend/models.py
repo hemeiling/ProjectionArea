@@ -717,6 +717,7 @@ class AreaResult:
         return self.hole_area_units2 * (self.scale.mm_per_unit ** 2)
 
     def as_dict(self) -> Dict[str, Any]:
+        from backend.messages import annotate as _annotate
         from backend.units import Area
 
         area_block: Dict[str, Any]
@@ -771,6 +772,9 @@ class AreaResult:
             "footprint_interpretations": [i.as_dict() for i in self.footprint_interpretations],
             "pending_interpretations": self.pending_interpretations,
             "warnings": self.warnings,
+            # The same warnings, each paired with a stable code where one is
+            # known, so a localised client can translate without parsing prose.
+            "warnings_coded": _annotate(self.warnings),
             "assumptions": self.assumptions,
             "engine_version": self.engine_version,
             "timestamp": self.timestamp,

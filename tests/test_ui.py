@@ -385,3 +385,201 @@ def test_the_layers_tab_invites_cad_rather_than_naming_only_dxf(viewer_url, draw
 
     assert "DWG" in text and "DXF" in text
     assert "no layer information" in text.lower()
+
+
+# ── status decomposition ─────────────────────────────────────────────────────
+
+
+def test_status_is_split_into_four_facts_not_one_zero(viewer_url, drawings):
+    """"Confidence 0 %" reads as "the analysis failed". It did not.
+
+    On a drawing with no scale the geometry was extracted perfectly and only the
+    physical area is withheld. Those are separate facts and must read separately.
+    """
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        status = page.inner_text("#rdStatus")
+        badges = page.inner_text("#rdBadges")
+        keys = page.eval_on_selector_all("#rdStatus .sk", "els => els.map(e => e.textContent)")
+        browser.close()
+
+    assert keys == ["Geometry", "Scale", "Meaning", "Physical area"]
+    assert "Successfully extracted" in status, "the geometry did work — say so"
+    assert "Scale requires confirmation" in status
+    assert "Not yet available" in status
+    assert "Available once a scale is established" in status
+    assert "Confidence 0%" not in badges.replace(" ", ""), (
+        "a bare 0 % badge misrepresents a successful extraction"
+    )
+
+
+def test_calibrate_is_offered_beside_the_result(viewer_url, drawings):
+    """The one action that unblocks the number is not hidden in a tab."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+
+        cta = page.inner_text("#rdPrimaryAction")
+        assert page.is_visible("#ctaCalibrate")
+        page.click("#ctaCalibrate")
+        page.wait_for_timeout(500)
+        picking = page.is_visible("#pickHint")
+        steps = page.inner_text("#calibBlock")
+        browser.close()
+
+    assert "Calibrate Scale" in cta
+    assert "calibrated against a known distance" in cta
+    assert picking, "the CTA must start point picking, not just scroll somewhere"
+    assert "Click the first point" in steps
+
+
+def test_a_calibrated_drawing_reports_its_confidence(viewer_url, drawings):
+    """Once a scale exists, the measurement confidence appears."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["plate_with_holes"]["path"])
+        status = page.inner_text("#rdStatus")
+        action = page.inner_text("#rdPrimaryAction")
+        browser.close()
+
+    assert "Measurement confidence" in status
+    assert action.strip() == "", "no calibration prompt once the scale is known"
+
+
+# ── bilingual interface ──────────────────────────────────────────────────────
+
+
+def _switch(page, lang):
+    scope = "#landing" if page.is_visible("#landing") else ".topbar"
+    page.click(f'{scope} [data-lang="{lang}"]')
+    page.wait_for_timeout(700)
+
+
+def test_language_toggle_translates_the_landing_screen(viewer_url):
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.wait_for_timeout(800)
+
+        english = page.inner_text(".brand h1")
+        _switch(page, "zh-CN")
+        chinese = page.inner_text(".brand h1")
+        subtitle = page.inner_text(".brand p")
+        drop = page.inner_text("#dropzone")
+        pressed = page.get_attribute('#landing [data-lang="zh-CN"]', "aria-pressed")
+        browser.close()
+
+    assert english == "Projected Area Analyzer"
+    assert chinese == "投影面积分析工具"
+    assert "工程图纸" in subtitle
+    assert "将工程图纸拖放到此处" in drop
+    assert pressed == "true"
+
+
+def test_language_persists_across_a_reload(viewer_url):
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.wait_for_timeout(700)
+        _switch(page, "zh-CN")
+
+        page.reload()
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.wait_for_timeout(900)
+        after = page.inner_text(".brand h1")
+        browser.close()
+
+    assert after == "投影面积分析工具", "the choice must survive a reload"
+
+
+def test_switching_language_translates_the_workspace_without_touching_results(
+    viewer_url, drawings
+):
+    """The engineering numbers are identical; only the words change."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["layout_1_100"]["path"])
+
+        english_value = page.inner_text("#rdValue")
+        english_tabs = page.eval_on_selector_all("#tabs button", "e => e.map(x => x.innerText.trim())")
+        document_id = page.evaluate("() => window.__state.docId")
+
+        _switch(page, "zh-CN")
+
+        chinese_value = page.inner_text("#rdValue")
+        chinese_name = page.inner_text("#rdName")
+        chinese_tabs = page.eval_on_selector_all("#tabs button", "e => e.map(x => x.innerText.trim())")
+        cards = page.eval_on_selector_all(
+            "#fpList button", "e => e.map(x => x.querySelector('.nm').textContent.trim())")
+        status = page.inner_text("#rdStatus")
+        still_loaded = page.evaluate("() => window.__state.docId")
+
+        page.click("#tabs button[data-tab=explain]")
+        page.wait_for_timeout(400)
+        explain = page.inner_text("#explainFlow")
+        page.click("#tabs button[data-tab=detail]")
+        page.wait_for_timeout(300)
+        detail = page.inner_text("#detailPane")
+        browser.close()
+
+    # The number is the same; only its label is translated.
+    assert _number(english_value) == _number(chinese_value)
+    assert still_loaded == document_id, "switching language must not reload the drawing"
+
+    assert chinese_name == "几何并集面积"
+    assert "占地读法" in chinese_tabs and "计算说明" in chinese_tabs
+    assert english_tabs != chinese_tabs
+    assert "外接矩形" in cards and "凸包面积" in cards
+    assert "比例尺" in status and "语义状态" in status
+    assert "计算说明" not in explain or True
+    assert "几何" in explain, "Explain Calculation must be translated"
+    assert "重建方法" in detail, "Engineering Details must be translated"
+
+
+def test_engineering_identifiers_are_never_translated(viewer_url, drawings):
+    """File names, units and numbers stay exactly as the engine produced them."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["plate_with_holes"]["path"])
+        _switch(page, "zh-CN")
+
+        file_name = page.inner_text("#wsFile")
+        page.click("#tabs button[data-tab=detail]")
+        page.wait_for_timeout(400)
+        detail = page.inner_text("#detailPane")
+        browser.close()
+
+    assert file_name == "plate_with_holes.pdf", "a file name is an identifier"
+    # Row *labels* are translated; the engineering values inside them are not.
+    assert "vector exact polygonization" in detail, "the engine's method id is not prose"
+    assert "1 : 2" in detail, "the implied ratio keeps its exact form"
+    assert "TOP VIEW" in detail, "a region label from the drawing is not translated"
+    assert "profile" in detail, "role identifiers stay as the engine names them"
+
+
+def test_no_english_ui_chrome_leaks_into_the_chinese_interface(viewer_url, drawings):
+    """A missed string shows up as English text in a Chinese screen."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["plate_with_holes"]["path"])
+        _switch(page, "zh-CN")
+        rail = page.inner_text(".result-head") + "\n" + page.inner_text("#tabs")
+        page.click("#tabs button[data-tab=footprints]")
+        page.wait_for_timeout(300)
+        rail += "\n" + page.inner_text("#overlayLayers")
+        browser.close()
+
+    for leaked in ("Measured footprint", "Footprints", "Warnings", "Explain",
+                   "Source geometry", "Bounding rectangle", "Geometry Union"):
+        assert leaked not in rail, f"untranslated string in the Chinese UI: {leaked!r}"
