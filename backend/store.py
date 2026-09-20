@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import fitz
 
@@ -28,17 +28,30 @@ from backend.pipeline import PreparedPage, prepare_page
 
 @dataclass
 class StoredDocument:
-    """One uploaded PDF plus its per-page analysis cache."""
+    """One uploaded drawing plus its per-page analysis cache.
+
+    Either a PDF (``doc`` is a ``fitz.Document``) or a DXF (``cad`` is a
+    :class:`~backend.cad.dxf.CadDrawing`). The two sources reach the same engine
+    through different adapters (§37), so the store carries whichever it opened
+    and the API branches on :attr:`kind`.
+    """
 
     id: str
     file_name: str
     path: str
-    doc: fitz.Document
+    doc: Optional[fitz.Document]
     created_at: float
     last_used: float
     pages: Dict[int, PreparedPage] = field(default_factory=dict)
+    cad: Any = None
+
+    @property
+    def kind(self) -> str:
+        return "dxf" if self.cad is not None else "pdf"
 
     def close(self) -> None:
+        if self.doc is None:
+            return
         try:
             self.doc.close()
         except Exception:
@@ -57,6 +70,41 @@ class DocumentStore:
     @property
     def root(self) -> str:
         return self._root
+
+    def add_cad(self, data: bytes, file_name: str) -> StoredDocument:
+        """Persist a DXF upload and read it through the CAD adapter.
+
+        Raises:
+            ValueError: If the bytes are not a readable DXF.
+        """
+        from backend.cad.dxf import DxfReadError, load_dxf
+
+        self.sweep()
+        os.makedirs(self._root, exist_ok=True)
+        document_id = uuid.uuid4().hex[:16]
+        path = os.path.join(self._root, f"{document_id}.dxf")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        try:
+            drawing = load_dxf(path)
+        except DxfReadError as error:
+            os.unlink(path)
+            raise ValueError(str(error)) from error
+        except Exception as error:
+            os.unlink(path)
+            raise ValueError(f"Not a readable DXF: {error}") from error
+        if not drawing.primitives:
+            os.unlink(path)
+            raise ValueError("The DXF contains no readable geometry in model space")
+
+        now = time.time()
+        stored = StoredDocument(
+            id=document_id, file_name=file_name, path=path, doc=None,
+            created_at=now, last_used=now, cad=drawing,
+        )
+        with self._lock:
+            self._documents[document_id] = stored
+        return stored
 
     def add(self, data: bytes, file_name: str) -> StoredDocument:
         """Persist an upload and open it.
@@ -109,7 +157,12 @@ class DocumentStore:
         with self._lock:
             page = stored.pages.get(page_number)
             if page is None:
-                page = prepare_page(stored.doc, page_number)
+                if stored.kind == "dxf":
+                    from backend.cad.pipeline import prepare_cad_page
+
+                    page = prepare_cad_page(stored.cad)
+                else:
+                    page = prepare_page(stored.doc, page_number)
                 stored.pages[page_number] = page
             return stored, page
 

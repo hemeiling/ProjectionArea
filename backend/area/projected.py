@@ -167,7 +167,17 @@ def compute_projected_area(
         notes.extend(vector_notes)
         warnings.extend(vector_warnings)
 
-    if geometry is None:
+    if geometry is None and fitz_page is None:
+        # The raster fallback rasterises a PDF page. A CAD source has none, and
+        # inventing one would mean re-rendering vector geometry only to trace it
+        # back — precisely what §5 forbids. Nothing reconstructed is reported as
+        # nothing reconstructed.
+        notes.append(
+            "no raster fallback is available for a CAD source; the vector path is "
+            "the only one that applies"
+        )
+
+    if geometry is None and fitz_page is not None:
         if not use_vector:
             notes.append(
                 f"page classified {analysis.drawing_type.value}; the vector path was not applicable"

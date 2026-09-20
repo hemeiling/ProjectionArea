@@ -48,12 +48,76 @@ def test_upload_returns_page_inventory(uploaded):
     assert uploaded["suggested_page"] == 1
 
 
-def test_upload_rejects_non_pdf(client):
+def test_upload_rejects_a_file_that_is_no_kind_of_drawing(client):
+    """415 with a reason and a fix, not a bare error string."""
     response = client.post(
         "/api/documents", files={"file": ("notes.txt", b"not a pdf at all", "text/plain")}
     )
-    assert response.status_code == 400
-    assert "PDF" in response.json()["detail"]
+    assert response.status_code == 415
+    detail = response.json()["detail"]
+    assert detail["kind"] == "unknown"
+    assert "not a readable drawing" in detail["headline"]
+    assert "25504446" in detail["reason"], "say what a PDF header looks like"
+    assert detail["fix"]
+
+
+def test_a_dwg_upload_is_identified_and_explained_not_failed(client):
+    """§31: a valid DWG is a supported *format* we cannot read yet.
+
+    The UI must be able to say so precisely, so the refusal carries the version,
+    why it cannot be read, and what to do — never a generic error.
+    """
+    response = client.post(
+        "/api/documents",
+        files={"file": ("line.dwg", b"AC1015" + bytes(512), "application/octet-stream")},
+    )
+    assert response.status_code == 415
+    detail = response.json()["detail"]
+    assert detail["kind"] == "dwg"
+    assert detail["version"] == "AC1015"
+    assert "valid DWG" in detail["headline"]
+    assert "no pure-Python DWG reader" in detail["reason"]
+    assert "DXF" in detail["fix"]
+    assert "declared units" in detail["why_dxf_is_better"]
+
+
+def test_a_dxf_upload_is_read_through_the_cad_adapter(client, tmp_path):
+    """The second source path, end to end through the same API."""
+    ezdxf = pytest.importorskip("ezdxf")
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 4
+    doc.layers.add("EQUIPMENT", color=3)
+    doc.modelspace().add_lwpolyline(
+        [(0, 0), (2000, 0), (2000, 1000), (0, 1000)], close=True,
+        dxfattribs={"layer": "EQUIPMENT"},
+    )
+    path = tmp_path / "plate.dxf"
+    doc.saveas(str(path))
+
+    with open(path, "rb") as handle:
+        uploaded = client.post(
+            "/api/documents", files={"file": ("plate.dxf", handle.read(), "application/dxf")}
+        )
+    assert uploaded.status_code == 200
+    payload = uploaded.json()
+    assert payload["source_kind"] == "dxf"
+    assert payload["cad"]["units"]["declared"] is True
+    assert any(l["name"] == "EQUIPMENT" for l in payload["cad"]["layers"])
+
+    document_id = payload["document_id"]
+    try:
+        analysis = client.get(f"/api/documents/{document_id}/pages/1/analyze").json()
+        assert [r["label"] for r in analysis["regions"]] == ["Model space"]
+        assert analysis["scale"]["source"] == "cad_declared_units"
+
+        area = client.post(f"/api/documents/{document_id}/pages/1/area", json={}).json()
+        # 2000 x 1000 mm = 2 m^2, with the scale read from the header.
+        assert area["projected_area"]["verified"] is True
+        assert area["projected_area"]["net"]["m2"] == pytest.approx(2.0, rel=1e-3)
+        assert area["scale"]["source"] == "cad_declared_units"
+        assert area["scale"]["mm_per_unit"] == 1.0
+    finally:
+        client.delete(f"/api/documents/{document_id}")
 
 
 def test_analyze_reports_regions_and_scale(client, uploaded):

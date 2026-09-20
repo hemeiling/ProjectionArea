@@ -42,9 +42,35 @@ def health() -> Dict[str, Any]:
     return {"status": "ok", "engine_version": ENGINE_VERSION}
 
 
+def _detect_kind(data: bytes, file_name: str) -> str:
+    """What this upload actually is, by signature rather than by extension.
+
+    A drafter's file name is not evidence. The first bytes are.
+    """
+    head = data[:8]
+    if head.startswith(b"%PDF") or b"%PDF" in data[:1024]:
+        return "pdf"
+    if head[:2] == b"AC" and head[2:6].isdigit():
+        return "dwg"
+    lowered = file_name.lower()
+    if lowered.endswith(".dxf"):
+        return "dxf"
+    # An ASCII DXF opens with a SECTION group code; a binary one has a sentinel.
+    if data[:22].startswith(b"AutoCAD Binary DXF"):
+        return "dxf"
+    probe = data[:512].lstrip()
+    if probe.startswith(b"0") and b"SECTION" in data[:2048]:
+        return "dxf"
+    return "unknown"
+
+
 @router.post("/documents")
 async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """Accept a PDF and return its page inventory and classification."""
+    """Accept a drawing — PDF or DXF — and return its inventory.
+
+    A DWG is detected and refused with the reason and the fix, not with a generic
+    error: there is no pure-Python DWG reader, so it has to be exported to DXF.
+    """
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty upload")
@@ -53,14 +79,90 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
             status_code=413,
             detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit",
         )
+
+    file_name = file.filename or "drawing"
+    kind = _detect_kind(data, file_name)
+
+    if kind == "dwg":
+        version = data[:6].decode("ascii", "replace")
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "kind": "dwg",
+                "headline": "This is a valid DWG, but it cannot be read directly.",
+                "version": version,
+                "reason": (
+                    "There is no pure-Python DWG reader, so the drawing has to be "
+                    "converted before its geometry can be measured."
+                ),
+                "fix": (
+                    "In AutoCAD choose Save As -> AutoCAD DXF, or convert the file "
+                    "locally with the free ODA File Converter, then upload the DXF."
+                ),
+                "why_dxf_is_better": (
+                    "The DXF also carries declared units, layers, blocks and real "
+                    "dimension values, none of which survive a printed PDF."
+                ),
+            },
+        )
+
+    if kind == "unknown":
+        preview = data[:4].hex()
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "kind": "unknown",
+                "headline": "This file is not a readable drawing.",
+                "reason": (
+                    f"It begins {preview}, which is neither a PDF (25504446) nor a "
+                    "DXF. Encrypted or rights-managed exports look like this."
+                ),
+                "fix": "Export an unprotected PDF or DXF from the application that owns it.",
+            },
+        )
+
     try:
-        stored = STORE.add(data, file.filename or "drawing.pdf")
+        if kind == "dxf":
+            stored = STORE.add_cad(data, file_name)
+            summary = cad_document_summary(stored)
+        else:
+            stored = STORE.add(data, file_name)
+            summary = document_summary(stored.doc, stored.file_name)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    summary = document_summary(stored.doc, stored.file_name)
     summary["document_id"] = stored.id
+    summary["source_kind"] = kind
     return summary
+
+
+def cad_document_summary(stored) -> Dict[str, Any]:
+    """The DXF equivalent of ``document_summary``, in the same shape."""
+    drawing = stored.cad
+    info = drawing.summary()
+    box = drawing.bbox
+    return {
+        "file_name": stored.file_name,
+        "page_count": 1,
+        "metadata": {"dxf_version": info["dxf_version"], "layouts": info["layouts"]},
+        "is_encrypted": False,
+        "overall_drawing_type": "vector",
+        "suggested_page": 1,
+        "pages": [
+            {
+                "page": 1,
+                "width_pt": round(box.width, 2) if box else 0.0,
+                "height_pt": round(box.height, 2) if box else 0.0,
+                "rotation": 0,
+                "path_count": len(drawing.primitives),
+                "image_count": 0,
+                "image_coverage": 0.0,
+                "text_length": sum(len(t.text) for t in drawing.texts),
+                "drawing_type": "vector",
+            }
+        ],
+        "cad": info,
+    }
 
 
 @router.get("/demo")
@@ -214,7 +316,8 @@ def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, 
 
     result = compute_projected_area(
         analysis=prepared.analysis,
-        fitz_page=stored.doc.load_page(page_number - 1),
+        # Only the raster fallback needs the page; a DXF has none.
+        fitz_page=(stored.doc.load_page(page_number - 1) if stored.doc is not None else None),
         document_id=document_id,
         file_name=stored.file_name,
         scale=scale,
@@ -311,6 +414,12 @@ def _resolve_region(prepared: PreparedPage, request: AreaRequest):
 def _resolve_scale(prepared: PreparedPage, region: Optional[Region], spec: ScaleSpec):
     """Turn a scale request into a :class:`Scale` plus any warnings."""
     if spec.mode == "auto":
+        # A CAD drawing states its units, so there is nothing to re-derive: the
+        # prepared page already carries a scale read from the file header, which
+        # is stronger than anything measuring the drawing could produce.
+        declared = prepared.auto_scale
+        if declared is not None and declared.verified and declared.source is ScaleSource.CAD_UNITS:
+            return declared, list(prepared.scale_warnings)
         return region_scale(prepared, region)
     return _scale_from_spec(spec), []
 
