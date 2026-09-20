@@ -11,8 +11,26 @@ Inputs/
 samples/*
 !samples/README.md
 
-# Generated test drawings — rebuilt by `python -m tests.fixtures samples/generated`
+# Generated test drawings — rebuilt by `python -m backend.demo.drawings samples/generated`
 samples/generated/
+
+# ---------------------------------------------------------------------------
+# CAD files, wherever they land. A DWG or DXF in this repository is a customer
+# drawing until proven otherwise, so they are ignored globally rather than only
+# under Inputs/ — a file dropped in the project root is exactly how one leaks.
+#
+# The test suite needs no tracked CAD fixture: every DXF it reads is generated
+# by ezdxf into a pytest temporary directory at run time. Should a checked-in
+# fixture ever be needed, put it under tests/fixtures/cad/ and it is un-ignored
+# below — that directory is for generated, non-proprietary files only.
+# ---------------------------------------------------------------------------
+*.dwg
+*.dxf
+!tests/fixtures/cad/**
+
+# PDFs are deliberately NOT ignored globally: the demo and regression drawings
+# are synthetic PDFs the suite may need. The real ones live under Inputs/ and
+# samples/, both ignored above.
 
 # ---------------------------------------------------------------------------
 # Secrets — NEVER commit. Checked by tests/test_secrets_hygiene.py.
