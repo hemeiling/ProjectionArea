@@ -351,3 +351,61 @@ def test_uploads_are_never_left_in_the_store_after_removal(client, drawings):
     assert os.path.exists(stored_path)
     assert client.delete(f"/api/documents/{document_id}").status_code in (200, 204)
     assert not os.path.exists(stored_path), "the file outlived the document"
+
+
+def test_the_converter_version_is_asked_for_once_not_per_health_check(monkeypatch, tmp_path):
+    """A platform polls /health every few seconds. Spawning a subprocess each
+    time is waste normally and a hazard while a job holds twelve gigabytes:
+    forking under that pressure is how a health check fails and takes the job
+    with it."""
+    import subprocess as subprocess_module
+
+    from backend.cad import dwg as dwg_module
+
+    fake = tmp_path / "dwg2dxf"
+    fake.write_text("#!/bin/sh\necho 'dwg2dxf 0.14'\n")
+    fake.chmod(0o755)
+
+    calls = []
+    real_run = subprocess_module.run
+
+    def counting_run(args, **kwargs):
+        calls.append(args)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(dwg_module.subprocess, "run", counting_run)
+    dwg_module._VERSION_CACHE.clear()
+
+    first = dwg_module._dwg2dxf_version(str(fake))
+    for _ in range(20):
+        dwg_module._dwg2dxf_version(str(fake))
+
+    assert first == "0.14"
+    assert len(calls) == 1, f"the binary was interrogated {len(calls)} times"
+
+    # A rebuilt converter must still be noticed: the cache is keyed on the
+    # binary's identity, not merely its path.
+    fake.write_text("#!/bin/sh\necho 'dwg2dxf 0.15'\n")
+    fake.chmod(0o755)
+    os.utime(str(fake), (0, 0))
+    assert dwg_module._dwg2dxf_version(str(fake)) == "0.15"
+    assert len(calls) == 2
+
+
+def test_health_never_spawns_a_subprocess_after_the_first_call(client, monkeypatch):
+    """The same property, through the endpoint a platform actually calls."""
+    import subprocess as subprocess_module
+
+    from backend.cad import dwg as dwg_module
+
+    client.get("/health")  # first call may interrogate the binary
+
+    calls = []
+    real_run = subprocess_module.run
+    monkeypatch.setattr(
+        dwg_module.subprocess, "run",
+        lambda args, **kw: (calls.append(args), real_run(args, **kw))[1])
+
+    for _ in range(10):
+        assert client.get("/health").status_code == 200
+    assert calls == [], f"/health spawned {len(calls)} subprocess(es)"

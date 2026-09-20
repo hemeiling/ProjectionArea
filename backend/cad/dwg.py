@@ -253,16 +253,43 @@ def _is_executable(path: str) -> bool:
     return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+#: Answers from ``dwg2dxf --version``, keyed by the binary's identity.
+_VERSION_CACHE: Dict[Tuple[str, int, int], str] = {}
+
+
 def _dwg2dxf_version(path: str) -> str:
+    """The converter's version, asking the binary once per build of it.
+
+    ``/health`` reports the converter, and a platform calls ``/health`` every few
+    seconds. Spawning a subprocess for each one is waste at the best of times and
+    a hazard at the worst: while a job holds twelve gigabytes of geometry, forking
+    to re-ask a question whose answer cannot have changed is a good way for a
+    health check to fail and take the job down with it.
+
+    Keyed on the binary's path, size and modification time, so a replaced or
+    rebuilt converter is still noticed — which is what keeps
+    :func:`find_converter` honest about not needing a restart after an install.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return "unknown"
+    key = (path, int(stat.st_mtime), int(stat.st_size))
+    cached = _VERSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    version = "unknown"
     try:
         out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=20)
         text = (out.stdout or out.stderr or "").strip().splitlines()
         if text:
             match = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", text[0])
-            return match.group(1) if match else text[0][:40]
+            version = match.group(1) if match else text[0][:40]
     except Exception:
         pass
-    return "unknown"
+    _VERSION_CACHE[key] = version
+    return version
 
 
 def converter_status(reveal_paths: bool = False) -> Dict[str, Any]:

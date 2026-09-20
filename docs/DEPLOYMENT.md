@@ -139,6 +139,39 @@ Two different failures, both explained rather than silent:
   that large drawings need more memory. The progress bar keeps the progress it
   had earned and the heading changes to "Analysis interrupted".
 
+## Migrating the existing Render service
+
+A native-Python service `projection-area-analyzer` already exists (Ohio, 0.5 CPU /
+512 MB, auto-deploy from `main`). It serves PDF and DXF and reports `dwg: false`,
+because a native Python build cannot install LibreDWG. It is the rollback and
+stays running.
+
+Two things to know about it:
+
+- **Its builds have been failing since `6411b3c`.** That commit moved the
+  dependency manifest from `backend/requirements.txt` to the repository root, so a
+  build command pointing at the old path cannot install anything. The last good
+  deploy — `82ad49f` — keeps serving, which is why the live service still answers
+  `/api/health` in the old shape and leaks host paths from `/api/capabilities`.
+  Repointing that build command at `requirements.txt` is enough to unstick it.
+- **Nothing in the current code requires Docker.** It runs on the native runtime
+  and reports `dwg: false`; Docker is needed only for DWG support. So the old
+  service can be brought up to date as a rollback target, or deliberately frozen
+  at `82ad49f` — both are defensible, but a frozen service with auto-deploy still
+  enabled will keep generating failed deploys, so turn auto-deploy off if you
+  freeze it.
+
+The migration runs the Docker service *alongside* it:
+
+1. Apply this blueprint. It creates `projection-area-analyzer-docker` — a
+   deliberately different name, not a near-miss of the existing one — in the same
+   region, on `1c-2g`.
+2. Smoke test at 2 GB: `/health` reporting `dwg: true`, the landing page, EN/中文,
+   a PDF, a DXF, the progress bar, JSON and CSV export. All of that fits.
+3. Raise the plan to `2c-16g` in the dashboard and put the real DWGs through. A
+   production DWG cannot run at 2 GB; the smallest needs 6.7 GB.
+4. Only then decide whether the old service is renamed, repointed or retired.
+
 ## Long-running requests
 
 A DWG takes minutes. No request is held open for one:
@@ -152,6 +185,16 @@ GET  /api/jobs/{id} ->  { state: "done", result }
 So a platform's request timeout applies only to the upload itself and to each
 poll, never to the analysis. This is also why a redeploy mid-analysis is a
 recoverable, explained event rather than a hung browser.
+
+**The health check has to stay cheap for this to hold.** Render restarts an
+instance whose health check fails, and a restart mid-job kills the job. The work
+runs in a thread inside the same process, so while a CAD parse holds several
+gigabytes, anything expensive in `/health` competes with it. `/health` therefore
+opens no drawing and — after the first call — spawns no subprocess: the
+converter's version is memoised against the binary's size and modification time,
+rather than asked of `dwg2dxf --version` on every poll. On one CPU, a long job and
+a forking health check together are a plausible way to lose that job, and the
+symptom would look like an unexplained restart rather than a failure.
 
 ## Files and privacy
 

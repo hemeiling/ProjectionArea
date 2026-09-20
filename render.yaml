@@ -1,21 +1,38 @@
 # Render blueprint — the deployment described in the repository rather than in a
 # dashboard, so it can be reviewed, changed in a pull request and recreated.
 #
-# Apply by pointing Render at this file (Blueprints → New Blueprint Instance),
-# or keep an existing service and treat this as the reference for its settings.
+# Apply with Blueprints → New Blueprint Instance.
 #
-# See docs/DEPLOYMENT.md for what each choice is for, and for the plan sizing
-# evidence behind `plan` below.
+# ── This is a migration, not a fresh start ───────────────────────────────────
+#
+# A native-Python service `projection-area-analyzer` already exists in this
+# account, in Ohio, on 0.5 CPU / 512 MB, serving commit 82ad49f. It works for PDF
+# and DXF and reports `dwg: false`, because a native Python build cannot install
+# GNU LibreDWG.
+#
+# That service is the rollback and must keep running. So the name below is
+# deliberately `-docker` and deliberately NOT a near-miss of the existing name:
+# "projection-area-analyzer" and "projected-area-analyzer" differ by one word, and
+# a blueprint that adopted the wrong one would replace the thing it is meant to
+# fall back to. Nothing here can touch the existing service.
+#
+# Once the Docker service has been proven against the real drawings, renaming or
+# retiring the old one is a separate, deliberate decision.
+#
+# See docs/DEPLOYMENT.md for the sizing evidence behind `plan`.
 
 services:
   - type: web
-    name: projected-area-analyzer
+    # Temporary name, alongside the existing service rather than over it.
+    name: projection-area-analyzer-docker
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
     repo: https://github.com/hemeiling/ProjectionArea
     branch: main
-    region: oregon
+    # Same region as the service being migrated from, so a comparison between the
+    # two measures the runtime change and not the distance to Ohio.
+    region: ohio
 
     # Docker, not the native Python runtime: reading a DWG needs GNU LibreDWG,
     # which no Debian suite packages, so the converter is built into the image.
@@ -26,27 +43,29 @@ services:
     # catching, and it looks perfectly healthy from the outside otherwise.
     healthCheckPath: /health
 
-    # Sized from measurement, not from habit. Peak memory of the whole job —
-    # upload, convert, read, footprint candidates, area — for each production
-    # drawing, on a freshly started server so the figures do not carry each
-    # other's high-water marks:
+    # ── plan: start small, then measure ─────────────────────────────────────
+    #
+    # Peak memory of a whole job — upload, convert, read, footprint candidates,
+    # area — measured per production drawing on a freshly started server:
     #
     #     101 PDF  0.9 GB      103 DWG   6.7 GB
     #     102 PDF  2.6 GB      101 DWG   9.4 GB      102 DWG  11.7 GB
     #
-    # Free and Starter are both 512 MB, so neither can read *any* production
-    # drawing. 2c-16g (16 GB) is the smallest plan on which all five complete.
+    # This starts at 1c-2g (Standard, 2 GB) because the first question is whether
+    # the *image* works: does it boot, does /health report dwg: true, does the
+    # page load in both languages, does a PDF measure, does the progress bar move,
+    # does export work. All of that fits in 2 GB, and standing up 16 GB to find
+    # out the page renders would be a waste.
     #
-    # If DWG can wait, 2c-8g runs both PDFs and the 103 with margin and costs
-    # materially less — change this one line. On anything smaller a production
-    # drawing does not fail gracefully: the process is killed part way through.
-    # The application explains that (the bar keeps what it earned and the heading
-    # reads "Analysis interrupted") but cannot prevent it.
+    # 2 GB will NOT run a production DWG: the smallest needs 6.7 GB and the
+    # process is killed part way through. `dwg: true` from /health proves the
+    # converter is present in the image; proving a 97 MB drawing measures needs
+    # 2c-16g, which is a dashboard plan change on this service once the smoke test
+    # passes — no redeploy, and no reason to commit to that cost before then.
     #
-    # docs/DEPLOYMENT.md has the full table, and the two pieces of engineering
-    # that would bring this down — numpy-backed geometry, and not returning a
-    # 44 MB result in one response.
-    plan: 2c-16g
+    # Free and Starter (512 MB, which is what the existing service runs on) cannot
+    # process any production drawing at all.
+    plan: 1c-2g
 
     envVars:
       # Render sets PORT itself; the application reads it and binds 0.0.0.0.
