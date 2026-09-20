@@ -1451,14 +1451,14 @@ Or a whole set, with a comparison table and an overlay per page:
 Tests:
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 155 tests, ~40 s
+.venv/bin/python -m pytest tests -q      # 166 tests, ~49 s
 ```
 
 Seven of those drive the real page in Chromium — the demo click-through, the
 three footprint readings and the overlay switching between them, the layer
 toggles, Explain Calculation, and the refusal path. They try the bundled
 headless shell, then the bundled Chromium, then a system Chrome, and skip only if
-none exists. The other 147 run in about a second.
+none exists. The other 158 run in about a second.
 
 ---
 
@@ -1763,7 +1763,8 @@ Backend   FastAPI
 run.py      one-command launcher — serves viewer + API, pre-builds demos
 tools/      audit_overlay.py    headless overlay renderer, one page
             validate_drawings.py whole-set validation harness + report
-tests/      147 unit/integration + 8 browser tests
+            validate_cad.py      DXF validation + PDF cross-check
+tests/      158 unit/integration + 8 browser tests
 ```
 
 ### Why this stack
@@ -1967,6 +1968,30 @@ with evidence, and a test asserts the adapter assigns no semantic role at all.
 A `.dwg` is refused by signature with the instruction that actually helps — there
 is no pure-Python DWG reader, so export DXF from AutoCAD or convert with the ODA
 File Converter.
+
+### Validating a real DXF
+
+```bash
+.venv/bin/python -m tools.validate_cad Inputs --out-dir validation/cad
+.venv/bin/python -m tools.validate_cad line.dxf --pdf line.pdf --calibrate 75000
+```
+
+Writes `CAD_REPORT.md`: declared units, the layer/block/linetype inventory, which
+metadata axes actually **separate** the drawing, the footprint interpretations,
+a footprint **per layer**, the CAD↔PDF discrepancy, an overlay, and a verdict per
+reading saying what would be needed to confirm it.
+
+**Why per-layer measurement matters.** Measured as one mass, equipment drawn
+inside a site boundary is absorbed into that boundary's face — on the fixture the
+interior union collapses to 0.12 m² against a 72 m² boundary, and on the real
+GLTR-101 PDF to 1.6 m² against 773 m². Measured on its own layer, the same
+equipment reads 5.76 m². That gap is the whole argument for the CAD path, and it
+is asserted by a test.
+
+The harness names groups exactly as the file names them and stops there. A group
+called `FENCE` is reported as a group called `FENCE` with an area — never as a
+safety perimeter. Every per-group footprint stays `provisional`, and a test
+asserts nothing is ever promoted to `confirmed` without a person saying so.
 
 ## Known limitations
 
