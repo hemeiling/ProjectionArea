@@ -95,6 +95,7 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--no-reload", action="store_true", help="disable auto-restart")
     parser.add_argument("--no-demo", action="store_true", help="skip demo pre-generation")
     parser.add_argument("--open", action="store_true", help="open a browser window")
+    parser.add_argument("--no-open", action="store_true", help="never open a browser")
     args = parser.parse_args(argv)
 
     _check_imports()
@@ -117,12 +118,14 @@ def main(argv: "list[str] | None" = None) -> int:
         pass
 
     print()
-    print("  Projected Area Analyzer", f"· engine {engine}")
+    print("  Projected Area Analyzer is running", f"· engine {engine}")
     print("  " + "-" * 52)
-    print(f"  Open: {url}")
+    print()
+    print(f"  Open:  {url}")
+    print()
     print(f"  API docs: http://localhost:{port}/docs")
     if demo_count:
-        print(f"  {demo_count} demo drawings ready — click \"试用样例图纸\" to start")
+        print(f"  {demo_count} reference drawings ready on the landing screen")
     if port != args.port:
         print(f"  (port {args.port} was busy, using {port})")
     print("  Stop with Ctrl+C")

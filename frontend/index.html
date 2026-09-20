@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Projected Area Analyzer</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+
+<!-- ── landing ─────────────────────────────────────────────────────────── -->
+<main id="landing">
+  <div class="landing-inner">
+    <header class="brand">
+      <h1>Projected Area Analyzer</h1>
+      <p>Engineering drawing footprint analysis from PDF and CAD geometry</p>
+    </header>
+
+    <section id="dropzone" class="dropzone">
+      <h2>Drop engineering drawing here</h2>
+      <p class="formats">PDF · DXF · DWG</p>
+      <button class="primary" id="browseBtn">Browse Files</button>
+      <input type="file" id="fileInput" accept=".pdf,.dxf,.dwg,application/pdf" hidden>
+    </section>
+
+    <div id="uploadNotice"></div>
+
+    <section class="demo-row" id="demoRow">
+      <h3>Or analyse a reference drawing</h3>
+      <div class="demo-grid" id="demoGrid"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ── processing ──────────────────────────────────────────────────────── -->
+<main id="processing" class="hide" style="padding:40px 24px">
+  <header class="brand" style="margin-bottom:22px">
+    <h1 style="font-size:18px" id="procTitle">Processing drawing</h1>
+    <p class="mono" id="procFile" style="font-size:12px"></p>
+  </header>
+  <div class="timeline" id="timeline"></div>
+  <div id="procNotice"></div>
+  <div style="margin-top:16px; text-align:center">
+    <button class="ghost" id="procBack">Cancel and choose another file</button>
+  </div>
+</main>
+
+<!-- ── workspace ───────────────────────────────────────────────────────── -->
+<main id="workspace" class="hide">
+  <div class="topbar">
+    <span class="name">Projected Area Analyzer</span>
+    <span class="sep"></span>
+    <span class="file mono" id="wsFile"></span>
+    <span class="badge" id="wsKind">PDF</span>
+    <span class="spacer"></span>
+    <button class="ghost" id="newFileBtn">New drawing</button>
+    <button id="exportJsonBtn">Export JSON</button>
+    <button id="exportCsvBtn">Export CSV</button>
+  </div>
+
+  <div class="split">
+    <section class="viewer">
+      <div class="viewer-bar">
+        <button id="zoomOut" title="Zoom out">−</button>
+        <span class="zoom mono" id="zoomLabel">100%</span>
+        <button id="zoomIn" title="Zoom in">+</button>
+        <span class="sep"></span>
+        <button id="fitBtn">Fit</button>
+        <button id="oneToOne">100%</button>
+        <button id="resetView">Reset view</button>
+        <span class="sep"></span>
+        <button id="fullscreenBtn">Fullscreen</button>
+        <span class="hint hide" id="pickHint">Click two points on a known dimension</span>
+      </div>
+      <div class="canvas-wrap" id="canvasWrap">
+        <div class="sheet" id="sheet">
+          <canvas id="pageCanvas"></canvas>
+          <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+      </div>
+    </section>
+
+    <aside class="rail">
+      <div class="result-head">
+        <div class="cap">Measured footprint</div>
+        <div class="reading" id="rdName">—</div>
+        <div class="value mono" id="rdValue">—</div>
+        <div class="alt mono" id="rdAlt"></div>
+        <div class="badges" id="rdBadges"></div>
+        <p class="means" id="rdMeans"></p>
+      </div>
+
+      <div style="display:grid; grid-template-rows:auto 1fr; min-height:0">
+        <div class="tabs" id="tabs" role="tablist">
+          <button role="tab" data-tab="footprints" aria-selected="true">Footprints</button>
+          <button role="tab" data-tab="layers">Layers</button>
+          <button role="tab" data-tab="warnings">Warnings<span class="count hide" id="warnCount">0</span></button>
+          <button role="tab" data-tab="explain">Explain</button>
+          <button role="tab" data-tab="detail">Detail</button>
+        </div>
+
+        <div class="panes">
+          <div class="pane on" data-pane="footprints">
+            <div id="calibBlock"></div>
+            <h4>Available readings</h4>
+            <div class="fp-list" id="fpList"></div>
+            <h4>Requires CAD semantics</h4>
+            <div class="fp-list" id="fpPending"></div>
+            <h4>Overlay</h4>
+            <div class="layers" id="overlayLayers"></div>
+          </div>
+
+          <div class="pane" data-pane="layers">
+            <div id="layersPane"></div>
+          </div>
+
+          <div class="pane" data-pane="warnings">
+            <div id="warningsPane"></div>
+          </div>
+
+          <div class="pane" data-pane="explain">
+            <div class="flow" id="explainFlow"></div>
+          </div>
+
+          <div class="pane" data-pane="detail">
+            <div id="detailPane"></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

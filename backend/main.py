@@ -16,9 +16,10 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.api.routes import router
 from backend.config import ENGINE_VERSION
@@ -31,7 +32,11 @@ logging.basicConfig(
 logger = logging.getLogger("projected_area")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VIEWER_HTML = os.path.join(PROJECT_ROOT, "cad-area-meter.html")
+FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
+APP_HTML = os.path.join(FRONTEND_DIR, "index.html")
+#: The original planimeter. Its manual wand and polygon tools are the documented
+#: fallback for drawings the automatic path cannot handle, so it stays reachable.
+CLASSIC_HTML = os.path.join(PROJECT_ROOT, "cad-area-meter.html")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -80,9 +85,33 @@ async def log_stage_timing(request: Request, call_next: Callable) -> Any:
     return response
 
 
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
 @app.get("/", include_in_schema=False)
 def viewer() -> Any:
-    """Serve the drawing viewer."""
-    if not os.path.exists(VIEWER_HTML):
-        return JSONResponse({"error": f"Viewer not found at {VIEWER_HTML}"}, status_code=404)
-    return FileResponse(VIEWER_HTML, media_type="text/html")
+    """Serve the analysis application."""
+    if not os.path.exists(APP_HTML):
+        return JSONResponse({"error": f"Front end not found at {APP_HTML}"}, status_code=404)
+    return FileResponse(APP_HTML, media_type="text/html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Any:
+    """A tiny inline mark, so the browser stops asking for one."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+        '<rect width="16" height="16" fill="#1F6F63"/>'
+        '<rect x="3.5" y="4.5" width="9" height="7" fill="none" stroke="#fff"/>'
+        "</svg>"
+    )
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.get("/classic", include_in_schema=False)
+def classic_viewer() -> Any:
+    """The original planimeter, kept for its manual wand and polygon tools."""
+    if not os.path.exists(CLASSIC_HTML):
+        return JSONResponse({"error": "Classic viewer not found"}, status_code=404)
+    return FileResponse(CLASSIC_HTML, media_type="text/html")

@@ -1,4 +1,9 @@
-"""Browser smoke test for the viewer.
+"""Browser smoke test for the classic planimeter at /classic.
+
+The professional analysis UI lives at `/` and has its own suite in
+``tests/test_ui.py``. This file covers the original viewer, which is kept
+because its manual wand and polygon tools remain the documented fallback for
+drawings the automatic path cannot handle.
 
 CONSTITUTION.md §42: an API returning 200 is not "done" for a feature whose
 whole point is that a human can see what was measured. This drives the real
@@ -111,7 +116,7 @@ def test_viewer_measures_a_drawing_end_to_end(viewer_url, drawings):
             lambda m: errors.append(f"console.error: {m.text}") if m.type == "error" else None,
         )
 
-        page.goto(viewer_url)
+        page.goto(viewer_url + 'classic')
         page.wait_for_timeout(800)
         page.set_input_files("#file", truth["path"])
         page.wait_for_selector("#sheet", state="visible", timeout=20000)
@@ -158,7 +163,7 @@ def test_viewer_refuses_to_show_an_area_without_scale(viewer_url, drawings):
     with playwright_api.sync_playwright() as pw:
         browser = _launch(pw)
         page = browser.new_page(viewport={"width": 1500, "height": 940})
-        page.goto(viewer_url)
+        page.goto(viewer_url + 'classic')
         page.wait_for_timeout(800)
         page.set_input_files("#file", drawings["raster_plate"]["path"])
         page.wait_for_selector("#sheet", state="visible", timeout=20000)
@@ -184,7 +189,7 @@ def test_viewer_refuses_to_show_an_area_without_scale(viewer_url, drawings):
 
 def _open_demo(page, viewer_url, demo_id="plate_with_holes"):
     """Click the demo drawing through, exactly as a user would."""
-    page.goto(viewer_url)
+    page.goto(viewer_url + 'classic')
     page.wait_for_selector(f"#demoGrid button[data-demo={demo_id}]", timeout=30000)
     page.click(f"#demoGrid button[data-demo={demo_id}]")
     page.wait_for_selector("#srvResultSect", state="visible", timeout=90000)
@@ -210,7 +215,7 @@ def test_demo_drawing_runs_the_real_pipeline_from_one_click(viewer_url, drawings
         )
 
         # The landing page must offer the demo before anything is loaded.
-        page.goto(viewer_url)
+        page.goto(viewer_url + 'classic')
         page.wait_for_selector("#demoGrid button[data-demo]", timeout=30000)
         offered = page.eval_on_selector_all("#demoGrid button[data-demo]", "els => els.length")
         first_label = page.inner_text("#demoGrid button[data-demo]")

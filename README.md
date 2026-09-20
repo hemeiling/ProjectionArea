@@ -1423,13 +1423,19 @@ origin. It prints the URL it actually bound to:
 If 8000 is busy it moves to the next free port and says so. `--port`, `--open`,
 `--no-reload` and `--no-demo` are there if you want them.
 
-**No drawing to hand?** Click **试用样例图纸** on the landing page. The demo
+**No drawing to hand?** Pick a reference drawing on the landing screen. The demo
 drawings run through the *real* pipeline — generated server-side, ingested by the
 same store an upload uses, measured by the same geometry code. Nothing about a
 demo result is pre-computed, which is why the browser tests can check the numbers
 against analytically known areas.
 
-With your own file: **打开文件** → **分析图纸** → pick a view → read the result card.
+Drop a **PDF or DXF** on the landing screen and it processes straight through to
+the analysis workspace. A **DWG** is detected and explained — it is a valid file
+in a format that needs converting, not an error.
+
+The original planimeter, with its manual wand and polygon tools, is still served
+at **`/classic`**; it remains the fallback for drawings the automatic path cannot
+handle.
 
 > Always invoke tools as `.venv/bin/python -m <tool>`. The venv's console
 > scripts (`.venv/bin/uvicorn`, `.venv/bin/pytest`) hard-code the interpreter
@@ -1451,14 +1457,14 @@ Or a whole set, with a comparison table and an overlay per page:
 Tests:
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 166 tests, ~49 s
+.venv/bin/python -m pytest tests -q      # 178 tests, ~82 s
 ```
 
 Seven of those drive the real page in Chromium — the demo click-through, the
 three footprint readings and the overlay switching between them, the layer
 toggles, Explain Calculation, and the refusal path. They try the bundled
 headless shell, then the bundled Chromium, then a system Chrome, and skip only if
-none exists. The other 158 run in about a second.
+none exists. The other 160 run in about a second.
 
 ---
 
@@ -1760,11 +1766,12 @@ Backend   FastAPI
             pdf/space.py     canonical page space, /Rotate normalisation
             demo/            synthetic drawings + the demo catalogue
             cad/             DXF source adapter, provenance-preserving
-run.py      one-command launcher — serves viewer + API, pre-builds demos
+run.py      one-command launcher — serves the app + API, pre-builds demos
+frontend/   index.html · app.js · styles.css — the analysis UI
 tools/      audit_overlay.py    headless overlay renderer, one page
             validate_drawings.py whole-set validation harness + report
             validate_cad.py      DXF validation + PDF cross-check
-tests/      158 unit/integration + 8 browser tests
+tests/      160 unit/integration + 18 browser tests
 ```
 
 ### Why this stack
@@ -1880,7 +1887,34 @@ A file it cannot open is reported as **BLOCKED** with a reason and a suggested
 action; it never becomes a measured `0 mm²`. Pages that fail are isolated, so one
 bad page does not lose the rest of the set.
 
-### Using it in the browser
+### The analysis workspace
+
+`frontend/` is plain HTML, CSS and JavaScript served by the same FastAPI process
+— no build step, no second server. **Every number it shows comes from the
+backend**; the front end renders state and collects input, and never computes an
+area, a scale or a unit conversion of its own.
+
+- **Landing** — drop zone for PDF · DXF · DWG, plus reference drawings.
+- **Processing timeline** — six stages, each with its own state: completed,
+  warning, needs input, unsupported or failed. A missing scale reads *"Scale
+  requires confirmation"*, not *"Error"*.
+- **Workspace** — the drawing takes the space; a fixed rail carries the measured
+  footprint, and tabs for Footprints, Layers, Warnings, Explain and Detail.
+- **Viewer** — zoom, fit, 100 %, reset, fullscreen, pan, and twelve independent
+  overlay layers so nothing is rendered that you did not ask for.
+- **Calibration** — pick two points, state the distance, apply. The result is
+  badged **Operator calibrated**, never "verified", and the span stays on the
+  drawing in red with its length.
+- **Layers** — for a DXF, the layer and block tables with entity counts and
+  per-layer visibility. Names are shown exactly as the file records them.
+- **Explain** — the calculation path, built from backend evidence.
+- **Export** — JSON (full result) and CSV (one row per reading). The structure
+  leaves room for a formal PDF report later.
+
+Not built: the PDF ↔ DXF comparison panel. Both measurements have to exist before
+that number means anything, and no readable DXF exists yet.
+
+### Result card details
 
 The result card is built around the question *which* area you are being shown:
 
