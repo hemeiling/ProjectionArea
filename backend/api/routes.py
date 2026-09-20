@@ -7,16 +7,21 @@ engineering number, including the ones the user draws by hand.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from backend.api.schemas import AreaRequest, PolygonMeasureRequest, ScaleSpec
+from backend.api.schemas import (
+    AreaRequest, PolygonMeasureRequest, RenameRequest, SaveAnalysisRequest,
+    ScaleSpec,
+)
 from backend.area.projected import compute_projected_area
 from backend.calibration.scale import scale_from_ratio, scale_from_two_points
-from backend.config import ENGINE_VERSION
+from backend.config import ENGINE_VERSION, INTERPRETATION_VERSION
 from backend.cad.dwg import DwgConversionUnavailable, converter_status
 from backend.jobs import JOBS, advance
 from backend.progress import tracker_for
@@ -26,9 +31,12 @@ from backend.geometry.regions import detect_title_block_ambiguity
 from backend.models import BBox, GeometryRole, Region, Scale, ScaleSource, ViewSource
 from backend.pdf.document import document_summary
 from backend.pipeline import PreparedPage, region_scale
+from backend.db import config as db_config
 from backend.runtime import UPLOAD_CHUNK_BYTES, max_upload_bytes
 from backend.store import STORE
 from backend.units import Area, to_mm
+
+logger = logging.getLogger("projected_area.api")
 
 router = APIRouter(prefix="/api")
 
@@ -59,13 +67,29 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "engine_version": ENGINE_VERSION,
+        "interpretation_version": INTERPRETATION_VERSION,
         "pdf": True,
         "dxf": True,
         "dwg": bool(dwg["available"]),
         "dwg_converter": dwg.get("tool") if dwg["available"] else None,
         "dwg_converter_version": dwg.get("version") if dwg["available"] else None,
         "max_upload_mb": max_upload_bytes() // (1024 * 1024),
+        # Configured, and actually answering. Both are useful and they differ: a
+        # database that is set but unreachable is a different problem from one that
+        # was never configured. Neither reports a host, a user or a URL (§35) —
+        # a health endpoint is public, and a connection string is a credential.
+        "database": db_config.is_enabled(),
+        "persistence": _persistence_ready(),
     }
+
+
+def _persistence_ready() -> bool:
+    """Whether a result could actually be saved right now. Never raises."""
+    if not db_config.is_enabled():
+        return False
+    from backend.db import pool as db_pool
+
+    return db_pool.probe()
 
 
 @router.get("/capabilities")
@@ -136,11 +160,16 @@ def safe_file_name(raw: Optional[str]) -> str:
     return name[:120]
 
 
-async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int]:
+async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int, str]:
     """Stream an upload to a file in the store, enforcing the size limit.
 
-    Returns ``(path, head, size)``. The caller owns the file and must delete it
-    if it does not adopt it.
+    Returns ``(path, head, size, sha256)``. The caller owns the file and must
+    delete it if it does not adopt it.
+
+    The hash is computed from the same chunks already being written, so it costs
+    one pass over data that is being read anyway — not a second read of a 97 MB
+    drawing. It identifies the drawing for the analysis cache and is part of the
+    audit record.
 
     The limit is checked *while* reading rather than after, because checking
     afterwards means having already accepted the whole thing: on a small instance
@@ -154,6 +183,7 @@ async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int]
     path = STORE.spool_path(suffix)
     size = 0
     head = b""
+    digest = hashlib.sha256()
     try:
         with open(path, "wb") as handle:
             while True:
@@ -177,6 +207,7 @@ async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int]
                     )
                 if len(head) < HEAD_BYTES:
                     head += chunk[: HEAD_BYTES - len(head)]
+                digest.update(chunk)
                 handle.write(chunk)
     except BaseException:
         STORE.discard(path)
@@ -184,7 +215,7 @@ async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int]
     if size == 0:
         STORE.discard(path)
         raise HTTPException(status_code=400, detail="Empty upload")
-    return path, head, size
+    return path, head, size, digest.hexdigest()
 
 
 def _refuse_missing_dwg_support(head: bytes, signature: str) -> HTTPException:
@@ -242,7 +273,7 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     error: there is no pure-Python DWG reader, so it has to be exported to DXF.
     """
     file_name = safe_file_name(file.filename)
-    spooled, head, _size = await _spool_upload(file, ".upload")
+    spooled, head, size, source_sha256 = await _spool_upload(file, ".upload")
     kind = _detect_kind(head, file_name)
 
     if kind == "dwg" and not converter_status()["available"]:
@@ -307,16 +338,22 @@ def _ingest_dwg(job, spooled: str, file_name: str) -> Dict[str, Any]:
 
 
 @router.post("/analyse")
-async def analyse(file: UploadFile = File(...)) -> Any:
+async def analyse(file: UploadFile = File(...), reanalyse: bool = False) -> Any:
     """Ingest a drawing and measure it, reporting progress as it goes.
 
-    Always returns 202 with a job id. A production DWG takes minutes and a large
+    Normally returns 202 with a job id. A production DWG takes minutes and a large
     PDF tens of seconds, and there is no useful difference between "slow" and
     "hung" to someone staring at a spinner — so every source takes the same path
     and the client follows the real stages.
+
+    If this exact drawing has already been measured by this exact algorithm, the
+    saved analysis is **offered** instead, as 200 with ``cached``. It is never
+    substituted silently: reopening a previous result and running a new one are
+    different acts, and only the operator knows which they meant. ``reanalyse=true``
+    skips the offer.
     """
     file_name = safe_file_name(file.filename)
-    spooled, head, _size = await _spool_upload(file, ".upload")
+    spooled, head, size, source_sha256 = await _spool_upload(file, ".upload")
     kind = _detect_kind(head, file_name)
 
     if kind == "dwg" and not converter_status()["available"]:
@@ -326,14 +363,61 @@ async def analyse(file: UploadFile = File(...)) -> Any:
         STORE.discard(spooled)
         raise _refuse_unreadable(head)
 
+    if not reanalyse:
+        previous = _find_saved(source_sha256)
+        if previous is not None:
+            # The upload is discarded: measuring it again is exactly what this
+            # avoids, and keeping a customer's drawing on disk for an offer the
+            # operator may decline would be the wrong default (§35).
+            STORE.discard(spooled)
+            return JSONResponse(status_code=200, content={
+                "cached": previous.as_dict(),
+                "source_sha256": source_sha256,
+                "file_name": file_name,
+            })
+
     # The tracker exists before the worker does, so the worker never has to wait
     # for it and the first poll already has a plan to render.
     job = JOBS.start(
         file_name,
-        lambda j: _run_analysis(j, spooled, file_name, kind),
+        lambda j: _run_analysis(
+            j, spooled, file_name, kind,
+            source_sha256=source_sha256, source_size=size),
         tracker=tracker_for(kind),
     )
+    job.source_sha256 = source_sha256
+    job.source_size_bytes = size
     return JSONResponse(status_code=202, content=job.as_dict())
+
+
+def _repository():
+    """The analysis repository, or ``None`` when persistence is not configured.
+
+    Every caller treats ``None`` as "cannot save", never as an error: an engine
+    with nowhere to record a result still measures correctly, which is the whole
+    reason persistence is optional.
+    """
+    if not db_config.is_enabled():
+        return None
+    try:
+        from backend.db.analyses import AnalysisRepository
+
+        return AnalysisRepository()
+    except Exception as error:  # configuration problems must not break analysis
+        logger.warning("persistence unavailable: %s", type(error).__name__)
+        return None
+
+
+def _find_saved(source_sha256: str):
+    """A compatible saved analysis, or ``None``. Never raises."""
+    repository = _repository()
+    if repository is None:
+        return None
+    try:
+        return repository.find_compatible(source_sha256)
+    except Exception as error:
+        logger.warning("cache lookup failed: %s", type(error).__name__)
+        return None
 
 
 def _signature_of(path: str) -> Optional[str]:
@@ -344,12 +428,16 @@ def _signature_of(path: str) -> Optional[str]:
         return dwg_signature(handle.read(8))
 
 
-def _run_analysis(job, spooled: str, file_name: str, kind: str) -> Dict[str, Any]:
+def _run_analysis(
+    job, spooled: str, file_name: str, kind: str,
+    source_sha256: str = "", source_size: int = 0,
+) -> Dict[str, Any]:
     """Ingest, analyse and measure, driving the job's progress tracker.
 
-    Everything here is the ordinary pipeline. The only addition is that it says
-    where it has got to (§31) — no stage does different work because someone is
-    watching it.
+    Everything here is the ordinary pipeline. The only additions are that it says
+    where it has got to (§31), and that when it has finished it records the result
+    — no stage does different work because someone is watching it, and no number
+    changes because it was written down.
     """
     progress = job.tracker
 
@@ -359,16 +447,17 @@ def _run_analysis(job, spooled: str, file_name: str, kind: str) -> Dict[str, Any
         stored = STORE.adopt_dwg(
             spooled, file_name,
             on_stage=lambda stage, detail: advance(job, stage, detail),
-            progress=progress,
+            progress=progress, source_sha256=source_sha256,
         )
         summary = cad_document_summary(stored)
     elif kind == "dxf":
         progress.begin("geometry")
-        stored = STORE.adopt_cad(spooled, file_name, progress=progress)
+        stored = STORE.adopt_cad(
+            spooled, file_name, progress=progress, source_sha256=source_sha256)
         progress.finish("geometry", f"{len(stored.cad.primitives):,} primitives")
         summary = cad_document_summary(stored)
     else:
-        stored = STORE.adopt_pdf(spooled, file_name)
+        stored = STORE.adopt_pdf(spooled, file_name, source_sha256=source_sha256)
         progress.finish("loaded", f"{stored.doc.page_count} page(s)")
         summary = document_summary(stored.doc, stored.file_name)
 
@@ -425,12 +514,168 @@ def _run_analysis(job, spooled: str, file_name: str, kind: str) -> Dict[str, Any
     progress.finish("area", f"{result.geometry.component_count} components")
     progress.complete()
 
-    return {
+    payload = {
         "document": summary,
         "analysis": analysis,
         "area": result.as_dict(),
         "overlay": overlay,
     }
+
+    # Saving happens *after* the measurement is complete, from the finished
+    # payload, and cannot alter it. A failure to save is reported as a failure to
+    # save — the analysis it describes is exactly as correct either way.
+    saved = _autosave(payload, source_sha256, file_name, source_size,
+                      job.tracker.elapsed if job.tracker else None)
+    if saved:
+        payload["saved"] = saved
+    return payload
+
+
+def _autosave(
+    payload: Dict[str, Any], source_sha256: str, file_name: str,
+    source_size: int, analysis_seconds: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Record a finished analysis, or explain why it was not recorded.
+
+    Never raises: an eight-minute measurement must not be lost because a database
+    was briefly unreachable, and the operator can save again from the workspace.
+    """
+    if not source_sha256:
+        return None  # a demo drawing, or a path that did not stream an upload
+    repository = _repository()
+    if repository is None:
+        return {"stored": False, "reason": "persistence_disabled"}
+    try:
+        stored = repository.save(
+            payload, source_sha256=source_sha256, file_name=file_name,
+            source_size_bytes=source_size, analysis_seconds=analysis_seconds,
+        )
+        return {"stored": True, **stored}
+    except Exception as error:
+        logger.warning("could not save analysis: %s", type(error).__name__)
+        return {"stored": False, "reason": "save_failed",
+                "error_kind": type(error).__name__}
+
+
+# ── saved analyses ───────────────────────────────────────────────────────────
+
+
+def _require_repository():
+    """The repository, or a 503 that says persistence is off rather than broken."""
+    repository = _repository()
+    if repository is None:
+        raise HTTPException(status_code=503, detail={
+            "kind": "persistence_disabled",
+            "headline": "Saved analyses are not available on this instance.",
+            "reason": (
+                "No database is configured, so results are measured but not kept. "
+                "Everything else works exactly as it does with one."
+            ),
+            "fix": "Configure DATABASE_URL to enable saving and reopening.",
+        })
+    return repository
+
+
+@router.post("/analyses")
+def save_analysis(request: SaveAnalysisRequest) -> Dict[str, Any]:
+    """Save a finished job's result, for when the automatic save failed.
+
+    Takes a job id, not a result: the payload is read from the server's own copy of
+    what it measured. A browser may ask for something to be saved; it may not say
+    what the numbers were (§22).
+    """
+    repository = _require_repository()
+    try:
+        job = JOBS.get(request.job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail={
+            "kind": "job_lost",
+            "headline": "That analysis is no longer held in memory.",
+            "reason": (
+                "A result can only be saved while the job that produced it is still "
+                "in this process. The measurement itself was not affected."
+            ),
+            "fix": "Upload the drawing again to measure and save it.",
+        }) from None
+    if job.state != "done" or not job.result:
+        raise HTTPException(status_code=409, detail="That job has no finished result")
+
+    try:
+        stored = repository.save(
+            job.result,
+            source_sha256=job.source_sha256,
+            file_name=job.file_name,
+            source_size_bytes=job.source_size_bytes,
+            analysis_seconds=job.tracker.elapsed if job.tracker else None,
+        )
+    except Exception as error:
+        raise _persistence_failed(error) from None
+    return stored
+
+
+@router.get("/analyses")
+def list_analyses(limit: int = 20) -> Dict[str, Any]:
+    """Recent completed analyses, newest first. Summaries only — no geometry."""
+    repository = _require_repository()
+    try:
+        return {"analyses": [a.as_dict() for a in repository.recent(limit)]}
+    except Exception as error:
+        raise _persistence_failed(error) from None
+
+
+@router.get("/analyses/{analysis_id}")
+def open_analysis(analysis_id: str) -> Dict[str, Any]:
+    """Everything needed to restore a saved analysis, without recomputing it."""
+    repository = _require_repository()
+    try:
+        restored = repository.reopen(analysis_id)
+    except Exception as error:
+        raise _persistence_failed(error) from None
+    if restored is None:
+        raise HTTPException(status_code=404, detail={
+            "kind": "analysis_not_found",
+            "headline": "That saved analysis is no longer available.",
+            "reason": "It may have been deleted, or its stored result removed.",
+            "fix": "Upload the drawing again to measure it afresh.",
+        })
+    return restored
+
+
+@router.patch("/analyses/{analysis_id}")
+def rename_analysis(analysis_id: str, request: RenameRequest) -> Dict[str, Any]:
+    """Give a saved analysis an operator-chosen name."""
+    repository = _require_repository()
+    try:
+        summary = repository.rename(analysis_id, request.name)
+    except Exception as error:
+        raise _persistence_failed(error) from None
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Unknown analysis")
+    return {"analysis": summary.as_dict()}
+
+
+@router.delete("/analyses/{analysis_id}")
+def delete_analysis(analysis_id: str) -> Dict[str, Any]:
+    """Remove a saved analysis, its artifact and its audit trail."""
+    repository = _require_repository()
+    try:
+        removed = repository.delete(analysis_id)
+    except Exception as error:
+        raise _persistence_failed(error) from None
+    if not removed:
+        raise HTTPException(status_code=404, detail="Unknown analysis")
+    return {"deleted": analysis_id}
+
+
+def _persistence_failed(error: Exception) -> HTTPException:
+    """A 503 that names the failure kind and never the connection string."""
+    logger.warning("persistence operation failed: %s", type(error).__name__)
+    return HTTPException(status_code=503, detail={
+        "kind": "persistence_failed",
+        "headline": "The saved-analysis store could not be reached.",
+        "reason": f"The database did not respond ({type(error).__name__}).",
+        "fix": "The measurement itself is unaffected. Try again shortly.",
+    })
 
 
 @router.get("/jobs/{job_id}")
@@ -670,7 +915,79 @@ def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, 
         force_raster=request.force_raster,
         extra_warnings=scale_warnings,
     )
-    return result.as_dict()
+    body = result.as_dict()
+    if request.analysis_id:
+        saved = _persist_recalculation(
+            request.analysis_id, stored, body, operator_scale=request.scale.mode != "auto")
+        if saved is not None:
+            body = {**body, "saved": saved}
+    return body
+
+
+def _persist_recalculation(
+    analysis_id: str, stored, area_payload: Dict[str, Any], operator_scale: bool
+) -> Optional[Dict[str, Any]]:
+    """Make a recalculated result the saved state of its analysis.
+
+    Called after the measurement is complete and never able to change it. The new
+    result replaces the saved one — a refresh or a reopen then shows the calibration
+    the operator actually established — and the scale and area before and after are
+    kept in the audit trail, so the change stays explainable.
+
+    Refuses to write unless the document is provably the same drawing: a
+    calibration measured on one drawing must never land on another's record.
+    """
+    repository = _repository()
+    if repository is None:
+        return {"stored": False, "reason": "persistence_disabled"}
+    try:
+        summary = repository.get_summary(analysis_id)
+        if summary is None:
+            return {"stored": False, "reason": "analysis_not_found"}
+        if not stored.source_sha256 or stored.source_sha256 != summary.source_sha256:
+            return {"stored": False, "reason": "different_drawing"}
+
+        restored = repository.reopen(analysis_id)
+        if restored is None:
+            return {"stored": False, "reason": "analysis_not_found"}
+        payload = dict(restored["result"])
+        payload["area"] = _stamp_calibration(area_payload, operator_scale)
+
+        from backend.db.analyses import EVENT_RECALCULATED, EVENT_RECALIBRATED
+
+        updated = repository.update_result(
+            analysis_id, payload,
+            event=EVENT_RECALIBRATED if operator_scale else EVENT_RECALCULATED,
+        )
+        return {"stored": True, **updated}
+    except Exception as error:
+        logger.warning("could not save recalculation: %s", type(error).__name__)
+        return {"stored": False, "reason": "save_failed",
+                "error_kind": type(error).__name__}
+
+
+def _stamp_calibration(area_payload: Dict[str, Any], operator_scale: bool) -> Dict[str, Any]:
+    """The result with its calibration's provenance and time made explicit.
+
+    The engine records *what* the calibration was — two points, a length, a unit,
+    the resulting scale. For the audit record it also matters *who* established it
+    and *when*. Added around the engine's own record rather than into it: this is
+    bookkeeping, and the engine's model is not changed for it.
+    """
+    from datetime import datetime, timezone
+
+    area = dict(area_payload)
+    scale = dict(area.get("scale") or {})
+    calibration = scale.get("calibration")
+    if calibration is not None or operator_scale:
+        scale["calibration"] = {
+            **(calibration or {}),
+            "provenance": "operator_supplied" if operator_scale else scale.get("source"),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "resulting_mm_per_unit": scale.get("mm_per_unit"),
+        }
+    area["scale"] = scale
+    return area
 
 
 @router.post("/measure/polygon")

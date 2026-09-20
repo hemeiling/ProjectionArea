@@ -257,5 +257,21 @@
   "stageActive.regions": "Identifying drawing regions…",
   "stageActive.scale": "Evaluating scale and units…",
   "stageActive.candidates": "Creating footprint candidates…",
-  "stageActive.area": "Calculating area…"
+  "stageActive.area": "Calculating area…",
+  "recent.heading": "Recent analyses",
+  "recent.empty": "No saved analyses yet. A completed analysis is kept so you can reopen it without measuring again.",
+  "recent.open": "Open",
+  "recent.unverified": "Scale requires confirmation",
+  "ws.save": "Save analysis",
+  "ws.rename": "Rename",
+  "ws.saved": "Analysis saved",
+  "ws.saving": "Saving analysis…",
+  "ws.saveFailed": "Not saved — {reason}",
+  "ws.saveDisabled": "Not saved — this instance keeps no history",
+  "ws.renamePrompt": "Name for this analysis",
+  "cache.title": "This drawing has already been measured",
+  "cache.body": "An analysis of this exact file by this exact engine version was completed on {when}. Reopening it restores the result without measuring again.",
+  "cache.open": "Open previous analysis",
+  "cache.again": "Re-analyse anyway",
+  "saved.restored": "Reopened a saved analysis"
 }

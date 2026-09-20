@@ -36,6 +36,13 @@
       <h3 data-i18n="demo.heading">Or analyse a reference drawing</h3>
       <div class="demo-grid" id="demoGrid"></div>
     </section>
+
+    <!-- Saved analyses. Hidden entirely when persistence is not configured: an
+         empty panel that can never fill is worse than no panel. -->
+    <section class="recent-row hide" id="recentRow">
+      <h3 data-i18n="recent.heading">Recent analyses</h3>
+      <div class="recent-list" id="recentList"></div>
+    </section>
   </div>
 </main>
 
@@ -89,6 +96,9 @@
       <button type="button" data-lang="zh-CN" aria-pressed="false">中文</button>
     </div>
     <span class="sep"></span>
+    <span class="saved-state" id="savedState" hidden></span>
+    <button class="ghost hide" id="saveBtn" data-i18n="ws.save">Save analysis</button>
+    <button class="ghost hide" id="renameBtn" data-i18n="ws.rename">Rename</button>
     <button class="ghost" id="newFileBtn" data-i18n="ws.newDrawing">New drawing</button>
     <button id="exportJsonBtn" data-i18n="ws.exportJson">Export JSON</button>
     <button id="exportCsvBtn" data-i18n="ws.exportCsv">Export CSV</button>

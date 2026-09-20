@@ -48,6 +48,10 @@ class StoredDocument:
     #: Set when the source was a DWG converted locally to DXF. The source stays
     #: a DWG — this records how it got here, not what it became.
     conversion: Any = None
+    #: SHA-256 of the uploaded bytes, when known. Ties a later recalculation to the
+    #: saved analysis of *this* drawing, so a calibration cannot be written onto
+    #: the record of a different one.
+    source_sha256: str = ""
 
     @property
     def kind(self) -> str:
@@ -149,7 +153,8 @@ class DocumentStore:
     # is the natural thing to have.
 
     def adopt_cad(
-        self, spooled: str, file_name: str, progress: Progress = NULL_PROGRESS
+        self, spooled: str, file_name: str, progress: Progress = NULL_PROGRESS,
+        source_sha256: str = "",
     ) -> StoredDocument:
         """Take over a spooled DXF and read it through the CAD adapter.
 
@@ -179,10 +184,12 @@ class DocumentStore:
         return self._register(StoredDocument(
             id=document_id, file_name=file_name, path=path, doc=None,
             created_at=now, last_used=now, cad=drawing,
+            source_sha256=source_sha256,
         ))
 
     def adopt_dwg(self, spooled: str, file_name: str, on_stage: Any = None,
-                  progress: Progress = NULL_PROGRESS) -> StoredDocument:
+                  progress: Progress = NULL_PROGRESS,
+                  source_sha256: str = "") -> StoredDocument:
         """Take over a spooled DWG, convert it locally, and read the result.
 
         Raises:
@@ -213,9 +220,12 @@ class DocumentStore:
         return self._register(StoredDocument(
             id=document_id, file_name=file_name, path=path, doc=None,
             created_at=now, last_used=now, cad=drawing, conversion=conversion,
+            source_sha256=source_sha256,
         ))
 
-    def adopt_pdf(self, spooled: str, file_name: str) -> StoredDocument:
+    def adopt_pdf(
+        self, spooled: str, file_name: str, source_sha256: str = ""
+    ) -> StoredDocument:
         """Take over a spooled PDF and open it.
 
         Raises:
@@ -235,7 +245,7 @@ class DocumentStore:
         now = time.time()
         return self._register(StoredDocument(
             id=document_id, file_name=file_name, path=path, doc=doc,
-            created_at=now, last_used=now,
+            created_at=now, last_used=now, source_sha256=source_sha256,
         ))
 
     def _spool_bytes(self, data: bytes, suffix: str) -> str:

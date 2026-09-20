@@ -44,6 +44,15 @@ class AreaRequest(BaseModel):
     """A projected-area calculation request."""
 
     region_id: Optional[str] = Field(default=None, description="Detected region to measure")
+    analysis_id: Optional[str] = Field(
+        default=None, max_length=64,
+        description=(
+            "The saved analysis this recalculation belongs to. When given, the new "
+            "result — including any calibration — replaces the saved state, and what "
+            "changed is kept in the audit trail. Only honoured when the document is "
+            "the same drawing the analysis was made from."
+        ),
+    )
     region_bbox: Optional[BBoxIn] = Field(default=None, description="Explicit region, overrides region_id")
     scale: ScaleSpec = Field(default_factory=ScaleSpec)
     subtract_holes: bool = True
@@ -86,3 +95,26 @@ class PolygonMeasureRequest(BaseModel):
     subtract: List[List[List[float]]] = Field(default_factory=list)
     scale: ScaleSpec = Field(default_factory=ScaleSpec)
     output_unit: str = Field(default="mm2", description=f"One of {sorted(AREA_TO_MM2)}")
+
+
+class RenameRequest(BaseModel):
+    """A new operator-chosen name for a saved analysis.
+
+    The original filename is kept separately and never overwritten: it is part of
+    the audit record of what was measured (§24).
+    """
+
+    name: str = Field(
+        default="", max_length=200,
+        description="Display name. Empty clears it and the filename shows again.",
+    )
+
+
+class SaveAnalysisRequest(BaseModel):
+    """Which finished job to record.
+
+    A job id rather than a payload: the result is taken from what the server
+    measured, never from what a client says it measured (§22).
+    """
+
+    job_id: str = Field(min_length=1, max_length=64)

@@ -397,3 +397,40 @@ table.grid td .sw { display: inline-block; width: 9px; height: 9px; border-radiu
   background: var(--amber-soft); color: #6B4E14; font-size: 11.5px; border-radius: 3px;
 }
 .progress .failnote { color: var(--red); font-weight: 550; }
+
+/* ── saved analyses ───────────────────────────────────────────────────────── */
+
+.recent-row { margin-top: 26px; }
+.recent-row h3 {
+  margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--ink-2);
+}
+.recent-list { display: flex; flex-direction: column; gap: 8px; }
+.recent-item {
+  display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--surface); text-align: left; cursor: pointer;
+}
+.recent-item:hover { border-color: var(--accent); }
+.recent-item .nm {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.recent-item .kind {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+  padding: 2px 6px; border-radius: 4px; background: var(--line); color: var(--ink-2);
+}
+.recent-item .area { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.recent-item .when { font-size: 11.5px; color: var(--ink-3); }
+.recent-item .note { font-size: 11.5px; color: var(--amber-ink, var(--ink-3)); }
+.recent-item .open { font-size: 12px; color: var(--accent); font-weight: 600; }
+.recent-empty { font-size: 12.5px; color: var(--ink-3); }
+
+/* The save indicator sits in the workspace bar and says what is true: saved,
+ * saving, or not saved and why. Never "saved" unless the server said so. */
+.saved-state { font-size: 11.5px; color: var(--ink-3); }
+.saved-state[data-state="saved"] { color: var(--accent); }
+.saved-state[data-state="failed"] { color: var(--red); }
+
+/* The cached-analysis offer: two explicit choices, never a silent substitution. */
+.cache-offer { display: flex; flex-direction: column; gap: 8px; }
+.cache-offer .row { display: flex; gap: 8px; flex-wrap: wrap; }

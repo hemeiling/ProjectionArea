@@ -46,6 +46,11 @@ class Job:
     #: Progress reporting for this job, when the work is instrumented.
     #: Set when the work has a stage plan; drives the progress bar.
     tracker: Optional[ProgressTracker] = None
+    #: Identity of what was uploaded. Kept so a save can be retried from the
+    #: server's own copy of the result rather than from numbers a browser sends
+    #: back (§22: the backend is authoritative for every engineering value).
+    source_sha256: str = ""
+    source_size_bytes: int = 0
     #: The stage that was in flight when the job failed, so the bar can keep the
     #: progress already earned and say where it stopped.
     failed_stage: Optional[str] = None

@@ -862,3 +862,143 @@ def test_the_drawing_extent_is_absent_when_there_is_no_geometry(viewer_url):
         )
         browser.close()
     assert extent is None
+
+
+# ── saved analyses ───────────────────────────────────────────────────────────
+
+
+def test_recent_analyses_are_hidden_when_this_instance_keeps_no_history(viewer_url):
+    """An empty panel that can never fill reads as "nothing saved" rather than
+    "saving is not available here"."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.wait_for_timeout(1200)
+        hidden = page.evaluate(
+            "() => document.getElementById('recentRow').classList.contains('hide')")
+        browser.close()
+    assert hidden
+
+
+def test_a_completed_analysis_says_it_was_not_saved_when_nothing_was(viewer_url, drawings):
+    """"Analysis saved" only when the server said it stored one."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["plate_with_holes"]["path"])
+        state = page.evaluate("""() => {
+            const el = document.getElementById('savedState');
+            return { hidden: el.hidden, state: el.dataset.state, text: el.textContent };
+        }""")
+        browser.close()
+    assert "saved" != state.get("state"), "claimed a save that did not happen"
+    assert not (state["text"] or "").startswith("Analysis saved")
+
+
+def test_a_previously_measured_drawing_is_offered_not_substituted(viewer_url, drawings):
+    """The server answers 200 with `cached`; the page must offer both choices and
+    start nothing on its own."""
+    cached = {
+        "cached": {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "file_name": "plate_with_holes.pdf", "name": "plate_with_holes.pdf",
+            "source_type": "pdf", "status": "completed",
+            "created_at": "2026-09-20T10:00:00+00:00",
+            "completed_at": "2026-09-20T10:00:05+00:00",
+            "scale_verified": True, "area_mm2": 23057.5, "area_m2": 0.023,
+        },
+        "source_sha256": "a" * 64,
+        "file_name": "plate_with_holes.pdf",
+    }
+    import json as _json
+
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        requests = []
+        page.on("request", lambda r: requests.append(r.url)
+                if "/api/analyse" in r.url else None)
+        page.route("**/api/analyse", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=_json.dumps(cached)))
+
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.set_input_files("#fileInput", drawings["plate_with_holes"]["path"])
+        page.wait_for_selector("#cacheOpenBtn", timeout=30000)
+
+        english = {
+            "title": page.inner_text("#uploadNotice h4"),
+            "open": page.inner_text("#cacheOpenBtn"),
+            "again": page.inner_text("#cacheAgainBtn"),
+            "landing": page.is_visible("#landing"),
+            "workspace": page.is_visible("#workspace"),
+        }
+        # Switching language re-renders the page's static text; the offer itself
+        # was written from the catalogue at the moment it appeared.
+        page.click('#landing [data-lang="zh-CN"]')
+        page.wait_for_timeout(700)
+        chinese_heading = page.inner_text("#dropzone h2")
+        browser.close()
+
+    assert english["title"] == "This drawing has already been measured"
+    assert english["open"] == "Open previous analysis"
+    assert english["again"] == "Re-analyse anyway"
+    assert english["landing"] and not english["workspace"], (
+        "nothing was substituted: the operator is still deciding")
+    assert len(requests) == 1, "no analysis was started behind the offer"
+    assert any("一" <= c <= "鿿" for c in chinese_heading)
+
+
+def test_re_analyse_anyway_asks_for_a_fresh_measurement(viewer_url, drawings):
+    import json as _json
+
+    cached = {"cached": {"id": "x", "file_name": "p.pdf", "source_type": "pdf",
+                         "created_at": "2026-09-20T10:00:00+00:00"},
+              "source_sha256": "a" * 64, "file_name": "p.pdf"}
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        seen = []
+
+        def handler(route):
+            seen.append(route.request.url)
+            if "reanalyse=true" in route.request.url:
+                route.continue_()
+            else:
+                route.fulfill(status=200, content_type="application/json",
+                              body=_json.dumps(cached))
+
+        page.route("**/api/analyse*", handler)
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.set_input_files("#fileInput", drawings["plate_with_holes"]["path"])
+        page.wait_for_selector("#cacheAgainBtn", timeout=30000)
+        page.click("#cacheAgainBtn")
+        page.wait_for_selector("#workspace:not(.hide)", timeout=120000)
+        browser.close()
+
+    assert len(seen) == 2
+    assert "reanalyse=true" not in seen[0]
+    assert "reanalyse=true" in seen[1], "the second request must ask to re-measure"
+
+
+def test_every_saved_analysis_string_exists_in_both_languages():
+    """Recent Analyses, Save Analysis, Analysis saved, Open, Open previous analysis,
+    Re-analyse anyway and rename — none may fall back to a bare key in Chinese."""
+    import json as _json
+    import os as _os
+
+    root = _os.path.join(_os.path.dirname(__file__), "..", "frontend", "i18n")
+    en = _json.load(open(_os.path.join(root, "en.json"), encoding="utf-8"))
+    zh = _json.load(open(_os.path.join(root, "zh-CN.json"), encoding="utf-8"))
+    for key in ("recent.heading", "recent.open", "recent.empty", "recent.unverified",
+                "ws.save", "ws.saved", "ws.saving", "ws.saveFailed",
+                "ws.saveDisabled", "ws.rename", "ws.renamePrompt",
+                "cache.title", "cache.body", "cache.open", "cache.again",
+                "saved.restored"):
+        assert en.get(key), f"{key} missing in English"
+        assert zh.get(key), f"{key} missing in Chinese"
+        assert zh[key] != en[key], f"{key} is untranslated"
+        assert any("一" <= c <= "鿿" for c in zh[key]), f"{key} has no Chinese"

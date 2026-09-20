@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.api.routes import health as api_health, router
 from backend.config import ENGINE_VERSION
+from backend.db import config as db_config
+from backend.db import pool as db_pool_module
 from backend.store import STORE
 
 logging.basicConfig(
@@ -40,13 +42,44 @@ CLASSIC_HTML = os.path.join(PROJECT_ROOT, "cad-area-meter.html")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Application lifespan: nothing to set up, everything to clean up.
+    """Prepare persistence if it is configured; clean up the store on the way out.
 
     Uploaded drawings are proprietary (§35), so the temporary store is emptied
-    when the process stops. The teardown sits after the ``yield``; the store is
-    created lazily on first upload, so there is no startup half.
+    when the process stops.
+
+    The startup half brings this application's own schema up to date. It is
+    deliberately not fatal: with no database the engine measures exactly as well,
+    and an instance that cannot reach one should serve drawings rather than refuse
+    to boot. Either way the state is stated in the log, so "why was nothing saved"
+    has an answer on the first line rather than after an investigation.
     """
+    db_config.load_local_env()
+    # Before anything connects: the driver logs its own connection failures, and
+    # those messages name the host.
+    db_pool_module.install_log_redaction()
+    settings = db_config.settings()
+    if settings.enabled:
+        try:
+            from backend.db.migrations import migrate
+
+            applied = migrate()
+            logger.info(
+                "%s%s", settings.summary,
+                f" · applied migrations {applied}" if applied else " · schema current",
+            )
+        except Exception as error:
+            # The type only: a driver error can carry the host and the user.
+            logger.error(
+                "persistence configured but unavailable (%s); "
+                "analyses will be measured but not saved", type(error).__name__,
+            )
+    else:
+        logger.info("%s", settings.summary)
     yield
+    if settings.enabled:
+        from backend.db import pool as db_pool
+
+        db_pool.close()
     STORE.shutdown()
 
 

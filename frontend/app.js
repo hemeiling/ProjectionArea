@@ -80,6 +80,7 @@ async function setLanguage(lang, { rerender = true } = {}) {
       renderTimeline(timelineFromJob(LAST_SNAP));
     }
     renderDemoList();
+    renderRecent();
   }
 }
 
@@ -98,6 +99,10 @@ const S = {
   },
   hiddenLayers: new Set(),
   capabilities: null, demos: null,
+  // Saved-analysis state. analysisId is set once a result has been
+  // recorded, which is what makes rename and re-save possible.
+  analysisId: null, savedAt: null, persistence: false, restored: false,
+  jobId: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -336,7 +341,7 @@ function timelineFromJob(snap) {
   return states;
 }
 
-async function handleFile(file) {
+async function handleFile(file, { reanalyse = false } = {}) {
   $("uploadNotice").innerHTML = "";
   show("processing");
   $("procFile").textContent = file.name;
@@ -357,7 +362,12 @@ async function handleFile(file) {
   try {
     const body = new FormData();
     body.append("file", file);
-    job = await call("/api/analyse", { method: "POST", body });
+    const path = reanalyse ? "/api/analyse?reanalyse=true" : "/api/analyse";
+    job = await call(path, { method: "POST", body });
+
+    /* 200 rather than 202: this drawing has been measured before by this engine,
+     * and the operator is offered the saved result instead of being given it. */
+    if (job && job.cached) { offerCachedAnalysis(job.cached, file); return; }
   } catch (err) {
     const d = err.detail;
     const missing = d?.kind === "dwg_component_missing";
@@ -445,6 +455,9 @@ async function handleFile(file) {
   S.analysis = payload.analysis;
   S.result = payload.area;
   S.ignored = (payload.overlay && payload.overlay.primitives) || [];
+  S.restored = false;
+  S.jobId = job.job_id;
+  adoptSaveOutcome(payload.saved);
 
   if (S.kind === "pdf") await renderPdf(file);
 
@@ -1009,11 +1022,20 @@ async function computeArea(opts = {}) {
   const region = S.analysis?.default_region_id;
   const body = { scale: S.scaleSpec };
   if (region) body.region_id = region;
-  S.result = await call(`/api/documents/${S.docId}/pages/${S.page}/area`, {
+  /* Naming the saved analysis makes this recalculation — a calibration, most
+   * often — its saved state, so a refresh or a reopen keeps it. The server only
+   * honours it when the document is the drawing the analysis was made from. */
+  if (S.analysisId && !S.restored) body.analysis_id = S.analysisId;
+  const result = await call(`/api/documents/${S.docId}/pages/${S.page}/area`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (result.saved) {
+    adoptSaveOutcome(result.saved.stored ? { stored: true, ...result.saved } : result.saved);
+    delete result.saved;
+  }
+  S.result = result;
   if (S.kind === "dxf" && !S.cadBox) {
     const b = S.result.region?.bbox || null;
     S.cadBox = b || null;
@@ -1334,6 +1356,8 @@ $("newFileBtn").onclick = () => {
   S.docId = null; S.result = null; S.analysis = null; S.cad = null; S.cadBox = null;
   S.picks = []; S.picking = false; show("landing");
 };
+$("saveBtn").onclick = saveAnalysisNow;
+$("renameBtn").onclick = renameAnalysis;
 $("exportJsonBtn").onclick = exportJson;
 $("exportCsvBtn").onclick = exportCsv;
 
@@ -1428,7 +1452,191 @@ function renderDemoList() {
   } catch (e) {
     $("demoRow").classList.add("hide");
   }
+
+  /* Whether this instance keeps history at all. The panel and the save indicator
+   * are hidden when it does not: an empty list that can never fill reads as
+   * "nothing saved" rather than "saving is not available here". */
+  try {
+    const health = await call("/health");
+    S.persistence = Boolean(health.persistence);
+  } catch (e) { S.persistence = false; }
+  await renderRecent();
 })();
+
+/* ── saved analyses ────────────────────────────────────────────────────────
+ *
+ * The server saves a finished analysis itself, so a closed tab does not lose the
+ * record. What the client does is report the outcome honestly: "Analysis saved"
+ * only when the server said it stored one, and otherwise why not. */
+
+function adoptSaveOutcome(saved) {
+  const el = $("savedState");
+  S.analysisId = null;
+  S.savedAt = null;
+  if (!saved) { el.hidden = true; $("saveBtn").classList.add("hide"); $("renameBtn").classList.add("hide"); return; }
+  el.hidden = false;
+  if (saved.stored && saved.analysis) {
+    S.analysisId = saved.analysis.id;
+    S.savedAt = saved.analysis.completed_at || saved.analysis.created_at;
+    el.dataset.state = "saved";
+    el.textContent = t("ws.saved");
+    $("saveBtn").classList.add("hide");
+    $("renameBtn").classList.remove("hide");
+    return;
+  }
+  el.dataset.state = "failed";
+  el.textContent = saved.reason === "persistence_disabled"
+    ? t("ws.saveDisabled")
+    : t("ws.saveFailed", { reason: saved.error_kind || saved.reason || "" });
+  // Offer a retry only where retrying could work.
+  $("saveBtn").classList.toggle("hide", saved.reason === "persistence_disabled");
+  $("renameBtn").classList.add("hide");
+}
+
+async function saveAnalysisNow() {
+  /* The server saves automatically; this is the retry for when that failed. It
+   * re-sends the result already in hand rather than re-measuring anything. */
+  const el = $("savedState");
+  el.hidden = false; el.dataset.state = ""; el.textContent = t("ws.saving");
+  try {
+    /* The job id, not the numbers: the server saves what it measured. */
+    const body = JSON.stringify({ job_id: S.jobId });
+    const saved = await call("/api/analyses", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body });
+    adoptSaveOutcome({ stored: true, ...saved });
+    renderRecent();
+  } catch (err) {
+    adoptSaveOutcome({ stored: false, error_kind: err.message });
+  }
+}
+
+async function renameAnalysis() {
+  if (!S.analysisId) return;
+  const current = S.fileName || "";
+  const name = window.prompt(t("ws.renamePrompt"), current);
+  if (name === null) return;
+  try {
+    await call(`/api/analyses/${S.analysisId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    renderRecent();
+  } catch (err) { /* the indicator already shows the saved state */ }
+}
+
+function recentItem(a) {
+  const when = a.completed_at || a.created_at || "";
+  const date = when ? new Date(when).toLocaleDateString(
+    LANG === "zh-CN" ? "zh-CN" : "en-GB",
+    { year: "numeric", month: "short", day: "numeric" }) : "";
+  const area = a.area_mm2 != null
+    ? `${num(a.area_m2 != null ? a.area_m2 : a.area_mm2 / 1e6, 2)} m²`
+    : "";
+  const note = a.scale_verified ? "" : t("recent.unverified");
+  return `<button class="recent-item" data-analysis="${esc(a.id)}">
+    <span class="nm">${esc(a.name || a.file_name)}</span>
+    <span class="kind">${esc((a.source_type || "").toUpperCase())}</span>
+    <span class="area">${esc(area)}</span>
+    <span class="note">${esc(note)}</span>
+    <span class="when">${esc(date)}</span>
+    <span class="open">${esc(t("recent.open"))}</span>
+  </button>`;
+}
+
+async function renderRecent() {
+  const row = $("recentRow");
+  if (!S.persistence) { row.classList.add("hide"); return; }
+  try {
+    const { analyses } = await call("/api/analyses?limit=8");
+    row.classList.remove("hide");
+    $("recentList").innerHTML = analyses.length
+      ? analyses.map(recentItem).join("")
+      : `<p class="recent-empty">${esc(t("recent.empty"))}</p>`;
+    for (const btn of $("recentList").querySelectorAll("[data-analysis]")) {
+      btn.onclick = () => openSavedAnalysis(btn.dataset.analysis);
+    }
+  } catch (err) {
+    // Persistence was advertised but is not answering. Say nothing rather than
+    // show an empty list that looks like "you have never saved anything".
+    row.classList.add("hide");
+  }
+}
+
+/* Restores a saved analysis without running the geometry pipeline again. */
+async function openSavedAnalysis(id) {
+  show("processing");
+  setProcTitle("proc.title");
+  $("procFile").textContent = "";
+  resetProgress();
+  try {
+    const restored = await call(`/api/analyses/${id}`);
+    const payload = restored.result;
+    const doc = payload.document;
+    S.docId = doc.document_id;
+    S.fileName = restored.analysis.name || doc.file_name;
+    S.kind = doc.source_kind || "pdf";
+    S.cad = doc.cad || null;
+    S.conversion = (doc.cad && doc.cad.conversion) || null;
+    S.page = doc.suggested_page || 1;
+    S.scaleSpec = { mode: "auto" };
+    S.fpType = null;
+    S.picks = [];
+    S.analysis = payload.analysis;
+    S.result = payload.area;
+    S.ignored = (payload.overlay && payload.overlay.primitives) || [];
+    S.analysisId = restored.analysis.id;
+    S.savedAt = restored.analysis.completed_at;
+    S.restored = true;
+
+    // A reopened analysis has no uploaded file behind it, so a PDF cannot be
+    // re-rendered from bytes. The geometry overlay is what was stored, and it is
+    // drawn the same way a CAD source is.
+    S.pdf = null; S.pdfPage = null;
+    renderProgress({ state: "done", progress: 1 });
+    show("workspace");
+    S.cadBox = cadExtent();
+    renderCad();
+    paintAll();
+    fitToWindow();
+    const el = $("savedState");
+    el.hidden = false; el.dataset.state = "saved"; el.textContent = t("saved.restored");
+    $("saveBtn").classList.add("hide");
+    $("renameBtn").classList.remove("hide");
+  } catch (err) {
+    setProcTitle("proc.titleUnreadable");
+    notice("procNotice", {
+      headline: err.detail?.headline || t("proc.failed"),
+      body: err.detail?.reason || err.message, fix: err.detail?.fix, kind: "error",
+    });
+  }
+}
+
+/* The offer shown when this exact drawing has already been measured by this
+ * exact engine. Two explicit choices; nothing is substituted silently. */
+function offerCachedAnalysis(cached, file) {
+  const when = cached.completed_at || cached.created_at;
+  const date = when ? new Date(when).toLocaleString(
+    LANG === "zh-CN" ? "zh-CN" : "en-GB") : "";
+  show("landing");
+  $("uploadNotice").innerHTML = `<div class="notice">
+      <h4>${esc(t("cache.title"))}</h4>
+      <p>${esc(t("cache.body", { when: date }))}</p>
+      <div class="cache-offer"><div class="row">
+        <button class="primary" id="cacheOpenBtn">${esc(t("cache.open"))}</button>
+        <button class="ghost" id="cacheAgainBtn">${esc(t("cache.again"))}</button>
+      </div></div>
+    </div>`;
+  $("cacheOpenBtn").onclick = () => {
+    $("uploadNotice").innerHTML = "";
+    openSavedAnalysis(cached.id);
+  };
+  $("cacheAgainBtn").onclick = () => {
+    $("uploadNotice").innerHTML = "";
+    handleFile(file, { reanalyse: true });
+  };
+}
+
 
 async function openDemo(id) {
   const doc = await call(`/api/demo/${id}`, { method: "POST" });

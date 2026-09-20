@@ -257,5 +257,21 @@
   "stageActive.regions": "正在识别图纸区域……",
   "stageActive.scale": "正在评估比例尺与单位……",
   "stageActive.candidates": "正在生成占地候选区域……",
-  "stageActive.area": "正在计算面积……"
+  "stageActive.area": "正在计算面积……",
+  "recent.heading": "最近的分析",
+  "recent.empty": "尚无已保存的分析。分析完成后会自动保存，无需重新计算即可打开。",
+  "recent.open": "打开",
+  "recent.unverified": "比例尺待确认",
+  "ws.save": "保存分析",
+  "ws.rename": "重命名",
+  "ws.saved": "分析已保存",
+  "ws.saving": "正在保存分析…",
+  "ws.saveFailed": "未保存 — {reason}",
+  "ws.saveDisabled": "未保存 — 本实例不保留历史记录",
+  "ws.renamePrompt": "为此分析命名",
+  "cache.title": "该图纸已经测量过",
+  "cache.body": "本文件在 {when} 已由相同版本的引擎完成分析。打开已有结果无需重新计算。",
+  "cache.open": "打开已有分析",
+  "cache.again": "仍然重新分析",
+  "saved.restored": "已打开保存的分析"
 }

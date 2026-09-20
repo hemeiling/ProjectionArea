@@ -13,6 +13,7 @@ diagonal with an absolute floor, via :meth:`Tolerances.for_page`.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, asdict
 from typing import Any, Dict
@@ -26,6 +27,13 @@ MM_PER_PDF_UNIT_AT_1_1 = MM_PER_INCH / PDF_UNITS_PER_INCH  # 0.3527777...
 
 #: Software version stamped into every result for reproducibility (§24).
 ENGINE_VERSION = "0.3.0"
+
+#: Version of what a measurement *means* — how footprint readings are derived,
+#: named and classified — as distinct from the geometry engine that computes them.
+#: Bumped when an interpretation changes, even if no geometry code moved, because a
+#: stored result produced under the old meaning is not interchangeable with a new
+#: one. Part of the cache key, so an incompatible saved analysis is never reused.
+INTERPRETATION_VERSION = "1.0.0"
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,28 @@ class SilhouetteSettings:
 
 TOLERANCES = Tolerances()
 REGIONS = RegionSettings()
+
+
+def config_fingerprint() -> str:
+    """A hash of every setting that materially changes a measurement.
+
+    ``ENGINE_VERSION`` moves when the code does, but a tolerance can change a
+    reconstructed contour without any version moving — a saved result from before
+    such a change is not comparable with one from after. Including this in the
+    cache key means a tolerance edit invalidates stored analyses rather than
+    silently making them look current (§3: never present a stale number as fresh).
+
+    Deliberately not a version string: nobody remembers to bump one.
+    """
+    import hashlib
+
+    material = {
+        "tolerances": asdict(TOLERANCES),
+        "regions": asdict(REGIONS),
+        "mm_per_pdf_unit": MM_PER_PDF_UNIT_AT_1_1,
+    }
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 CALIBRATION = CalibrationSettings()
 RASTER = RasterSettings()
 SILHOUETTE = SilhouetteSettings()

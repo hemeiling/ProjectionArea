@@ -19,3 +19,10 @@ numpy>=1.24
 opencv-python-headless>=4.9  # scan conversion and raster tracing only; never the GUI build
 pillow>=10.0
 ezdxf>=1.4                   # DXF reading, and DWG once converted
+
+# Persistence. Optional at runtime: with no DATABASE_URL the application runs and
+# simply cannot save. psycopg 3 rather than psycopg2 for its built-in pool and its
+# native support for setting a connection's search_path at connect time, which is
+# how this application guarantees it only ever writes to its own schema.
+psycopg[binary,pool]>=3.1
+python-dotenv>=1.0           # reads a local .env in development; no-op in production
