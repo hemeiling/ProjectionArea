@@ -187,13 +187,27 @@ async def _spool_upload(file: UploadFile, suffix: str) -> Tuple[str, bytes, int]
     return path, head, size
 
 
-def _refuse_missing_dwg_support(head: bytes) -> HTTPException:
-    """The 503 for a valid DWG in an environment that cannot convert one."""
+def _refuse_missing_dwg_support(head: bytes, signature: str) -> HTTPException:
+    """The 503 for a valid DWG in an environment that cannot convert one.
+
+    Carries a real progress snapshot, because one stage genuinely did happen: the
+    file was read far enough to confirm it is a DWG and which release wrote it.
+    Presenting that stage as failed would blame the signature for the converter's
+    absence, and the point of naming stages is to send the reader to the right
+    place (§31). The snapshot comes from the same tracker the job would have used,
+    so the weights live in one place.
+    """
     status = converter_status()
+    tracker = tracker_for("dwg")
+    tracker.begin("validated")
+    tracker.finish("validated", f"{signature} signature")
+    snapshot = tracker.snapshot()
+    snapshot["failed_stage"] = "converted"
+
     return HTTPException(status_code=503, detail={
         "kind": "dwg_component_missing",
         "headline": "DWG support requires the local CAD conversion component.",
-        "version": head[:6].decode("ascii", "replace"),
+        "version": signature,
         "reason": (
             "The drawing is a valid DWG. Reading one needs a converter, which is "
             "not available in this environment. Nothing is uploaded anywhere — the "
@@ -203,6 +217,7 @@ def _refuse_missing_dwg_support(head: bytes) -> HTTPException:
         "advice": status.get("advice"),
         "setup_command": status.get("setup_command", ""),
         "component": status["component"],
+        "progress": snapshot,
     })
 
 
@@ -232,7 +247,7 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
 
     if kind == "dwg" and not converter_status()["available"]:
         STORE.discard(spooled)
-        raise _refuse_missing_dwg_support(head)
+        raise _refuse_missing_dwg_support(head, head[:6].decode('ascii', 'replace'))
     if kind == "unknown":
         STORE.discard(spooled)
         raise _refuse_unreadable(head)
@@ -306,7 +321,7 @@ async def analyse(file: UploadFile = File(...)) -> Any:
 
     if kind == "dwg" and not converter_status()["available"]:
         STORE.discard(spooled)
-        raise _refuse_missing_dwg_support(head)
+        raise _refuse_missing_dwg_support(head, head[:6].decode('ascii', 'replace'))
     if kind == "unknown":
         STORE.discard(spooled)
         raise _refuse_unreadable(head)

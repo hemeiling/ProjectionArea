@@ -362,7 +362,18 @@ async function handleFile(file) {
     const d = err.detail;
     const missing = d?.kind === "dwg_component_missing";
     setProcTitle(missing ? "proc.titleDwgMissing" : "proc.titleUnreadable");
-    renderProgress({ state: "failed", progress: 0, failed_stage: STAGES[0][0] });
+    /* A refusal may still carry a real snapshot: a DWG whose signature was read
+     * and confirmed got through its first stage, and saying otherwise would blame
+     * the signature for the converter's absence. Where the server sends none —
+     * an unreadable file, where nothing was established — the bar stays at zero,
+     * which is the honest number. */
+    const snap = d?.progress;
+    renderProgress(snap
+      ? { ...snap, state: "failed" }
+      : { state: "failed", progress: 0, failed_stage: STAGES[0][0] });
+    renderTimeline(timelineFromJob(snap
+      ? { ...snap, state: "failed" }
+      : { stages: [], state: "failed", failed_stage: STAGES[0][0] }));
     notice("procNotice", {
       headline: d?.headline || err.message, body: d?.reason, fix: d?.fix,
       kind: missing ? "warn" : "error",

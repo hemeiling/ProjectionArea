@@ -8,8 +8,21 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.cad.dwg import find_converter
 from backend.main import app
 from backend.store import STORE
+
+#: Two tests below are about what happens *after* a DWG starts converting, so
+#: they need a converter to exist. Where one does not — a CI runner, a fresh
+#: clone before `tools/install_dwg_support.py` has been run — the correct
+#: behaviour is the 503 that
+#: :func:`test_dwg_support_when_the_component_is_missing_is_actionable` covers,
+#: and asserting a 202 there would be asserting the wrong thing rather than
+#: finding a bug.
+needs_converter = pytest.mark.skipif(
+    find_converter() is None,
+    reason="no local DWG converter; the missing-component path is tested separately",
+)
 
 
 @pytest.fixture(scope="module")
@@ -75,6 +88,7 @@ def test_capabilities_reports_which_formats_can_be_read(client):
         assert formats["dwg"]["advice"] in ("local_build", "deploy_image")
 
 
+@needs_converter
 def test_a_dwg_upload_is_accepted_as_a_job(client):
     """Converting a production DWG takes minutes, so the upload returns a job.
 
@@ -92,6 +106,7 @@ def test_a_dwg_upload_is_accepted_as_a_job(client):
     assert job["file_name"] == "line.dwg"
 
 
+@needs_converter
 def test_a_corrupt_dwg_fails_the_job_with_a_reason_not_a_crash(client):
     """A DWG signature with no DWG behind it is a conversion problem.
 

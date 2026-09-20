@@ -64,6 +64,13 @@ class StoredDocument:
             pass
 
 
+#: Prefix for every store directory, so orphans can be recognised.
+STORE_PREFIX = "projected-area-"
+
+#: Name of the marker naming the process that owns a store directory.
+OWNER_MARKER = ".owner-pid"
+
+
 class DocumentStore:
     """Thread-safe store of uploaded documents with TTL sweeping."""
 
@@ -71,11 +78,27 @@ class DocumentStore:
         self._ttl = ttl_seconds
         self._lock = threading.RLock()
         self._documents: Dict[str, StoredDocument] = {}
-        self._root = tempfile.mkdtemp(prefix="projected-area-")
+        self._root = tempfile.mkdtemp(prefix=STORE_PREFIX)
+        self._claim()
+        sweep_orphaned_stores()
 
     @property
     def root(self) -> str:
         return self._root
+
+    def _claim(self) -> None:
+        """Record which process owns this directory.
+
+        :meth:`shutdown` removes the directory on a normal stop, but a process
+        that is killed outright — ``SIGKILL``, an out-of-memory kill, a crash —
+        never runs it, and what it leaves behind is customer geometry (§35). The
+        marker lets the next start recognise that directory as abandoned.
+        """
+        try:
+            with open(os.path.join(self._root, OWNER_MARKER), "w") as handle:
+                handle.write(str(os.getpid()))
+        except OSError:
+            pass  # a store that cannot mark itself still works
 
     # ── spooling ────────────────────────────────────────────────────────────
     #
@@ -296,6 +319,58 @@ class DocumentStore:
         for document_id in ids:
             self.remove(document_id)
         shutil.rmtree(self._root, ignore_errors=True)
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Whether a process id is still running, without signalling it."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, and owned by someone else
+    except OSError:
+        return True  # unknown, so assume alive and leave it alone
+    return pid > 0
+
+
+def sweep_orphaned_stores() -> int:
+    """Delete store directories whose owning process is gone.
+
+    Uploaded drawings are proprietary, so a directory left by a killed process
+    is a privacy problem and not merely litter — and on a small instance being
+    killed part way through a large drawing is a *likely* ending, not an exotic
+    one. Called on startup, when whatever went wrong has already happened.
+
+    Deliberately conservative: a directory is removed only when it carries an
+    owner marker naming a process that no longer exists. A directory with no
+    marker, or one whose owner is alive, is left alone — deleting the files of a
+    running instance would be a far worse failure than leaving a stale folder.
+
+    Returns:
+        How many directories were removed.
+    """
+    parent = tempfile.gettempdir()
+    removed = 0
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(STORE_PREFIX):
+            continue
+        candidate = os.path.join(parent, name)
+        marker = os.path.join(candidate, OWNER_MARKER)
+        try:
+            with open(marker) as handle:
+                owner = int(handle.read().strip())
+        except (OSError, ValueError):
+            continue  # unmarked: not ours to judge
+        if _process_is_alive(owner):
+            continue
+        shutil.rmtree(candidate, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 STORE = DocumentStore()

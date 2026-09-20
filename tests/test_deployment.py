@@ -290,6 +290,52 @@ def test_a_real_upload_still_works_through_the_streamed_path(client, drawings):
     assert body["document_id"]
 
 
+# ── temporary directories ────────────────────────────────────────────────────
+
+
+def test_a_store_marks_the_process_that_owns_it():
+    from backend.store import OWNER_MARKER, DocumentStore
+
+    store = DocumentStore()
+    try:
+        marker = os.path.join(store.root, OWNER_MARKER)
+        assert os.path.exists(marker)
+        assert int(open(marker).read().strip()) == os.getpid()
+    finally:
+        store.shutdown()
+    assert not os.path.exists(store.root), "a normal stop removes the directory"
+
+
+def test_a_store_left_by_a_dead_process_is_swept(tmp_path, monkeypatch):
+    """A killed process never runs shutdown, and what it leaves is customer
+    geometry (§35). On a small instance being killed part way through a large
+    drawing is a likely ending, so the next start cleans up after it."""
+    import tempfile as tempfile_module
+
+    from backend.store import OWNER_MARKER, STORE_PREFIX, sweep_orphaned_stores
+
+    monkeypatch.setattr(tempfile_module, "gettempdir", lambda: str(tmp_path))
+
+    orphan = tmp_path / f"{STORE_PREFIX}dead"
+    orphan.mkdir()
+    (orphan / OWNER_MARKER).write_text("999999")   # a pid that cannot be running
+    (orphan / "abc123.dxf").write_text("proprietary geometry")
+
+    mine = tmp_path / f"{STORE_PREFIX}live"
+    mine.mkdir()
+    (mine / OWNER_MARKER).write_text(str(os.getpid()))
+    (mine / "def456.dxf").write_text("in use right now")
+
+    unmarked = tmp_path / f"{STORE_PREFIX}unmarked"
+    unmarked.mkdir()
+    (unmarked / "something.dxf").write_text("not ours to judge")
+
+    assert sweep_orphaned_stores() == 1
+    assert not orphan.exists(), "the abandoned drawing was not removed"
+    assert mine.exists(), "a running instance's files must never be deleted"
+    assert unmarked.exists(), "an unmarked directory is left alone"
+
+
 def test_uploads_are_never_left_in_the_store_after_removal(client, drawings):
     """§35: a drawing is deleted when asked, file and all."""
     from backend.store import STORE

@@ -47,10 +47,15 @@ jobs:
       - name: Install the test browser
         run: python -m playwright install --with-deps chromium
 
-      # No LibreDWG here on purpose. The DWG tests are written to skip when the
-      # converter is absent, and this job proves that they do — a suite that
-      # silently required a system CAD tool would fail for every new contributor.
-      # The image job below is what proves DWG support itself.
+      # No LibreDWG here on purpose, and this is not only a saving: a suite that
+      # quietly required a system CAD tool would fail for every new contributor
+      # before they had built one. The first run of this job found exactly that —
+      # four tests assumed a converter — so the two whose premise genuinely needs
+      # one now skip with a reason, and the rest assert the correct behaviour for
+      # an environment without it.
+      #
+      # Proving DWG support itself is the image job below, which is where the
+      # converter actually lives.
       - name: Run the suite
         run: python -m pytest -q
 
