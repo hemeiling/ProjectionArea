@@ -447,9 +447,14 @@ async function handleFile(file, { reanalyse = false } = {}) {
   }
 
   let snap = job;
+  /* The instance that holds this job. Jobs live in the memory of the process that
+   * started them, so if a later poll is answered by a different instance the page
+   * can say so from evidence, rather than guessing at a restart or at memory. */
+  let jobInstance = job.instance || null;
   try {
     while (true) {
       snap = await call(`/api/jobs/${job.job_id}`);
+      if (snap.instance && !jobInstance) jobInstance = snap.instance;
       if (snap.plan) {
         const plan = snap.plan.join(",");
         for (const [kind, stages] of Object.entries(STAGE_PLANS)) {
@@ -462,17 +467,31 @@ async function handleFile(file, { reanalyse = false } = {}) {
       await new Promise((resolve) => setTimeout(resolve, 700));
     }
   } catch (err) {
-    /* The bar keeps the progress it earned; only the reason changes. A job that
-     * has vanished is the visible symptom of the server process restarting — on
-     * a small instance, usually because a large drawing exhausted its memory —
-     * so that case is named rather than reported as a generic failure. */
+    /* The bar keeps the progress it earned; only the reason changes.
+     *
+     * An earlier version said a vanished job meant the server had restarted or run
+     * out of memory. On the hosted 102 run neither was true: a rolling deployment
+     * moved the poll to a new instance while the old one carried on measuring. So
+     * the message now says only what the evidence supports — which instance
+     * answered, compared with the one that started the job. */
     const lost = err.status === 404 || err.detail?.kind === "job_lost";
     renderProgress({ state: "failed", progress: PROGRESS.fraction, failed_stage: snap.stage });
-    if (lost) setProcTitle("proc.titleLost");
+    if (lost) {
+      const answering = err.detail && err.detail.instance;
+      const moved = Boolean(jobInstance && answering && answering !== jobInstance);
+      setProcTitle(moved ? "proc.titleMoved" : "proc.titleLost");
+      notice("procNotice", {
+        headline: t(moved ? "proc.movedHeadline" : "proc.lostHeadline"),
+        body: t(moved ? "proc.movedBody" : "proc.lostBody"),
+        fix: t("proc.lostFix"),
+        kind: moved ? "warn" : "error",
+      });
+      return;
+    }
     notice("procNotice", {
-      headline: lost ? t("proc.lostHeadline") : t("proc.failed"),
-      body: lost ? t("proc.lostBody") : err.message,
-      fix: lost ? t("proc.lostFix") : (err.detail && err.detail.fix),
+      headline: err.status === 0 ? t("err.networkHeadline") : t("proc.failed"),
+      body: err.message,
+      fix: err.detail && err.detail.fix,
       kind: "error",
     });
     return;

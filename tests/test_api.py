@@ -144,15 +144,23 @@ def test_a_corrupt_dwg_fails_the_job_with_a_reason_not_a_crash(client):
 
 
 def test_an_unknown_job_is_a_clear_404(client):
-    """An unknown job id is rarely a typo — jobs live in the process, so the
-    usual cause is that the process restarted under it. §31: say that, rather
-    than echoing the id back at a caller who already has it."""
+    """An unknown job id means this process has no record of it — and nothing more.
+
+    This test used to require the reason to mention a restart. On the hosted 102
+    run the job was alive on the old instance during a rolling deployment while the
+    new one answered 404; claiming a restart there was false. The response now
+    reports facts: which instance answered and how long it has been up.
+    """
     response = client.get("/api/jobs/nosuchjob")
     assert response.status_code == 404
     detail = response.json()["detail"]
     assert detail["kind"] == "job_lost"
     assert detail["headline"] and detail["reason"] and detail["fix"]
-    assert "restart" in detail["reason"]
+    assert detail["instance"], "which instance answered"
+    assert detail["instance_uptime_seconds"] >= 0
+    said = (detail["headline"] + " " + detail["reason"] + " " + detail["fix"]).lower()
+    for unsupported in ("restart", "memory", "oom", "too small"):
+        assert unsupported not in said, f"claims {unsupported!r} without evidence"
 
 
 def test_dwg_support_when_the_component_is_missing_is_actionable(client, monkeypatch):

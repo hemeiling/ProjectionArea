@@ -1329,7 +1329,10 @@ def test_a_dropped_connection_is_named_as_one(viewer_url):
     assert outcome["ok"] is False
     assert outcome["status"] == 0
     assert outcome["kind"] == "network"
-    assert "restart" in outcome["message"].lower() or "not respond" in outcome["message"].lower()
+    assert "interrupted" in outcome["message"].lower(), outcome["message"]
+    # A dropped connection has many causes; none of them is asserted.
+    for unsupported in ("restart", "memory", "small instance"):
+        assert unsupported not in outcome["message"].lower()
     assert "body stream already read" not in outcome["message"].lower()
 
 
@@ -1645,3 +1648,75 @@ def test_explain_and_export_carry_the_calibration(viewer_url, drawings):
     assert "operator" in warnings.lower() or "calibrat" in warnings.lower()
     assert "user_two_point_calibration" in exported
     assert f"{span:.4f}"[:6] in exported or "known_length" in exported
+
+
+# ── a job poll answered by a different instance ──────────────────────────────
+#
+# The hosted 102 run: 200 from the old instance until 03:54:35, 404 from the new
+# one at 03:54:36, while the old one kept measuring. The page used to say the server
+# had restarted and was too small; neither was true.
+
+
+def _poll_then_404(viewer_url, drawings, answering_instance):
+    """Let the first poll through, then answer every later one with a 404 from the
+    given instance (None: a 404 that names no instance)."""
+    import json as _json
+
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        polls = {"n": 0}
+
+        def handler(route):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                route.continue_()
+                return
+            detail = {"kind": "job_lost",
+                      "headline": "This server has no record of that analysis.",
+                      "reason": "held inside another instance", "fix": "upload again"}
+            if answering_instance is not None:
+                detail["instance"] = answering_instance
+                detail["instance_uptime_seconds"] = 4.2
+            route.fulfill(status=404, content_type="application/json",
+                          body=_json.dumps({"detail": detail}))
+
+        page.route("**/api/jobs/**", handler)
+        page.set_input_files("#fileInput", drawings["layout_1_100"]["path"])
+        page.wait_for_selector("#procNotice .notice", timeout=120000)
+        page.wait_for_timeout(300)
+        state = page.evaluate("""() => ({
+            title: document.getElementById('procTitle').textContent,
+            notice: document.getElementById('procNotice').innerText,
+            cls: document.getElementById('progressBlock').className,
+        })""")
+        browser.close()
+    return state
+
+
+def test_a_different_instance_answering_is_named_as_that(viewer_url, drawings):
+    state = _poll_then_404(viewer_url, drawings, answering_instance="0000000000")
+    assert "different server instance" in state["notice"].lower(), state["notice"]
+    assert "deployment" in state["notice"].lower()
+    assert "may still be finishing" in state["notice"].lower(), (
+        "the job may be alive elsewhere — the page must not declare it dead")
+
+
+def test_an_unexplained_404_claims_no_cause(viewer_url, drawings):
+    state = _poll_then_404(viewer_url, drawings, answering_instance=None)
+    assert "no record" in state["notice"].lower()
+    assert "cannot tell" in state["notice"].lower(), "says what it does not know"
+
+
+@pytest.mark.parametrize("answering", ["0000000000", None])
+def test_a_lost_job_message_never_asserts_memory_or_a_restart(
+    viewer_url, drawings, answering
+):
+    """Neither can be known from a 404. On the hosted 102 run both were false."""
+    state = _poll_then_404(viewer_url, drawings, answering_instance=answering)
+    said = (state["title"] + " " + state["notice"]).lower()
+    for unsupported in ("memory", "restart", "too small", "small instance", "oom"):
+        assert unsupported not in said, f"asserts {unsupported!r}: {said[:200]}"
+    assert "failed" in state["cls"], "the bar still keeps what it earned"

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.progress import ProgressTracker
+from backend.runtime import instance_token
 
 #: Finished jobs are kept this long so a slow client can still collect them.
 JOB_TTL_SECONDS = 1800
@@ -72,6 +73,10 @@ class Job:
             "error": self.error,
             "failed_stage": self.failed_stage,
             "elapsed_seconds": round(self.elapsed, 1),
+            # Which process holds this job. Jobs are process-local, so if a later
+            # poll is answered by a different instance, the client can say so from
+            # evidence instead of guessing why the job "disappeared".
+            "instance": instance_token(),
         }
         if self.tracker is not None:
             snapshot = self.tracker.snapshot()

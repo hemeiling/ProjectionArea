@@ -172,6 +172,69 @@ The migration runs the Docker service *alongside* it:
    production DWG cannot run at 2 GB; the smallest needs 6.7 GB.
 4. Only then decide whether the old service is renamed, repointed or retired.
 
+## Known limitation: in-memory jobs are not deployment-safe
+
+**An analysis is held in the memory of the instance that started it.** Nothing
+else knows it exists: not the database, not another instance, not a restarted copy
+of the same one.
+
+That was a deliberate choice for a single-user tool (a dictionary and a thread,
+§27), and it fails in a specific, now-observed way. The hosted 102 run, job
+`5edbc6630c474a8a`:
+
+```
+old instance …-ld89q   GET /api/jobs/5edbc…   200   through 03:54:35
+new instance …-nkzg8   GET /api/jobs/5edbc…   404   at      03:54:36
+old instance …-ld89q   still running CAD work after the 404
+```
+
+A rolling deployment started the new instance and moved traffic to it while the old
+one was mid-measurement. The job had not crashed or disappeared; the poll had simply
+reached a process that never heard of it. When the old instance is then retired, its
+work is lost with it.
+
+What follows from that:
+
+- **A deployment during an analysis loses the analysis.** The operator has to upload
+  again. On the largest drawings that is eight minutes of work.
+- **A job 404 cannot tell why.** It knows only that *this* instance has no record.
+  The message used to say the server had restarted or run out of memory; on the 102
+  run neither was true. It now reports what the evidence supports: every job
+  snapshot carries an opaque token for the instance holding it, a 404 reports the
+  token of the instance answering, and when they differ the page says a different
+  instance answered — which is what happens during a deployment — and that the work
+  may still be finishing elsewhere.
+- **More than one instance, or more than one worker, makes this constant** rather
+  than occasional: any poll can land on a process without the job. That is why the
+  service runs one instance with `WEB_CONCURRENCY=1`.
+
+### Operational guidance, until this is fixed
+
+Avoid deploying while an analysis is running. Render deploys `main` on every push,
+so on a busy day that means holding pushes, or turning auto-deploy off and deploying
+deliberately.
+
+### The fix, when it is worth building
+
+Two separate problems, and only the first is small:
+
+1. **Status that survives the process.** Keep job state in PostgreSQL — it is
+   already there — rather than in a dictionary: a `projection_area.jobs` row per job
+   holding the stage, progress snapshot, error and, when finished, the analysis id.
+   Any instance can then answer a poll. The worker also writes a **heartbeat**, which
+   turns "no record of this job" into evidence: *the worker last reported 40 s ago*
+   means interrupted; *2 s ago* means still running on another instance.
+2. **Work that survives the process.** Durable status does not make the measurement
+   itself survive: the work still lives in one process and dies with it. Surviving
+   that needs either a drain — the old instance finishes its jobs before exiting,
+   within the platform's shutdown grace period — or a queue with retry, where an
+   interrupted job is picked up again. The drain is the smaller step; the queue is
+   the roadmap's item 10.
+
+The child-process design recommended in `docs/INCIDENT_103_DWG_RESTART.md` fits
+either: the web process would own the job record, and the worker would own only the
+measurement.
+
 ## Long-running requests
 
 A DWG takes minutes. No request is held open for one:

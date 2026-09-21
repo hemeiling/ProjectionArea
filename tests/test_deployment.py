@@ -253,15 +253,19 @@ def test_an_unreadable_upload_is_refused_without_starting_a_job(client):
     assert response.json()["detail"]["kind"] == "unknown"
 
 
-def test_a_lost_job_explains_the_likely_cause(client):
-    """The usual reason a job id is unknown is that the process restarted —
-    on a small instance, because a large drawing exhausted its memory."""
+def test_a_lost_job_reports_facts_not_a_diagnosis(client):
+    """A 404 cannot know why this process has no record of a job. It used to guess
+    a restart or memory exhaustion; during a rolling deployment neither was true.
+    What it can report is which instance answered, which the client compares with
+    the instance that started the job."""
     response = client.get("/api/jobs/0123456789abcdef")
     assert response.status_code == 404
     detail = response.json()["detail"]
     assert detail["kind"] == "job_lost"
-    assert "memory" in detail["reason"]
     assert detail["fix"]
+    assert "deployment" in detail["reason"], "names the expected, benign case"
+    said = (detail["headline"] + " " + detail["reason"]).lower()
+    assert "memory" not in said and "restart" not in said
 
 
 def test_running_out_of_memory_is_reported_as_a_sizing_problem():
@@ -409,3 +413,35 @@ def test_health_never_spawns_a_subprocess_after_the_first_call(client, monkeypat
     for _ in range(10):
         assert client.get("/health").status_code == 200
     assert calls == [], f"/health spawned {len(calls)} subprocess(es)"
+
+
+# ── jobs are process-local, and the messages must not pretend otherwise ──────
+
+
+def test_every_job_snapshot_names_the_instance_that_holds_it(client, drawings):
+    """So a later poll answered by a different instance is recognisable as such."""
+    with open(drawings["plate_with_holes"]["path"], "rb") as handle:
+        blob = handle.read()
+    job = client.post(
+        "/api/analyse", files={"file": ("p.pdf", blob, "application/pdf")}).json()
+    assert job["instance"], "the 202 says which instance took the job"
+    polled = client.get(f"/api/jobs/{job['job_id']}").json()
+    assert polled["instance"] == job["instance"]
+
+
+def test_the_instance_token_reveals_no_host_detail():
+    """It is for telling instances apart, not for identifying the host (§35)."""
+    import platform
+
+    token = runtime.instance_token()
+    assert len(token) == 10 and all(c in "0123456789abcdef" for c in token)
+    assert platform.node().lower() not in token
+    assert token == runtime.instance_token(), "stable for the process's lifetime"
+
+
+def test_the_instance_token_follows_the_platform_instance_id(monkeypatch):
+    """Two Render instances must not share a token, even with equal PIDs."""
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "srv-abc-ld89q")
+    first = runtime.instance_token()
+    monkeypatch.setenv("RENDER_INSTANCE_ID", "srv-abc-nkzg8")
+    assert runtime.instance_token() != first

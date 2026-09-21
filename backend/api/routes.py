@@ -34,7 +34,9 @@ from backend.models import BBox, GeometryRole, Region, Scale, ScaleSource, ViewS
 from backend.pdf.document import document_summary
 from backend.pipeline import PreparedPage, region_scale
 from backend.db import config as db_config
-from backend.runtime import UPLOAD_CHUNK_BYTES, max_upload_bytes
+from backend.runtime import (
+    UPLOAD_CHUNK_BYTES, instance_token, instance_uptime_seconds, max_upload_bytes,
+)
 from backend.store import STORE
 from backend.units import Area, to_mm
 
@@ -731,25 +733,37 @@ async def job_status(job_id: str) -> Dict[str, Any]:
     the operator sees. It is an in-memory dictionary lookup — there is no reason
     for it to wait behind a threadpool that the analysis is starving.
 
-    A job the store has never heard of is usually not a typo. Jobs live in this
-    process, so the common cause is that the process is not the one that started
-    it: it was restarted, redeployed, or killed by the platform for exceeding its
-    memory while reading a large drawing. The 404 says so, because "unknown job"
-    on its own would send the reader looking for a bug in their request.
+    **A 404 here reports what this process knows, and nothing it does not.** Jobs
+    live in the memory of the process that started them, so an unknown id means
+    only that *this* process has no record. It does not mean the analysis stopped:
+    during a rolling deployment the hosted 102 run was still measuring on the old
+    instance while the new one answered 404. An earlier version of this message said
+    the process had restarted or run out of memory — neither was true, and neither
+    can be known from here.
+
+    What can be known is which instance answered and how long it has been up. The
+    client compares that with the instance that started the job, which turns "a
+    different server answered" into an observation rather than a guess.
     """
     try:
         return JOBS.get(job_id).as_dict()
     except KeyError:
         raise HTTPException(status_code=404, detail={
             "kind": "job_lost",
-            "headline": "That analysis is no longer running.",
+            "headline": "This server has no record of that analysis.",
             "reason": (
-                "Jobs are held in the server process, so this one is gone because "
-                "the process restarted — a redeploy, or the platform stopping it "
-                "for using more memory than the instance allows. Large drawings "
-                "need several gigabytes to read."
+                "Each analysis is held inside the server instance that started it. "
+                "This request reached an instance without that record. "
+                "That is expected during a deployment, when requests move to a new "
+                "instance while the old one may still be working. The analysis may "
+                "have finished, may still be running elsewhere, or may have been "
+                "interrupted — this instance cannot tell which."
             ),
-            "fix": "Upload the drawing again, or use an instance with more memory.",
+            "fix": "Upload the drawing again to start a fresh analysis on this instance.",
+            # Facts, not a diagnosis: which instance answered, and for how long it
+            # has been running. Opaque — a hash, never a host name (§35).
+            "instance": instance_token(),
+            "instance_uptime_seconds": instance_uptime_seconds(),
         }) from None
 
 

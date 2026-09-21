@@ -3,7 +3,8 @@
 Written for: whoever investigates the next hosted failure, or decides whether the
 CAD pipeline moves into a child process.
 
-**Status: cause narrowed, not yet confirmed from production logs.** The
+**Status: cause strongly indicated by hosted measurements; the platform's own event
+log is the remaining confirmation.** The
 instrumentation added for this incident is what confirms it. This records what is
 measured, what is inferred, and what the next hosted run will settle.
 
@@ -100,6 +101,40 @@ confirm or refute it:
 
 Not excluded: a native crash inside ezdxf's parse of LibreDWG output on Linux that
 does not occur on macOS. The table above tells it apart.
+
+## Update — the first clean hosted 102 run
+
+After `88b2b7f` fixed the converter-output decoding, the 102 DWG passed validation
+and conversion on the hosted instance and reached geometry extraction. Three facts
+from that run bear on this incident, and one of them corrects a tempting reading.
+
+**Its interruption at ~70 % was a rolling deployment, not a failure.** The old
+instance answered job polls with 200 through 03:54:35; the new instance answered 404
+at 03:54:36; the old one kept doing CAD work afterwards. The job was alive the whole
+time. That is a separate limitation — in-memory jobs are not deployment-safe — and is
+documented in `docs/DEPLOYMENT.md`. It is **not** evidence about the 103 restart, and
+should not be counted as a second instance of it.
+
+**Memory is adequate.** The container peaked at about **8.5 GB of 17.18 GB** on the
+largest production drawing. That settles the sizing question the 103 incident left
+open: 16 GB is enough, and the 103 restart was not the instance running out.
+
+**The event-loop starvation is real on the hosted instance, and larger than local.**
+
+| | Local, 12 cores | Hosted, 2 CPU |
+|---|---|---|
+| worst event-loop stall | 2.3 s | **6.9 s** |
+| slowest `/health` | 6.3 s | **≈ 20 s** |
+
+A health check that takes twenty seconds fails any reasonable health-check timeout.
+That does not prove the 103 restart was a health-check failure — the Render event log
+for 01:46:47 is still the direct evidence — but it moves the leading hypothesis from
+plausible to strongly supported: the instance has now been observed, on real hosted
+hardware, being unable to answer its own health check for twenty seconds while
+measuring a production drawing.
+
+It also confirms the scale factor assumed earlier: stalls on the hosted instance run
+about three times longer than on the development machine.
 
 ## A mistake made during this investigation
 

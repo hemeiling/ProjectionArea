@@ -17,6 +17,7 @@ cleanly with no configuration beyond ``PORT``.
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 #: Set by Render, Heroku, Fly and most other hosts. Absent locally, where
@@ -89,3 +90,47 @@ def is_managed_host() -> bool:
     It never changes what the engine computes.
     """
     return bool(os.environ.get(PORT_ENV, "").strip())
+
+
+# ── which process is answering ───────────────────────────────────────────────
+#
+# Jobs live in the memory of the process that started them. During a rolling
+# deployment the platform starts a new instance and moves traffic to it while the
+# old one is still working — and a job poll then lands on a process that has never
+# heard of the job. The hosted 102 run showed exactly this: 200 from the old
+# instance through 03:54:35, 404 from the new one at 03:54:36, while the old one
+# carried on measuring.
+#
+# The 404 cannot know *why* it has no record. What it can report is a fact: which
+# instance answered and how long it has been running. The client compares that
+# with the instance that started the job, and can then say "a different instance
+# answered" from evidence rather than guessing at restarts or memory.
+
+_STARTED_AT = time.time()
+
+
+def instance_token() -> str:
+    """An opaque identifier for this process, stable for its lifetime.
+
+    Derived from the platform's instance id where one exists, else the host name,
+    with the process id and start time mixed in so a restart on the same host is a
+    different instance. Hashed: it is for telling instances *apart*, and a host
+    name is infrastructure detail with no business in a browser (§35).
+    """
+    import hashlib
+    import platform
+
+    # platform.node() rather than socket.gethostname(): the same value, without
+    # importing the socket module into the backend — which the no-network guard
+    # rightly forbids, since it is the thing that proves a drawing has no way out.
+    raw = "|".join([
+        os.environ.get("RENDER_INSTANCE_ID", "") or platform.node(),
+        str(os.getpid()),
+        f"{_STARTED_AT:.6f}",
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def instance_uptime_seconds() -> float:
+    """How long this process has been running."""
+    return round(time.time() - _STARTED_AT, 1)
