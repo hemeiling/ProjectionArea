@@ -292,5 +292,11 @@
   "proc.titleMoved": "分析已无法追踪",
   "proc.movedHeadline": "响应来自另一个服务器实例。",
   "proc.movedBody": "该分析在另一个服务器实例上启动，而请求现在到达了新的实例 — 这在部署期间会发生。分析可能仍在原实例上完成，但本页面已无法继续追踪。",
-  "err.networkHeadline": "连接中断"
+  "err.networkHeadline": "连接中断",
+  "err.gatewayHeadline": "服务器未响应（HTTP {status}）。",
+  "err.gatewayBody": "托管平台返回了 HTTP {status}，而不是应用程序的回复。应用程序可能正在重启或无法响应；本页面无法判断是哪一种情况。",
+  "err.gatewayFix": "请稍候再试。如果有分析正在进行，请查看历史记录或重新上传图纸。",
+  "err.httpHeadline": "服务器返回错误（HTTP {status}）。",
+  "err.httpBody": "返回的内容无法被本页面读取，因此这里没有更多细节。",
+  "progress.queued": "正在等待前一个分析完成——每次只运行一个分析"
 }

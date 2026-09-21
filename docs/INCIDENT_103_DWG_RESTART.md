@@ -136,6 +136,47 @@ measuring a production drawing.
 It also confirms the scale factor assumed earlier: stalls on the hosted instance run
 about three times longer than on the development machine.
 
+## Update — hosted 102 on `7b2fbbc`: a restart with no deployment
+
+Job `33c2acbb0f5e4a69`. Job polls answered 200 while the run completed DWG
+validation, CAD conversion, geometry extraction, CAD units and layers/blocks, and
+reached footprint-candidate generation (~80 %). Then:
+
+```
+04:53:39   GET /api/jobs/…   502
+04:53:41   Render: instance restarted
+04:53:41   uvicorn started again
+```
+
+No deployment was in progress. Diagnostics immediately before:
+
+| | |
+|---|---|
+| memory limit | 17.18 GB |
+| container memory | ≈ 12.8–13.0 GB |
+| process peak RSS | ≈ 13.8 GB |
+| worst event-loop stall | **17.5 s** (earlier: 13.0, 10.4, 9.8, 13.8 s) |
+
+and the watchdog's own line: *HTTP, including the health check, was not served
+for that long.*
+
+**What this proves:** an instance restart during the analysis, and severe,
+repeated starvation of the web server by the analysis. **What it does not prove:**
+the restart's cause. A health check unanswered for 17.5 s fits; so does a brief
+memory spike above 17.18 GB between samples — the process was at ~13 GB entering
+the heaviest geometry stages, which locally reach several gigabytes more. This
+record does not claim either.
+
+**What was done about it:** the child-process architecture recommended below is
+now implemented (see `docs/DEPLOYMENT.md`, "Where the measurement runs"). It
+removes the starvation outright — the web server no longer shares an interpreter
+with the analysis — and it turns the open question into an observation: on the
+next hosted run, if the child dies, the parent records `SIGKILL` (with the last
+stage and memory against the limit), `SIGSEGV`, an exit status, or a timeout. If
+the *whole instance* still restarts, with the web process answering promptly up
+to that moment, that is itself evidence pointing at container memory rather than
+the health check.
+
 ## A mistake made during this investigation
 
 The first version of the instrumentation logged an `analysis.complete` line that
@@ -178,8 +219,8 @@ result with all instrumentation in place.
 
 ## Recommendation: the CAD pipeline belongs in a child process
 
-Not implemented, as agreed, until a hosted run confirms the cause. But the evidence
-already points one way.
+**Implemented after the hosted 102 restart on `7b2fbbc`** (see the update above).
+The reasoning that led to it is kept here as written.
 
 A separate process has its own interpreter and its own GIL. Nothing it does can
 stall the web server's event loop, so the health check and job polls stay fast

@@ -94,6 +94,14 @@ def _cgroup_memory() -> Dict[str, Optional[int]]:
     return {"container_used": None, "container_limit": None}
 
 
+def _safe_memory() -> Dict[str, Any]:
+    """:func:`memory`, or an empty snapshot if reading it fails. Never raises."""
+    try:
+        return memory()
+    except Exception:
+        return {}
+
+
 def memory() -> Dict[str, Any]:
     """A memory snapshot: this process, its children, and the container.
 
@@ -115,9 +123,9 @@ def memory() -> Dict[str, Any]:
         # keeping both makes a disagreement visible rather than silent.
         snapshot["peak_rss"] = status.get("VmHWM:", snapshot["peak_rss"])
     else:
-        # No /proc: the peak is all that is available without shelling out, and
-        # shelling out per stage on a busy box is not worth the child process.
-        snapshot["rss"] = None
+        # No /proc (macOS): the kernel's task counters give the current figure
+        # without shelling out, which on a busy box is not worth a child process.
+        snapshot["rss"] = current_rss()
         snapshot["vms"] = None
 
     snapshot.update(_cgroup_memory())
@@ -142,6 +150,14 @@ def format_memory(snapshot: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _log(level: int, message: str, name: str, snapshot: Dict[str, Any],
+         facts: Dict[str, Any]) -> None:
+    try:
+        logger.log(level, message, name, format_memory(snapshot), _facts(facts))
+    except Exception:  # a log line must not become the failure
+        pass
+
+
 @contextmanager
 def stage(name: str, **facts: Any) -> Iterator[Dict[str, Any]]:
     """Mark the start and end of an expensive stage, with its cost.
@@ -153,35 +169,93 @@ def stage(name: str, **facts: Any) -> Iterator[Dict[str, Any]]:
     Yields a dict the caller can add counts to; they are logged at the end, so
     "how many segments were we holding when it died" has an answer.
 
+    The stage's *own* peak comes from the sampler, not from the process peak: a
+    process high-water mark only ever rises, so after one expensive stage every
+    later stage would appear to cost as much. Each stage is also reported to the
+    registered reporter, which is how the numbers reach the job and the browser.
+
     Args:
         name: Stage identifier, matching the progress plan where there is one.
         **facts: Anything known up front — counts, sizes. Never drawing content.
     """
     facts_out: Dict[str, Any] = dict(facts)
     started = time.perf_counter()
-    before = memory()
-    logger.info("stage %s begin · %s%s", name, format_memory(before),
-                _facts(facts_out))
+    before = _safe_memory()
+    token = _sampler_open()
+    _log(logging.INFO, "stage %s begin · %s%s", name, before, facts_out)
+    _report(lambda: _stage_record(name, "running", 0.0, before, None, None, facts_out))
+
     try:
         yield facts_out
     except BaseException as error:
         elapsed = time.perf_counter() - started
-        after = memory()
+        after = _safe_memory()
+        peaks = _sampler_close(token)
         # The type, not the message: an exception from a CAD library can quote
         # file contents, and this line goes to a platform's log collector.
-        logger.error(
-            "stage %s FAILED after %.1fs · %s · %s%s",
-            name, elapsed, type(error).__name__, format_memory(after),
-            _facts(facts_out),
-        )
+        try:
+            logger.error(
+                "stage %s FAILED after %.1fs · %s · %s%s",
+                name, elapsed, type(error).__name__, format_memory(after),
+                _facts(facts_out),
+            )
+        except Exception:
+            pass
+        error_type = type(error).__name__
+        _report(lambda: {**_stage_record(name, "failed", elapsed, before, after, peaks, facts_out),
+                         "error_type": error_type})
         raise
     else:
         elapsed = time.perf_counter() - started
-        after = memory()
-        logger.info(
-            "stage %s end %.1fs · %s%s",
-            name, elapsed, format_memory(after), _facts(facts_out),
-        )
+        after = _safe_memory()
+        peaks = _sampler_close(token)
+        try:
+            logger.info(
+                "stage %s end %.1fs · %s%s%s",
+                name, elapsed, format_memory(after),
+                f" stage_peak={_mb(peaks.get('rss'))}" if peaks and peaks.get("rss") else "",
+                _facts(facts_out),
+            )
+        except Exception:
+            pass
+        _report(lambda: _stage_record(name, "done", elapsed, before, after, peaks, facts_out))
+
+
+def _stage_record(
+    name: str, state: str, elapsed: float, before: Dict[str, Any],
+    after: Optional[Dict[str, Any]], peaks: Optional[Dict[str, Optional[int]]],
+    facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """One stage's measurements, in the shape the job and the browser receive.
+
+    Numbers only. No PID, host name or path: this leaves the process (§35).
+    """
+    def rss(snapshot: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not snapshot:
+            return None
+        return snapshot.get("rss") or None
+
+    end = after or {}
+    stage_peak = (peaks or {}).get("rss")
+    # A stage too short for the sampler to have visited still has a true lower
+    # bound on its peak: the larger of its two ends.
+    ends = [v for v in (rss(before), rss(end)) if v]
+    if ends:
+        stage_peak = max([stage_peak or 0] + ends) or None
+    return {
+        "stage": name,
+        "state": state,
+        "elapsed_seconds": round(elapsed, 2),
+        "memory_start_bytes": rss(before),
+        "memory_end_bytes": rss(end) if after else None,
+        "memory_peak_bytes": stage_peak,
+        "container_memory_bytes": end.get("container_used") or before.get("container_used"),
+        "container_peak_bytes": (peaks or {}).get("container"),
+        "container_limit_bytes": end.get("container_limit") or before.get("container_limit"),
+        "process_peak_bytes": end.get("peak_rss") or before.get("peak_rss"),
+        "facts": {k: v for k, v in facts.items()
+                  if isinstance(v, (int, float, str)) and not isinstance(v, bool)},
+    }
 
 
 def _facts(facts: Dict[str, Any]) -> str:
@@ -233,6 +307,198 @@ def subprocess_outcome(name: str, returncode: int, seconds: float, **facts: Any)
             "subprocess %s exited %d after %.1fs · %s%s",
             name, returncode, seconds, format_memory(memory()), _facts(facts),
         )
+
+
+# ── current memory, cheaply, and per-stage peaks ─────────────────────────────
+#
+# A stage's peak is what it actually needed; the process's high-water mark is the
+# most any stage so far has needed. After `polygonize` reaches 6.7 GB every later
+# stage would read 6.7 GB from the high-water mark, which says nothing about them.
+# So a sampler reads current memory a few times a second while any stage is open,
+# and each stage keeps the largest value seen during its own lifetime.
+
+#: Seconds between samples. Reading two small /proc files costs microseconds;
+#: four a second is well below anything measurable against a minutes-long stage.
+SAMPLE_SECONDS = 0.25
+
+
+def _mach_rss() -> Optional[int]:
+    """Current resident size on macOS, from ``task_info``. ``None`` if unavailable."""
+    import ctypes
+
+    class TimeValue(ctypes.Structure):
+        _fields_ = [("seconds", ctypes.c_int), ("microseconds", ctypes.c_int)]
+
+    class MachTaskBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("virtual_size", ctypes.c_uint64), ("resident_size", ctypes.c_uint64),
+            ("resident_size_max", ctypes.c_uint64), ("user_time", TimeValue),
+            ("system_time", TimeValue), ("policy", ctypes.c_int),
+            ("suspend_count", ctypes.c_int),
+        ]
+
+    libc = ctypes.CDLL(None)
+    task = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+    info = MachTaskBasicInfo()
+    count = ctypes.c_uint(ctypes.sizeof(info) // 4)
+    MACH_TASK_BASIC_INFO = 20
+    if libc.task_info(task, MACH_TASK_BASIC_INFO, ctypes.byref(info), ctypes.byref(count)) != 0:
+        return None
+    return int(info.resident_size) or None
+
+
+_PAGE_SIZE: Optional[int] = None
+
+
+def current_rss() -> Optional[int]:
+    """This process's resident memory now, in bytes, or ``None``. Never raises."""
+    global _PAGE_SIZE
+    try:
+        if sys.platform.startswith("linux"):
+            if _PAGE_SIZE is None:
+                _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+            with open("/proc/self/statm", encoding="ascii") as handle:
+                return int(handle.read().split()[1]) * _PAGE_SIZE
+        if sys.platform == "darwin":
+            return _mach_rss()
+    except Exception:  # a measurement that fails is unavailable, never an error
+        return None
+    return None
+
+
+def ram_snapshot() -> Dict[str, Any]:
+    """What the operator sees as "RAM": the container where it is measurable.
+
+    ``scope`` says which: ``container`` is what the platform limits and kills on;
+    ``process`` is only this process's resident memory and must not be presented as
+    the container's. Values are ``None`` when unavailable, never estimated.
+    """
+    try:
+        container = _cgroup_memory()
+    except Exception:
+        container = {"container_used": None, "container_limit": None}
+    rss = current_rss()
+    if container.get("container_used"):
+        return {"scope": "container", "used_bytes": container["container_used"],
+                "limit_bytes": container.get("container_limit"), "process_bytes": rss}
+    return {"scope": "process", "used_bytes": rss, "limit_bytes": None, "process_bytes": rss}
+
+
+class MemorySampler:
+    """Samples memory on a daemon thread; keeps each open stage's maximum.
+
+    Runs only while at least one stage is open, plus whatever a listener asks for.
+    Every failure inside it is swallowed: it observes the analysis and must never
+    be able to stop it.
+    """
+
+    def __init__(self, interval: float = SAMPLE_SECONDS) -> None:
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._open: Dict[int, Dict[str, Optional[int]]] = {}
+        self._next = 0
+        self._thread: Optional[threading.Thread] = None
+        self._listener: Optional[Any] = None
+        self.peak_used: Optional[int] = None      # over the sampler's lifetime
+        self.last: Optional[Dict[str, Any]] = None
+
+    def open(self) -> int:
+        with self._lock:
+            self._next += 1
+            token = self._next
+            self._open[token] = {"rss": None, "container": None}
+        self._ensure_running()
+        self.sample()
+        return token
+
+    def close(self, token: int) -> Dict[str, Optional[int]]:
+        self.sample()
+        with self._lock:
+            return self._open.pop(token, {"rss": None, "container": None})
+
+    def listen(self, listener: Any) -> None:
+        """Call ``listener(snapshot)`` on every sample, and keep sampling."""
+        self._listener = listener
+        self._ensure_running()
+
+    def sample(self) -> Optional[Dict[str, Any]]:
+        try:
+            snap = ram_snapshot()
+            rss, used = snap.get("process_bytes"), snap.get("used_bytes")
+            with self._lock:
+                for peaks in self._open.values():
+                    if rss and (peaks["rss"] is None or rss > peaks["rss"]):
+                        peaks["rss"] = rss
+                    if snap["scope"] == "container" and used and (
+                            peaks["container"] is None or used > peaks["container"]):
+                        peaks["container"] = used
+                if used and (self.peak_used is None or used > self.peak_used):
+                    self.peak_used = used
+            snap["peak_bytes"] = self.peak_used
+            self.last = snap
+            if self._listener is not None:
+                self._listener(snap)
+            return snap
+        except Exception:
+            return None
+
+    def _ensure_running(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="pa-mem-sampler", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.interval)
+            with self._lock:
+                idle = not self._open
+            if idle and self._listener is None:
+                return
+            self.sample()
+
+
+SAMPLER = MemorySampler()
+
+
+def _sampler_open() -> Optional[int]:
+    try:
+        return SAMPLER.open()
+    except Exception:
+        return None
+
+
+def _sampler_close(token: Optional[int]) -> Optional[Dict[str, Optional[int]]]:
+    if token is None:
+        return None
+    try:
+        return SAMPLER.close(token)
+    except Exception:
+        return None
+
+
+# ── where stage records go ───────────────────────────────────────────────────
+#
+# In the analysis child, a reporter sends each record to the parent, which keeps it
+# on the job. Anywhere else there is none and records only reach the log.
+
+_reporter: Optional[Any] = None
+
+
+def set_reporter(reporter: Optional[Any]) -> None:
+    global _reporter
+    _reporter = reporter
+
+
+def _report(record: Any) -> None:
+    if _reporter is None:
+        return
+    try:
+        if callable(record):
+            record = record()
+        _reporter(record)
+    except Exception:  # a diagnostic must not become the failure
+        pass
 
 
 class EventLoopWatchdog:

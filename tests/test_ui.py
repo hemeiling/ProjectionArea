@@ -1274,8 +1274,9 @@ def _page(pw, viewer_url):
 
 
 def test_a_502_from_a_restarted_instance_surfaces_the_status(viewer_url):
-    """Render returns an HTML 502 when it restarts an instance under memory
-    pressure. That must reach the operator as a 502, not as a stream error."""
+    """The hosting proxy answers 502 with an HTML page when the instance cannot
+    answer. That must reach the operator as a 502 — never as a stream error, and
+    never as the proxy's markup."""
     with playwright_api.sync_playwright() as pw:
         browser, page = _page(pw, viewer_url)
         outcome = _drive_call(page, lambda route: route.fulfill(
@@ -1290,6 +1291,9 @@ def test_a_502_from_a_restarted_instance_surfaces_the_status(viewer_url):
         "the real failure was replaced by a stream error"
     )
     assert "502" in outcome["message"] or "bad gateway" in outcome["message"].lower()
+    assert "<" not in outcome["message"] and "<" not in outcome["detail"], (
+        "proxy HTML reached the message: " + outcome["message"])
+    assert outcome["kind"] == "gateway"
 
 
 def test_a_non_json_error_body_is_reported_not_swallowed(viewer_url):
@@ -1421,7 +1425,62 @@ def test_a_job_poll_that_fails_mid_analysis_keeps_the_progress_and_explains(
         "the stream error replaced the real one: " + state["notice"]
     )
     assert "failed" in state["cls"]
-    assert state["notice"].strip()
+    assert "HTTP 502" in state["notice"]
+    assert "<html" not in state["notice"].lower() and "502 Bad Gateway" not in state["notice"], (
+        "the proxy's HTML page was shown to the operator: " + state["notice"])
+    assert "restart" not in state["notice"].lower() or "cannot tell" in state["notice"].lower()
+
+
+def test_a_full_proxy_error_page_is_replaced_by_a_short_bilingual_message(
+    viewer_url, drawings
+):
+    """The hosted 502 showed the operator an entire <!DOCTYPE html> document."""
+    page_html = ("<!DOCTYPE html><html><head><title>502</title><style>body{}</style>"
+                 "</head><body><h1>Bad Gateway</h1><p>render</p></body></html>")
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        page.click('.langswitch [data-lang="zh-CN"] >> nth=0')
+        page.wait_for_timeout(600)
+        page.route("**/api/jobs/**", lambda route: route.fulfill(
+            status=502, content_type="text/html", body=page_html))
+        page.set_input_files("#fileInput", drawings["plate_with_holes"]["path"])
+        page.wait_for_selector("#procNotice .notice", timeout=60000)
+        notice = page.inner_text("#procNotice")
+        browser.close()
+
+    assert "DOCTYPE" not in notice and "<" not in notice, notice
+    assert "HTTP 502" in notice
+    assert any("一" <= c <= "鿿" for c in notice), "the message follows the language"
+
+
+def test_a_transient_502_during_polling_is_retried_not_fatal(viewer_url, drawings):
+    """One lost reply is not a lost analysis: two bad polls, then the job's real
+    answer, must end in the workspace."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+        polls = {"n": 0}
+
+        def handler(route):
+            polls["n"] += 1
+            if polls["n"] in (1, 2):
+                route.fulfill(status=502, content_type="text/html", body="<html>502</html>")
+            else:
+                route.continue_()
+
+        page.route("**/api/jobs/**", handler)
+        page.set_input_files("#fileInput", drawings["plate_with_holes"]["path"])
+        page.wait_for_selector("#workspace:not(.hide)", timeout=120000)
+        notice = page.inner_text("#procNotice")
+        browser.close()
+
+    assert polls["n"] >= 3
+    assert notice.strip() == ""
 
 
 def _calibrate_to_unit_scale(page):

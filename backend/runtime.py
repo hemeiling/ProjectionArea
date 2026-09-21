@@ -134,3 +134,47 @@ def instance_token() -> str:
 def instance_uptime_seconds() -> float:
     """How long this process has been running."""
     return round(time.time() - _STARTED_AT, 1)
+
+
+# ── the analysis child ───────────────────────────────────────────────────────
+#
+# See backend/analysis_host.py. These three settings are the whole of its
+# configuration, and every one has a default that is right on the hosted instance.
+
+#: ``process`` (default): every measurement runs in a supervised child process.
+#: ``inline``: in this process, on a thread — the pre-child behaviour, kept for
+#: tests that patch the pipeline and for a platform without child processes.
+ISOLATION_ENV = "ANALYSIS_ISOLATION"
+
+#: How long one command in the child may run before it is stopped. The slowest
+#: production drawing takes 7½ minutes locally and about three times that on two
+#: hosted CPUs, so an hour leaves room without letting a stuck child hold the slot
+#: for ever.
+TIMEOUT_ENV = "ANALYSIS_TIMEOUT_SECONDS"
+DEFAULT_ANALYSIS_TIMEOUT_SECONDS = 3600
+
+#: How many children may stay alive holding a measured drawing, so calibration can
+#: be applied to it. One on the hosted instance: a finished production DWG keeps
+#: gigabytes resident, and the next analysis needs the room more than an older
+#: drawing does. The finished host is retired *before* the next one starts.
+HOSTS_ENV = "MAX_DOCUMENT_HOSTS"
+DEFAULT_MAX_DOCUMENT_HOSTS = 1
+
+
+def analysis_isolation() -> str:
+    raw = os.environ.get(ISOLATION_ENV, "").strip().lower()
+    return "inline" if raw == "inline" else "process"
+
+
+def analysis_timeout_seconds() -> float:
+    raw = os.environ.get(TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_ANALYSIS_TIMEOUT_SECONDS)
+    return value if value > 0 else float(DEFAULT_ANALYSIS_TIMEOUT_SECONDS)
+
+
+def max_document_hosts() -> int:
+    raw = os.environ.get(HOSTS_ENV, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else DEFAULT_MAX_DOCUMENT_HOSTS

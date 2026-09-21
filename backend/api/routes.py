@@ -25,7 +25,7 @@ from backend.calibration.scale import scale_from_ratio, scale_from_two_points
 from backend import diagnostics
 from backend.config import ENGINE_VERSION, INTERPRETATION_VERSION
 from backend.cad.dwg import DwgConversionUnavailable, converter_status
-from backend.jobs import JOBS, advance
+from backend.jobs import JOBS, advance, sink_for
 from backend.progress import tracker_for
 from backend.demo.catalogue import CATALOGUE, BY_ID, ensure_drawing, ground_truth
 from backend.geometry.polygons import ring_to_polygon, union_polygons
@@ -37,8 +37,11 @@ from backend.db import config as db_config
 from backend.runtime import (
     UPLOAD_CHUNK_BYTES, instance_token, instance_uptime_seconds, max_upload_bytes,
 )
+from backend.config import DOCUMENT_TTL_SECONDS
 from backend.store import STORE
+from backend.supervisor import HOSTS
 from backend.units import Area, to_mm
+from backend import runtime
 
 logger = logging.getLogger("projected_area.api")
 
@@ -100,6 +103,10 @@ async def health() -> Dict[str, Any]:
         # question "is my password crossing the internet in clear text" deserves an
         # answer that does not require quoting the host it travels to.
         "database_tls": db_config.settings().tls,
+        # Where measurements run: "process" means in a supervised child, so a
+        # production DWG cannot stall this endpoint. No PID or host name (§35).
+        "analysis_isolation": runtime.analysis_isolation(),
+        "analysis_busy": HOSTS.busy(),
     }
 
 
@@ -303,12 +310,68 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
         STORE.discard(spooled)
         raise _refuse_unreadable(head)
 
+    HOSTS.sweep(DOCUMENT_TTL_SECONDS)
     if kind == "dwg":
         # Converting and parsing a production DWG takes minutes. Holding the
         # request open for that shows the user nothing; a job reports progress.
-        job = JOBS.start(file_name, lambda j: _ingest_dwg(j, spooled, file_name))
+        job = JOBS.start(file_name, lambda j: _run_ingest(j, spooled, file_name, kind))
         return JSONResponse(status_code=202, content=job.as_dict())
 
+    # Waiting on the analysis process blocks, so it happens on the threadpool:
+    # this handler is async, and the event loop is what answers /health.
+    from starlette.concurrency import run_in_threadpool
+
+    return await run_in_threadpool(_ingest_in_host, spooled, file_name, kind)
+
+
+def _ingest_in_host(spooled: str, file_name: str, kind: str) -> Dict[str, Any]:
+    from backend.supervisor import WorkerError, WorkerFailed
+
+    host = _acquire_host_or_503()
+    try:
+        summary = host.request("ingest", {"spooled": spooled, "file_name": file_name,
+                                          "kind": kind})
+    except WorkerError as error:
+        HOSTS.discard(host)
+        STORE.discard(spooled)
+        raise HTTPException(status_code=500, detail=error.described) from None
+    except WorkerFailed as error:
+        HOSTS.discard(host)
+        STORE.discard(spooled)
+        raise HTTPException(status_code=503, detail=error.outcome) from None
+    except BaseException:
+        HOSTS.discard(host)
+        STORE.discard(spooled)
+        raise
+    finally:
+        HOSTS.slot.release()
+    HOSTS.bind(summary["document_id"], host)
+    return summary
+
+
+def _acquire_host_or_503():
+    """The analysis slot and a fresh host, for a request that cannot wait."""
+    if not HOSTS.slot.acquire(timeout=5):
+        raise HTTPException(status_code=503, detail={
+            "kind": "analysis_busy",
+            "headline": "Another analysis is running.",
+            "reason": "This server measures one drawing at a time.",
+            "fix": "Try again when the current analysis has finished.",
+        })
+    try:
+        return HOSTS.create()
+    except BaseException:
+        HOSTS.slot.release()
+        raise
+
+
+def _ingest(spooled: str, file_name: str, kind: str, mark=None) -> Dict[str, Any]:
+    """Read an uploaded drawing into this process's store and describe it.
+
+    Runs where the document will live — in the analysis process, normally.
+    """
+    if kind == "dwg":
+        return _ingest_dwg(spooled, file_name, mark or (lambda stage, detail="": None))
     try:
         if kind == "dxf":
             stored = STORE.adopt_cad(spooled, file_name)
@@ -335,25 +398,29 @@ async def upload_document(file: UploadFile = File(...)) -> Dict[str, Any]:
     return summary
 
 
-def _ingest_dwg(job, spooled: str, file_name: str) -> Dict[str, Any]:
-    """Convert and read a spooled DWG, reporting each stage as it completes."""
-    from backend.cad.dwg import dwg_signature
+def _run_ingest(job, spooled: str, file_name: str, kind: str) -> Dict[str, Any]:
+    """The /documents DWG job: ingest in an analysis process, keep it there."""
+    summary, host = _run_in_host(job, "ingest", {
+        "spooled": spooled, "file_name": file_name, "kind": kind}, spooled)
+    job.document_id = summary["document_id"]
+    HOSTS.bind(summary["document_id"], host)
+    return summary
 
-    advance(job, "validated", f"{_signature_of(spooled) or 'DWG'} signature")
-    advance(job, "converting", "converting locally to DXF")
-    stored = STORE.adopt_dwg(
-        spooled, file_name, on_stage=lambda stage, detail: advance(job, stage, detail)
-    )
-    advance(job, "read", f"{len(stored.cad.primitives):,} primitives")
+
+def _ingest_dwg(spooled: str, file_name: str, mark) -> Dict[str, Any]:
+    """Convert and read a spooled DWG, reporting each stage as it completes."""
+    mark("validated", f"{_signature_of(spooled) or 'DWG'} signature")
+    mark("converting", "converting locally to DXF")
+    stored = STORE.adopt_dwg(spooled, file_name, on_stage=mark)
+    mark("read", f"{len(stored.cad.primitives):,} primitives")
 
     summary = cad_document_summary(stored)
     summary["document_id"] = stored.id
     summary["source_kind"] = "dwg"
-    job.document_id = stored.id
 
     layers = len([layer for layer in stored.cad.info.layers if layer.entity_count])
     blocks = len([b for b in stored.cad.info.blocks if b.insert_count])
-    advance(job, "analysed", f"{layers} layer(s), {blocks} block(s)")
+    mark("analysed", f"{layers} layer(s), {blocks} block(s)")
     return summary
 
 
@@ -396,6 +463,7 @@ async def analyse(file: UploadFile = File(...), reanalyse: bool = False) -> Any:
                 "file_name": file_name,
             })
 
+    HOSTS.sweep(DOCUMENT_TTL_SECONDS)
     # The tracker exists before the worker does, so the worker never has to wait
     # for it and the first poll already has a plan to render.
     job = JOBS.start(
@@ -448,18 +516,72 @@ def _signature_of(path: str) -> Optional[str]:
         return dwg_signature(handle.read(8))
 
 
+def _run_in_host(job, command: str, args: Dict[str, Any], spooled: str):
+    """Run ``command`` in a fresh analysis process, one analysis at a time.
+
+    The job reads as queued while it waits for the slot. Returns the value and the
+    host, which keeps the measured document for calibration and recalculation. A
+    host whose analysis failed holds nothing worth keeping and is retired.
+    """
+    job.queued = True
+    with HOSTS.slot:
+        job.queued = False
+        host = HOSTS.create()
+        try:
+            value = host.request(command, args, sink=sink_for(job))
+        except BaseException:
+            HOSTS.discard(host)
+            # The child may have died before adopting the upload; if so it is
+            # still in this process's spool, and it is a customer drawing (§35).
+            STORE.discard(spooled)
+            raise
+    return value, host
+
+
 def _run_analysis(
     job, spooled: str, file_name: str, kind: str,
     source_sha256: str = "", source_size: int = 0,
 ) -> Dict[str, Any]:
-    """Ingest, analyse and measure, driving the job's progress tracker.
+    """Measure an upload in an analysis process, then record the result here.
 
-    Everything here is the ordinary pipeline. The only additions are that it says
-    where it has got to (§31), and that when it has finished it records the result
-    — no stage does different work because someone is watching it, and no number
-    changes because it was written down.
+    The measurement itself is :func:`_compute_analysis`, run in the child. Saving
+    stays in this process, which owns the database connection: the child never
+    connects to it, and persistence cannot change a number it did not compute.
     """
-    progress = job.tracker
+    payload, host = _run_in_host(job, "analyse", {
+        "spooled": spooled, "file_name": file_name, "kind": kind,
+        "source_sha256": source_sha256, "source_size": source_size,
+    }, spooled)
+    document_id = payload["document"]["document_id"]
+    job.document_id = document_id
+    HOSTS.bind(document_id, host, source_sha256)
+
+    # Saving happens *after* the measurement is complete, from the finished
+    # payload, and cannot alter it. A failure to save is reported as a failure to
+    # save — the analysis it describes is exactly as correct either way.
+    saved = _autosave(payload, source_sha256, file_name, source_size,
+                      job.tracker.elapsed if job.tracker else None)
+    if saved:
+        payload["saved"] = saved
+    return payload
+
+
+def _compute_analysis(
+    spooled: str, file_name: str, kind: str,
+    source_sha256: str = "", source_size: int = 0,
+    progress=None, mark=None,
+) -> Dict[str, Any]:
+    """Ingest, analyse and measure, reporting progress as it goes.
+
+    Everything here is the ordinary pipeline. The only addition is that it says
+    where it has got to (§31) — no stage does different work because someone is
+    watching it. Runs in the analysis process; ``progress`` and ``mark`` carry its
+    reports back to the job.
+    """
+    from backend.progress import NULL_PROGRESS
+
+    progress = progress or NULL_PROGRESS
+    mark = mark or (lambda stage, detail="": None)
 
     # Every stage boundary is logged with the process's and the container's memory
     # either side of it, so a run that is killed leaves a record of which stage it
@@ -468,10 +590,9 @@ def _run_analysis(
 
     progress.begin("validated" if kind != "pdf" else "loaded")
     if kind == "dwg":
-        advance(job, "validated", f"{_signature_of(spooled) or 'DWG'} signature")
+        mark("validated", f"{_signature_of(spooled) or 'DWG'} signature")
         stored = STORE.adopt_dwg(
-            spooled, file_name,
-            on_stage=lambda stage, detail: advance(job, stage, detail),
+            spooled, file_name, on_stage=mark,
             progress=progress, source_sha256=source_sha256,
         )
         summary = cad_document_summary(stored)
@@ -488,7 +609,6 @@ def _run_analysis(
 
     summary["document_id"] = stored.id
     summary["source_kind"] = kind
-    job.document_id = stored.id
 
     if kind != "pdf":
         info = stored.cad.info
@@ -515,7 +635,7 @@ def _run_analysis(
             if prepared.auto_scale and prepared.auto_scale.verified
             else "not established"))
 
-    analysis = analyze(stored.id, page_number)
+    analysis = _analyze_local(stored.id, page_number)
 
     try:
         diagnostics.note("stage.candidates.begin", primitives=(
@@ -541,7 +661,7 @@ def _run_analysis(
 
     progress.begin("area")
     roles = "dimension,annotation,centerline,hidden,sheet,hatch,uncertain"
-    overlay = geometry(stored.id, page_number, roles=roles, max_primitives=8000)
+    overlay = _geometry_local(stored.id, page_number, roles=roles, max_primitives=8000)
     progress.finish("area", f"{result.geometry.component_count} components")
     progress.complete()
 
@@ -560,21 +680,12 @@ def _run_analysis(
     except Exception as error:  # pragma: no cover — defensive by design
         logger.warning("diagnostics failed: %s", type(error).__name__)
 
-    payload = {
+    return {
         "document": summary,
         "analysis": analysis,
         "area": result.as_dict(),
         "overlay": overlay,
     }
-
-    # Saving happens *after* the measurement is complete, from the finished
-    # payload, and cannot alter it. A failure to save is reported as a failure to
-    # save — the analysis it describes is exactly as correct either way.
-    saved = _autosave(payload, source_sha256, file_name, source_size,
-                      job.tracker.elapsed if job.tracker else None)
-    if saved:
-        payload["saved"] = saved
-    return payload
 
 
 def _autosave(
@@ -863,12 +974,43 @@ def document_file(document_id: str):
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str) -> Dict[str, Any]:
     """Delete an upload and its temporary file immediately."""
+    hosted = HOSTS.remove_document(document_id)
+    if hosted is not None:
+        return {"deleted": hosted}
     return {"deleted": STORE.remove(document_id)}
+
+
+def _hosted_call(document_id: str, command: str, args: Dict[str, Any]) -> Any:
+    """Send a document request to the analysis process holding it, if any.
+
+    Returns ``_LOCAL`` when the document lives in this process (a demo drawing,
+    or inline isolation). A child that dies mid-request is reported as what it was.
+    """
+    from backend.supervisor import WorkerError, WorkerFailed
+
+    host = HOSTS.for_document(document_id)
+    if host is None:
+        return _LOCAL
+    try:
+        return host.request(command, {"document_id": document_id, **args})
+    except WorkerError as error:
+        raise HTTPException(status_code=500, detail=error.described) from None
+    except WorkerFailed as error:
+        HOSTS.discard(host)
+        raise HTTPException(status_code=503, detail=error.outcome) from None
+
+
+_LOCAL = object()
 
 
 @router.get("/documents/{document_id}/pages/{page_number}/analyze")
 def analyze(document_id: str, page_number: int) -> Dict[str, Any]:
     """Classify a page, detect candidate views, and attempt auto-calibration."""
+    hosted = _hosted_call(document_id, "analyze", {"page_number": page_number})
+    return _analyze_local(document_id, page_number) if hosted is _LOCAL else hosted
+
+
+def _analyze_local(document_id: str, page_number: int) -> Dict[str, Any]:
     _stored, prepared = _prepared(document_id, page_number)
     summary = prepared.summary()
     # Surfaced so the UI can say "review recommended" and point at the region.
@@ -910,6 +1052,17 @@ def geometry(
         roles: Comma-separated role filter, e.g. ``profile,dimension``.
         max_primitives: Cap on returned primitives; the response says when it bit.
     """
+    hosted = _hosted_call(document_id, "geometry", {
+        "page_number": page_number, "roles": roles, "max_primitives": max_primitives})
+    if hosted is not _LOCAL:
+        return hosted
+    return _geometry_local(document_id, page_number, roles, max_primitives)
+
+
+def _geometry_local(
+    document_id: str, page_number: int, roles: Optional[str] = None,
+    max_primitives: int = 20000,
+) -> Dict[str, Any]:
     _stored, prepared = _prepared(document_id, page_number)
     wanted: Optional[Set[str]] = (
         {r.strip() for r in roles.split(",") if r.strip()} if roles else None
@@ -929,7 +1082,42 @@ def geometry(
 
 @router.post("/documents/{document_id}/pages/{page_number}/area")
 def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, Any]:
-    """Calculate the projected area for a selected region and scale."""
+    """Calculate the projected area for a selected region and scale.
+
+    The calculation runs where the document lives — normally the analysis
+    process that measured it, because re-running the footprint geometry of a
+    production drawing is as heavy as the first pass. Recording the new state is
+    done here, afterwards, and cannot change it.
+    """
+    hosted = _hosted_call(document_id, "area", {
+        "page_number": page_number,
+        "request": request.model_dump(exclude={"analysis_id"}),
+    })
+    if hosted is _LOCAL:
+        stored, body = _area_local(document_id, page_number, request)
+        identity = _Identity(getattr(stored, "source_sha256", ""))
+    else:
+        body = hosted
+        host = HOSTS.for_document(document_id)
+        identity = _Identity(
+            ((host.documents.get(document_id) or {}).get("source_sha256", "")) if host else "")
+    if request.analysis_id:
+        # Recording the new state costs a round trip to the database plus a
+        # rewrite of the stored artifact — four seconds on the 101 PDF, and more
+        # across regions. The operator is waiting on a calibration, not on a
+        # write, and persistence is observational: it happens after the answer,
+        # off the request, and cannot change it. What comes back says a save was
+        # started, not that it finished.
+        started = _persist_recalculation_async(
+            request.analysis_id, identity, body,
+            operator_scale=request.scale.mode != "auto")
+        if started is not None:
+            body = {**body, "saved": started}
+    return body
+
+
+def _area_local(document_id: str, page_number: int, request: AreaRequest):
+    """The area calculation itself. Returns ``(stored, body)``."""
     stored, prepared = _prepared(document_id, page_number)
 
     region_bbox, view_source, view_label = _resolve_region(prepared, request)
@@ -978,20 +1166,7 @@ def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, 
         force_raster=request.force_raster,
         extra_warnings=scale_warnings,
     )
-    body = result.as_dict()
-    if request.analysis_id:
-        # Recording the new state costs a round trip to the database plus a
-        # rewrite of the stored artifact — four seconds on the 101 PDF, and more
-        # across regions. The operator is waiting on a calibration, not on a
-        # write, and persistence is observational: it happens after the answer,
-        # off the request, and cannot change it. What comes back says a save was
-        # started, not that it finished.
-        started = _persist_recalculation_async(
-            request.analysis_id, stored, body,
-            operator_scale=request.scale.mode != "auto")
-        if started is not None:
-            body = {**body, "saved": started}
-    return body
+    return stored, result.as_dict()
 
 
 def _persist_recalculation_async(

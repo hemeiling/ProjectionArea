@@ -342,8 +342,6 @@ def test_a_store_left_by_a_dead_process_is_swept(tmp_path, monkeypatch):
 
 def test_uploads_are_never_left_in_the_store_after_removal(client, drawings):
     """§35: a drawing is deleted when asked, file and all."""
-    from backend.store import STORE
-
     with open(drawings["plate_with_holes"]["path"], "rb") as handle:
         payload = handle.read()
     document_id = client.post(
@@ -351,10 +349,20 @@ def test_uploads_are_never_left_in_the_store_after_removal(client, drawings):
         files={"file": ("plate.pdf", payload, "application/pdf")},
     ).json()["document_id"]
 
-    stored_path = STORE.get(document_id).path
-    assert os.path.exists(stored_path)
+    # The document lives in whichever process measured it — normally an analysis
+    # child with its own store directory — so look for its file in every store.
+    import glob
+    import tempfile
+
+    from backend.store import STORE_PREFIX
+
+    def stored_files():
+        return glob.glob(os.path.join(tempfile.gettempdir(), STORE_PREFIX + "*",
+                                      f"{document_id}.*"))
+
+    assert stored_files(), "the upload should be held while the document exists"
     assert client.delete(f"/api/documents/{document_id}").status_code in (200, 204)
-    assert not os.path.exists(stored_path), "the file outlived the document"
+    assert stored_files() == [], "the file outlived the document"
 
 
 def test_the_converter_version_is_asked_for_once_not_per_health_check(monkeypatch, tmp_path):

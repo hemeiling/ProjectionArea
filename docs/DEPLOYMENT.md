@@ -47,6 +47,9 @@ Nothing is required. The service starts with no environment set beyond `PORT`.
 | `MAX_UPLOAD_MB` | 200 | Upload ceiling. Production DWGs reach 93 MB. |
 | `LIBREDWG_BIN` | unset | Explicit converter path, for a host that puts it somewhere unusual. Never needed when `dwg2dxf` is on `PATH`. |
 | `PROJECTED_AREA_LOG` | `INFO` | Log level. |
+| `ANALYSIS_ISOLATION` | `process` | Where measurements run. `process`: a supervised child process per drawing (see below). `inline`: a thread in the web process — the behaviour before the child existed, kept for tests and for a platform without child processes. Never set it to `inline` on the hosted instance. |
+| `ANALYSIS_TIMEOUT_SECONDS` | 3600 | How long one analysis (or recalculation) may run in the child before it is stopped and reported as a timeout. |
+| `MAX_DOCUMENT_HOSTS` | 1 | How many analysis children may stay alive holding a measured drawing for calibration. The previous one is stopped *before* the next analysis starts, so two production drawings never sit in memory together. |
 | `CLAUDE_API_KEY`, `GEMINI_API_KEY` | unset | Optional. Nothing in the engine reads them; AI is for interpretation, never measurement. The service must start without them, and does. |
 
 ## Memory: the thing that decides the plan
@@ -130,14 +133,19 @@ test exists to protect, and deployment preparation is the wrong moment for that.
 
 ### When an instance runs out of memory
 
-Two different failures, both explained rather than silent:
+The measurement runs in a child process, so the process that uses the memory is
+not the one that answers the browser. The failures are now distinguishable:
 
 - Python sees the allocation fail → the job reports `out_of_memory`, naming it as
   a sizing problem rather than a fault in the drawing.
-- The kernel kills the process → the job is simply gone, because jobs live in the
-  process. The next poll gets a 404 whose body says the process restarted and
-  that large drawings need more memory. The progress bar keeps the progress it
-  had earned and the heading changes to "Analysis interrupted".
+- The child is killed with `SIGKILL` → the web process survives, sees the exit
+  signal and reports `worker_killed` with the stage the child was in and its last
+  memory reading against the container limit. An out-of-memory kill looks like
+  this, but so does any other `SIGKILL`; the message says so rather than
+  concluding.
+- The whole container is killed (memory counted against the container includes
+  the web process) → jobs are gone, as before; the next poll's 404 says only what
+  the answering instance can know.
 
 ## Migrating the existing Render service
 
@@ -235,6 +243,51 @@ The child-process design recommended in `docs/INCIDENT_103_DWG_RESTART.md` fits
 either: the web process would own the job record, and the worker would own only the
 measurement.
 
+## Where the measurement runs: a supervised child process
+
+The hosted 102 run on `7b2fbbc` was restarted at ~80 % with no deployment in
+progress, after the event loop serving `/health` had been blocked for 9.8, 10.4,
+13.0, 13.8 and 17.5 seconds by CAD parsing in the same interpreter. Threads share
+one GIL, so no arrangement of threads inside one process can keep the web server
+answering while ezdxf reads two million entities.
+
+So every measurement runs in a child process (`backend/analysis_host.py`),
+supervised by the web process (`backend/supervisor.py`):
+
+```
+FastAPI parent                       analysis child (one per measured drawing)
+  accepts upload, creates job  --->    DWG → DXF, parse, expand/normalise,
+  serves /health, /api/jobs            segments, noding, polygonize, union,
+  replays progress on the job  <---    footprint candidates, area
+  saves the result (database)          keeps the drawing for calibration
+  reads how the child ended            (exit code / signal / timeout)
+```
+
+- **Same code.** The child calls the same route functions the thread used to. The
+  baseline oracle's `--via-app` mode measures through upload → job → child →
+  payload and must report an identical engineering result.
+- **Progress and diagnostics cross the pipe.** Stage events are replayed on the
+  job's tracker, so the browser's progress is unchanged. Each diagnostic stage
+  (time, memory at start/end, the stage's own peak, container memory and limit,
+  counts) and a memory sample each second reach `GET /api/jobs/{id}` as
+  `diagnostics` and `resources` — numbers only, no PID, host or path.
+- **One heavy analysis at a time.** A second upload waits, visibly queued.
+- **The child keeps the drawing.** Calibrating re-runs the footprint geometry,
+  which for a production DWG is as heavy as the first pass, so recalculation
+  requests are forwarded to the child rather than rebuilding the drawing in the
+  web process. The web process holds no geometry.
+- **How it ended is observed, not guessed**: `worker_killed` (SIGKILL),
+  `worker_crashed` (SIGSEGV, SIGBUS, SIGABRT…), `worker_failed` (exit status),
+  `worker_timeout`, or a Python exception the child reported with its type and
+  source line. A killed child's temporary files — the customer's drawing — are
+  removed by the parent's orphan sweep.
+- **Children are forked from a forkserver** with the pipeline pre-imported, not
+  forked from the threaded web server (unsafe) and not spawned from scratch
+  (seconds of imports per analysis). A consequence worth knowing: children import
+  the launching script as `__mp_main__`, so any script that starts analyses must
+  keep its work under `if __name__ == "__main__":` — uvicorn, pytest and
+  `run.py` all do.
+
 ## Long-running requests
 
 A DWG takes minutes. No request is held open for one:
@@ -251,8 +304,9 @@ recoverable, explained event rather than a hung browser.
 
 **The health check has to stay cheap for this to hold.** Render restarts an
 instance whose health check fails, and a restart mid-job kills the job. The work
-runs in a thread inside the same process, so while a CAD parse holds several
-gigabytes, anything expensive in `/health` competes with it. `/health` therefore
+now runs in a child process, so a CAD parse no longer competes with `/health` for
+the GIL — but it still shares the machine's CPUs and memory, so anything
+expensive in `/health` would still compete with it. `/health` therefore
 opens no drawing and — after the first call — spawns no subprocess: the
 converter's version is memoised against the binary's size and modification time,
 rather than asked of `dwg2dxf --version` on every poll. On one CPU, a long job and

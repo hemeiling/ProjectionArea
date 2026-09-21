@@ -55,6 +55,30 @@ class Job:
     #: The stage that was in flight when the job failed, so the bar can keep the
     #: progress already earned and say where it stopped.
     failed_stage: Optional[str] = None
+    #: Waiting for the analysis slot: only one heavy analysis runs at a time.
+    queued: bool = False
+    #: Per-stage measurements from the analysis process — time, memory at start,
+    #: end and peak, counts. Observational only (§32); never read by the engine.
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    #: The latest memory sample from the analysis process.
+    memory: Optional[Dict[str, Any]] = None
+
+    def record_diagnostic(self, record: Dict[str, Any]) -> None:
+        """Keep one record per stage run: a stage's "running" entry is replaced by
+        its outcome when it finishes, so the list reads in order of execution."""
+        for index in range(len(self.diagnostics) - 1, -1, -1):
+            existing = self.diagnostics[index]
+            if existing.get("stage") == record.get("stage") and existing.get("state") == "running":
+                self.diagnostics[index] = record
+                return
+        self.diagnostics.append(record)
+
+    def resources(self) -> Optional[Dict[str, Any]]:
+        """The live memory summary: scope, used, limit, peak. Numbers only."""
+        snap = self.memory
+        if not snap:
+            return None
+        return {key: snap.get(key) for key in ("scope", "used_bytes", "limit_bytes", "peak_bytes")}
 
     @property
     def elapsed(self) -> float:
@@ -77,6 +101,9 @@ class Job:
             # poll is answered by a different instance, the client can say so from
             # evidence instead of guessing why the job "disappeared".
             "instance": instance_token(),
+            "queued": self.queued,
+            "resources": self.resources(),
+            "diagnostics": list(self.diagnostics),
         }
         if self.tracker is not None:
             snapshot = self.tracker.snapshot()
@@ -125,8 +152,9 @@ class JobStore:
                 job.stage = "complete"
             except Exception as error:  # surfaced to the client, not swallowed
                 job.state = "failed"
+                job.queued = False
                 job.failed_stage = job.tracker.current_key if job.tracker else job.stage
-                job.error = _describe(error)
+                job.error = describe_failure(error)
                 job.detail = job.error.get("headline", str(error))
             finally:
                 job.finished_at = time.time()
@@ -151,6 +179,30 @@ class JobStore:
             for key in stale:
                 del self._jobs[key]
         return len(stale)
+
+
+def sink_for(job: Job) -> Callable[[tuple], None]:
+    """Apply messages from the analysis process to ``job``.
+
+    Progress events are replayed on the job's own tracker, so the parent's view of
+    the work is the one the browser has always polled. Every branch is guarded:
+    these are reports about the measurement, and none of them may interrupt it.
+    """
+    def handle(message: tuple) -> None:
+        kind = message[0]
+        try:
+            if kind == "progress" and job.tracker is not None:
+                getattr(job.tracker, message[1])(*message[2])
+            elif kind == "mark":
+                advance(job, message[1], message[2] if len(message) > 2 else "")
+            elif kind == "diag" and isinstance(message[1], dict):
+                job.record_diagnostic(message[1])
+            elif kind == "mem" and isinstance(message[1], dict):
+                job.memory = message[1]
+        except Exception:
+            pass
+
+    return handle
 
 
 def advance(job: Job, stage: str, detail: str = "") -> None:
@@ -181,6 +233,21 @@ def _raised_at(error: BaseException) -> Optional[str]:
             location = f"{short}:{code.co_name}:{frame.tb_lineno}"
         frame = frame.tb_next
     return location
+
+
+def describe_failure(error: Exception) -> Dict[str, Any]:
+    """Describe a failed job, whether it failed here or in the analysis process.
+
+    An exception the child reported arrives already described; a child that died
+    arrives as an outcome read from its exit status. Neither is re-interpreted.
+    """
+    from backend.supervisor import WorkerError, WorkerFailed
+
+    if isinstance(error, WorkerError):
+        return dict(error.described)
+    if isinstance(error, WorkerFailed):
+        return dict(error.outcome)
+    return _describe(error)
 
 
 def _describe(error: Exception) -> Dict[str, Any]:

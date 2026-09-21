@@ -292,5 +292,11 @@
   "proc.titleMoved": "Analysis moved out of reach",
   "proc.movedHeadline": "A different server instance answered.",
   "proc.movedBody": "This analysis was started on another server instance, and requests are now reaching a new one — which happens during a deployment. The analysis may still be finishing on the original instance, but this page can no longer follow it.",
-  "err.networkHeadline": "Connection interrupted"
+  "err.networkHeadline": "Connection interrupted",
+  "err.gatewayHeadline": "The server did not answer (HTTP {status}).",
+  "err.gatewayBody": "The hosting platform returned HTTP {status} instead of a reply from the application. The application may have been restarting or unable to respond; this page cannot tell which.",
+  "err.gatewayFix": "Wait a moment and try again. If an analysis was running, check History or upload the drawing again.",
+  "err.httpHeadline": "The server returned an error (HTTP {status}).",
+  "err.httpBody": "The reply was not one this page can read, so no further detail is available here.",
+  "progress.queued": "Waiting for the analysis ahead of this one to finish — one runs at a time"
 }

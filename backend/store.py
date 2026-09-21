@@ -90,6 +90,20 @@ class DocumentStore:
     def root(self) -> str:
         return self._root
 
+    def reinitialise(self) -> None:
+        """Give a freshly started analysis child a store of its own.
+
+        A forked child inherits this object, including its directory and the
+        owner marker naming the process that created it. Sharing that directory
+        would mean a killed child's files outlive it under a live owner's name, so
+        the orphan sweep would never remove them. The child starts again: empty,
+        in a new directory, marked with its own pid.
+        """
+        with self._lock:
+            self._documents = {}
+            self._root = tempfile.mkdtemp(prefix=STORE_PREFIX)
+        self._claim()
+
     def _claim(self) -> None:
         """Record which process owns this directory.
 

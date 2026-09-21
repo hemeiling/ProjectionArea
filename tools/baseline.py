@@ -2,6 +2,7 @@
 
     .venv/bin/python -m tools.baseline capture Inputs/*.dwg Inputs/*.pdf
     .venv/bin/python -m tools.baseline compare Inputs/101-....dwg
+    .venv/bin/python -m tools.baseline compare --via-app Inputs/101-....dwg
 
 The plan in docs/CAD_PERFORMANCE_ROADMAP.md rests on one rule: the current
 implementation is the reference, and an optimised implementation must reproduce
@@ -126,11 +127,34 @@ def _measure(path: str) -> Dict[str, Any]:
     )
     finished = time.time()
 
-    payload = result.as_dict()
-    geometry = payload["geometry"]
-    cad = stored.cad
-    conversion = stored.conversion
+    record = _build_record(
+        path, file_name, kind, result.as_dict(),
+        stored.cad.summary() if stored.cad is not None else None,
+        stored.conversion.as_dict() if stored.conversion is not None else None,
+        _bounds(result),
+        {
+            "ingest_seconds": round(ingested - started, 2),
+            "analyse_seconds": round(finished - ingested, 2),
+            "total_seconds": round(finished - started, 2),
+            "peak_rss_mb": _peak_rss_mb(),
+        },
+    )
+    store.shutdown()
+    return record
 
+
+def _build_record(
+    path: str, file_name: str, kind: str, payload: Dict[str, Any],
+    info: Optional[Dict[str, Any]], conversion: Optional[Dict[str, Any]],
+    bounds: Optional[Dict[str, float]], cost: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The baseline record, from the engine's own serialised result.
+
+    Built from dictionaries — the result's ``as_dict``, the CAD summary, the
+    conversion record — so the same builder serves both a direct engine run and
+    a run through the application, where only the serialised form comes back.
+    """
+    geometry = payload["geometry"]
     record: Dict[str, Any] = {
         # ── identity ────────────────────────────────────────────────────────
         "file_name": file_name,
@@ -197,15 +221,10 @@ def _measure(path: str) -> Dict[str, Any]:
         "area_pdf_units2": payload["area_pdf_units2"],
 
         # ── bounding geometry, as a cheap whole-drawing fingerprint ─────────
-        "bounds": _bounds(result),
+        "bounds": bounds,
 
         # ── cost, for the roadmap's benchmarks ──────────────────────────────
-        "cost": {
-            "ingest_seconds": round(ingested - started, 2),
-            "analyse_seconds": round(finished - ingested, 2),
-            "total_seconds": round(finished - started, 2),
-            "peak_rss_mb": _peak_rss_mb(),
-        },
+        "cost": cost,
         "captured_on": {
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -213,8 +232,7 @@ def _measure(path: str) -> Dict[str, Any]:
         },
     }
 
-    if cad is not None:
-        info = cad.summary()
+    if info is not None:
         record.update({
             "units": info.get("units"),
             "extents": info.get("extents"),
@@ -240,7 +258,7 @@ def _measure(path: str) -> Dict[str, Any]:
             "xrefs": info.get("xrefs"),
         })
     if conversion is not None:
-        as_dict = conversion.as_dict()
+        as_dict = conversion
         record["conversion"] = {
             "source_type": as_dict["source_type"],
             "source_sha256": as_dict["source_sha256"],
@@ -254,9 +272,73 @@ def _measure(path: str) -> Dict[str, Any]:
             "metadata_warnings": sorted(as_dict["metadata_warnings"]),
             # Duration deliberately excluded: it is a property of the machine.
         }
-
-    store.shutdown()
     return record
+
+
+#: Coordinates in the application's payload are rounded to two decimals
+#: (``FootprintInterpretation.as_dict``), so bounds read back from it can differ
+#: from the engine's own by up to half of that. Areas are not rounded.
+PAYLOAD_COORDINATE_TOLERANCE = 0.005
+
+
+def _bounds_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    box = None
+    for interpretation in payload.get("footprint_interpretations") or []:
+        for ring in interpretation.get("outer") or []:
+            for x, y in ring:
+                if box is None:
+                    box = [x, y, x, y]
+                else:
+                    box = [min(box[0], x), min(box[1], y), max(box[2], x), max(box[3], y)]
+    if box is None:
+        return None
+    return {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
+
+
+def _measure_via_app(path: str) -> Dict[str, Any]:
+    """Measure through the application itself: upload, job, analysis process.
+
+    The direct measurement above proves the engine; this proves what the operator
+    gets — the same engine run in the supervised child process, its result carried
+    back across the process boundary and serialised by the API. No database: the
+    run must not be substituted by, or recorded to, a saved analysis.
+    """
+    os.environ["DATABASE_URL"] = ""
+    os.environ.setdefault("ANALYSIS_ISOLATION", "process")
+    import backend.main as application
+
+    application.load_local_env = lambda *args, **kwargs: None
+    from fastapi.testclient import TestClient
+
+    file_name = os.path.basename(path)
+    started = time.time()
+    with TestClient(application.app) as client, open(path, "rb") as handle:
+        response = client.post("/api/analyse?reanalyse=true",
+                               files={"file": (file_name, handle, "application/octet-stream")})
+        if response.status_code != 202:
+            raise RuntimeError(f"upload refused: HTTP {response.status_code}")
+        job_id = response.json()["job_id"]
+        while True:
+            snap = client.get(f"/api/jobs/{job_id}").json()
+            if snap["state"] != "running":
+                break
+            time.sleep(1.0)
+    if snap["state"] != "done":
+        raise RuntimeError(f"analysis failed: {json.dumps(snap.get('error'))[:500]}")
+    payload = snap["result"]
+    document = payload["document"]
+    info = document.get("cad")
+    conversion = (info or {}).get("conversion")
+    peaks = [d.get("memory_peak_bytes") or 0 for d in snap.get("diagnostics") or []]
+    peak = max(peaks + [((snap.get("resources") or {}).get("peak_bytes") or 0)])
+    return _build_record(
+        path, file_name, document.get("source_kind", "pdf"), payload["area"],
+        info, conversion, _bounds_from_payload(payload["area"]),
+        {"total_seconds": round(time.time() - started, 2),
+         "analyse_seconds": snap.get("elapsed_seconds"),
+         "peak_rss_mb": round(peak / 1e6, 1) if peak else None,
+         "via": "application (analysis process)"},
+    )
 
 
 def _bounds(result: Any) -> Optional[Dict[str, float]]:
@@ -300,6 +382,7 @@ def _close(a: Any, b: Any) -> bool:
 def _diff(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     """Every engineering difference between a baseline and a fresh run."""
     problems: List[str] = []
+    via_app = (current.get("cost") or {}).get("via") is not None
 
     for field in EXACT_FIELDS:
         was, now = baseline.get(field), current.get(field)
@@ -326,7 +409,9 @@ def _diff(baseline: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
         problems.append(f"bounds: {was_bounds!r} -> {now_bounds!r}")
     elif was_bounds:
         for edge in ("x0", "y0", "x1", "y1"):
-            if not _close(was_bounds[edge], now_bounds[edge]):
+            close = (abs(was_bounds[edge] - now_bounds[edge]) <= PAYLOAD_COORDINATE_TOLERANCE
+                     if via_app else _close(was_bounds[edge], now_bounds[edge]))
+            if not close:
                 problems.append(
                     f"bounds.{edge}: {was_bounds[edge]!r} -> {now_bounds[edge]!r}")
 
@@ -362,7 +447,7 @@ def capture(paths: List[str]) -> int:
     return 0
 
 
-def compare(paths: List[str]) -> int:
+def compare(paths: List[str], via_app: bool = False) -> int:
     failures = 0
     for path in paths:
         target = _baseline_path(path)
@@ -373,7 +458,7 @@ def compare(paths: List[str]) -> int:
         with open(target) as handle:
             baseline = json.load(handle)
         print(f"comparing {os.path.basename(path)} …", flush=True)
-        current = _run_isolated(path)
+        current = _run_isolated(path, via_app=via_app)
         if current is None:
             print("  FAILED to run")
             failures += 1
@@ -394,10 +479,10 @@ def compare(paths: List[str]) -> int:
     return 1 if failures else 0
 
 
-def _run_isolated(path: str) -> Optional[Dict[str, Any]]:
+def _run_isolated(path: str, via_app: bool = False) -> Optional[Dict[str, Any]]:
     """Measure in a fresh subprocess, so peak RSS belongs to this drawing alone."""
     proc = subprocess.run(
-        [sys.executable, "-m", "tools.baseline", "--one", path],
+        [sys.executable, "-m", "tools.baseline", "--one-app" if via_app else "--one", path],
         capture_output=True, text=True, cwd=PROJECT_ROOT,
     )
     for line in proc.stdout.splitlines():
@@ -414,11 +499,16 @@ def main(argv: List[str]) -> int:
     if argv[0] == "--one":
         print("__RECORD__" + json.dumps(_measure(argv[1]), ensure_ascii=False))
         return 0
+    if argv[0] == "--one-app":
+        print("__RECORD__" + json.dumps(_measure_via_app(argv[1]), ensure_ascii=False))
+        return 0
     command, paths = argv[0], argv[1:]
+    via_app = "--via-app" in paths
+    paths = [p for p in paths if p != "--via-app"]
     if command == "capture":
         return capture(paths)
     if command == "compare":
-        return compare(paths)
+        return compare(paths, via_app=via_app)
     print(f"unknown command {command!r}; expected capture or compare")
     return 2
 

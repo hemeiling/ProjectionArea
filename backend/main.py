@@ -91,6 +91,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         from backend.db import pool as db_pool
 
         db_pool.close()
+    # Analysis processes first: each empties its own store as it stops.
+    from backend.supervisor import HOSTS
+
+    HOSTS.shutdown()
     STORE.shutdown()
 
 

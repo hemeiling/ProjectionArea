@@ -137,9 +137,9 @@ async function call(path, options = {}) {
   try {
     res = await fetch(API + path, options);
   } catch (networkError) {
-    // fetch rejects only on a network failure: the server went away mid-request,
-    // which on a small instance usually means it was restarted under memory
-    // pressure. Reported as that rather than as a mysterious TypeError.
+    // fetch rejects only on a network failure: the connection dropped before the
+    // server answered. Why it dropped cannot be known from here, so the message
+    // says what happened and nothing more.
     const err = new Error(t("err.network"));
     err.status = 0;
     err.detail = { kind: "network", headline: t("err.network"),
@@ -148,10 +148,32 @@ async function call(path, options = {}) {
   }
 
   const body = await readBodyOnce(res);
+  if (!res.ok && (!body.json || body.json.detail === undefined)) {
+    /* Not this application's answer: an HTML page from the hosting platform's
+     * proxy (a 502 while the instance is unavailable), or an empty body. The page
+     * is never shown to the operator — it is markup, not a message. The status and
+     * an excerpt are kept on the error and in the console for diagnosis. */
+    const gateway = [502, 503, 504].includes(res.status);
+    const raw = (body.text || "").trim();
+    // A short plain-text reason (a proxy's "upstream connect error") is a message
+    // and is kept; anything that looks like markup is not.
+    const plain = raw && raw.length <= 300 && !/[<>]/.test(raw) ? raw : "";
+    const headline = t(gateway ? "err.gatewayHeadline" : "err.httpHeadline",
+                       { status: res.status });
+    const err = new Error(!gateway && plain ? plain : headline);
+    err.status = res.status;
+    err.raw = raw.slice(0, 500);
+    err.detail = {
+      kind: gateway ? "gateway" : "http_error",
+      status: res.status,
+      headline,
+      reason: plain || t(gateway ? "err.gatewayBody" : "err.httpBody", { status: res.status }),
+    };
+    console.warn(`HTTP ${res.status} from ${path}: non-JSON response`, err.raw.slice(0, 200));
+    throw err;
+  }
   if (!res.ok) {
-    const detail = (body.json && body.json.detail !== undefined)
-      ? body.json.detail
-      : (body.text || "").trim().slice(0, 300);
+    const detail = body.json.detail;
     const err = new Error(
       typeof detail === "string" && detail
         ? detail
@@ -358,6 +380,12 @@ function renderProgress(snap) {
     return;
   }
 
+  if (snap.queued) {
+    // Waiting for the analysis ahead of this one: one runs at a time.
+    $("progressWhat").textContent = t("progress.queued");
+    $("progressCounts").textContent = "";
+    return;
+  }
   $("progressWhat").textContent = t(`stageActive.${snap.stage}`, {}, snap.stage_detail || "");
 
   /* Real counts where the backend has them; nothing where it does not. */
@@ -451,9 +479,24 @@ async function handleFile(file, { reanalyse = false } = {}) {
    * started them, so if a later poll is answered by a different instance the page
    * can say so from evidence, rather than guessing at a restart or at memory. */
   let jobInstance = job.instance || null;
+  /* A poll that meets a network drop or a gateway error is retried a few times
+   * before the run is reported as failed: one lost reply is not a lost analysis. */
+  const POLL_RETRIES = 5;
+  const POLL_RETRY_MS = 1500;
+  const transient = (e) => e.status === 0 || [502, 503, 504].includes(e.status);
+  const poll = async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await call(`/api/jobs/${job.job_id}`);
+      } catch (e) {
+        if (!transient(e) || attempt >= POLL_RETRIES) throw e;
+        await new Promise((resolve) => setTimeout(resolve, POLL_RETRY_MS));
+      }
+    }
+  };
   try {
     while (true) {
-      snap = await call(`/api/jobs/${job.job_id}`);
+      snap = await poll();
       if (snap.instance && !jobInstance) jobInstance = snap.instance;
       if (snap.plan) {
         const plan = snap.plan.join(",");
@@ -489,9 +532,10 @@ async function handleFile(file, { reanalyse = false } = {}) {
       return;
     }
     notice("procNotice", {
-      headline: err.status === 0 ? t("err.networkHeadline") : t("proc.failed"),
-      body: err.message,
-      fix: err.detail && err.detail.fix,
+      headline: err.status === 0 ? t("err.networkHeadline")
+        : err.detail?.kind === "gateway" ? err.message : t("proc.failed"),
+      body: (err.detail && err.detail.reason) || err.message,
+      fix: (err.detail && err.detail.fix) || (err.detail?.kind === "gateway" ? t("err.gatewayFix") : null),
       kind: "error",
     });
     return;
