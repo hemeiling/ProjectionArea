@@ -86,16 +86,26 @@ def schema_name(default: str = DEFAULT_SCHEMA) -> str:
             creating tables in ``public`` on a shared instance.
     """
     raw = (os.environ.get(SCHEMA_ENV) or "").strip() or default
-    if not _SCHEMA_PATTERN.match(raw):
+    return validate_schema(raw)
+
+
+def validate_schema(name: str) -> str:
+    """``name`` if it may be this application's schema, else ConfigurationError.
+
+    Every path that names a schema goes through here — the configured one, and an
+    explicit override such as a test's — so ``public`` cannot arrive by a side door.
+    ``pg_`` is reserved by PostgreSQL for system schemas.
+    """
+    if not isinstance(name, str) or not _SCHEMA_PATTERN.match(name):
         raise ConfigurationError(
-            f"{SCHEMA_ENV} must be a plain lowercase identifier; got {raw!r}"
+            f"{SCHEMA_ENV} must be a plain lowercase identifier; got {name!r}"
         )
-    if raw in _FORBIDDEN_SCHEMAS:
+    if name in _FORBIDDEN_SCHEMAS or name.startswith("pg_"):
         raise ConfigurationError(
-            f"{SCHEMA_ENV} may not be {raw!r}: this application shares its database "
+            f"{SCHEMA_ENV} may not be {name!r}: this application shares its database "
             "instance and must own its own schema"
         )
-    return raw
+    return name
 
 
 #: Hosts for which an unencrypted connection is reasonable, because the traffic
@@ -204,3 +214,16 @@ def settings() -> Settings:
         tls=bool(url) and "sslmode=disable" not in (url or "").lower()
         and _host_of(url or "") not in _LOCAL_HOSTS,
     )
+
+
+def database_name(url: Optional[str]) -> Optional[str]:
+    """The database a connection string names, for checking — never for display."""
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    try:
+        name = urlparse(url).path.lstrip("/")
+    except ValueError:
+        return None
+    return name or None

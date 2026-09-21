@@ -409,6 +409,7 @@ class AnalysisRepository:
     def delete(self, analysis_id: str) -> bool:
         """Remove an analysis, its artifacts and its events."""
         with pool.connection(self.url, self.schema) as conn:
+            pool.verify_target(conn, self.schema, self.url)
             with conn.cursor() as cursor:
                 cursor.execute(
                     f"DELETE FROM {self.schema}.analyses WHERE id = %s", (analysis_id,))

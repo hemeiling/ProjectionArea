@@ -28,6 +28,22 @@ jobs:
     name: Test suite
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # A throwaway PostgreSQL, so the persistence and schema-isolation tests run
+    # against a real database — including the one that migrates a scratch schema
+    # and proves `public` is left exactly as it was. Never the shared production
+    # instance: that is DATABASE_URL, which the suite removes from its environment.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: scratch
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      PROJECTED_AREA_TEST_DATABASE_URL: postgresql://postgres:ci-only@localhost:5432/scratch
     steps:
       - uses: actions/checkout@v4
 

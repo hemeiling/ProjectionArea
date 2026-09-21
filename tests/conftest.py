@@ -96,7 +96,14 @@ def database():
         yield {"url": url, "schema": schema}
     finally:
         try:
+            # The one destructive statement in the suite: checked twice before it
+            # runs — the name is this fixture's own shape, and the connection
+            # really is scoped to it and to the test database.
+            import re as _re
+
+            assert _re.fullmatch(r"pa_test_[0-9a-f]{12}", schema), schema
             with db_pool.connection(url, schema) as conn:
+                db_pool.verify_target(conn, schema, url)
                 with conn.cursor() as cursor:
                     cursor.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
                 conn.commit()

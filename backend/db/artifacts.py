@@ -207,6 +207,7 @@ class PostgresArtifactStore:
 
     def delete(self, analysis_id: str) -> int:
         with pool.connection(self._url, self._schema) as conn:
+            pool.verify_target(conn, self._schema, self._url)
             with conn.cursor() as cursor:
                 cursor.execute(
                     f"DELETE FROM {self._schema}.artifacts WHERE analysis_id = %s",

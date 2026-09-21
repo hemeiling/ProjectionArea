@@ -143,37 +143,145 @@ def migrations(schema: str) -> List[Migration]:
     ]
 
 
-#: A statement may only name objects in this application's schema. ``CREATE SCHEMA``
-#: is the one exception, since it names the schema itself.
-_CREATE_SCHEMA = re.compile(r"^\s*CREATE\s+SCHEMA\b", re.IGNORECASE)
-_INDEX_ON = re.compile(r"\bON\s+(\S+)", re.IGNORECASE)
+# ── the isolation check ──────────────────────────────────────────────────────
+#
+# This database instance also holds Email Drafter's production data, in `public`.
+# Every statement a migration runs is therefore checked before it runs, and a
+# statement that could reach any other schema is refused, not executed.
+#
+# The check is deliberately conservative. It understands the handful of forms a
+# migration here legitimately uses; anything it cannot vouch for — a statement
+# kind it does not know, a DO block it cannot read into, a GRANT, an extension —
+# is refused outright. A false refusal costs a developer a minute; a false pass
+# could cost another application its data.
+
+#: Statements that are never acceptable in a migration here, whatever they name.
+#: Extensions and grants are database-wide; DO blocks and dynamic SQL cannot be
+#: checked; changing search_path or role would undo the isolation the connection
+#: sets up; dropping or altering a schema is destructive at the wrong scale.
+_FORBIDDEN_STATEMENTS = (
+    (re.compile(r"^\s*(GRANT|REVOKE)\b", re.I), "GRANT/REVOKE"),
+    (re.compile(r"^\s*(CREATE|ALTER|DROP)\s+EXTENSION\b", re.I), "extensions are database-wide"),
+    (re.compile(r"^\s*(DROP|ALTER)\s+SCHEMA\b", re.I), "altering or dropping a schema"),
+    (re.compile(r"^\s*DO\b", re.I), "DO blocks cannot be checked"),
+    (re.compile(r"\bEXECUTE\b", re.I), "dynamic SQL cannot be checked"),
+    (re.compile(r"^\s*(SET|RESET)\b", re.I), "changing session settings (search_path, role)"),
+    (re.compile(r"^\s*(CREATE|ALTER|DROP)\s+(ROLE|USER|GROUP|DATABASE|TABLESPACE)\b", re.I),
+     "cluster-wide objects"),
+    (re.compile(r"^\s*ALTER\s+(SYSTEM|DEFAULT\s+PRIVILEGES)\b", re.I), "cluster-wide settings"),
+    (re.compile(r"^\s*(COPY|SECURITY\s+LABEL|REASSIGN|VACUUM|CLUSTER|LOCK)\b", re.I),
+     "not a migration statement"),
+)
+
+#: The statement kinds a migration here may use. Anything else is refused.
+_KNOWN_STATEMENT = re.compile(
+    r"^\s*(CREATE|ALTER|DROP|COMMENT|INSERT|UPDATE|DELETE|TRUNCATE)\b", re.I)
+
+#: One SQL identifier, quoted or not, optionally qualified: `a`, `"A"`, `s.t`,
+#: `"public"."x"`, `s.t.c` (a column, for COMMENT ON COLUMN).
+_IDENT = r'(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)'
+_NAME = rf"{_IDENT}(?:\s*\.\s*{_IDENT}){{0,2}}"
+
+#: Object kinds that live inside a schema and so must be named with ours.
+_KINDS = (r"TABLE|INDEX|SEQUENCE|VIEW|MATERIALIZED\s+VIEW|FUNCTION|PROCEDURE|TYPE|DOMAIN"
+          r"|TRIGGER|RULE|POLICY|STATISTICS|AGGREGATE|OPERATOR|COLLATION|FOREIGN\s+TABLE")
+
+#: Where an object name follows. Each pattern captures the name (or a comma list).
+_NAME_SITES = [
+    re.compile(rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?"
+               rf"(?:{_KINDS})\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>{_NAME})", re.I),
+    re.compile(rf"\bALTER\s+(?:{_KINDS})\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?P<name>{_NAME})", re.I),
+    re.compile(rf"\bDROP\s+(?:{_KINDS})\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?"
+               rf"(?P<list>{_NAME}(?:\s*,\s*{_NAME})*)", re.I),
+    re.compile(rf"\bCOMMENT\s+ON\s+(?:COLUMN|CONSTRAINT\s+{_IDENT}\s+ON|{_KINDS})\s+(?P<name>{_NAME})", re.I),
+    re.compile(rf"\bINSERT\s+INTO\s+(?P<name>{_NAME})", re.I),
+    re.compile(rf"^\s*UPDATE\s+(?:ONLY\s+)?(?P<name>{_NAME})", re.I),
+    re.compile(rf"\bDELETE\s+FROM\s+(?:ONLY\s+)?(?P<name>{_NAME})", re.I),
+    re.compile(rf"\bTRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?(?P<list>{_NAME}(?:\s*,\s*{_NAME})*)", re.I),
+    re.compile(rf"\bREFERENCES\s+(?P<name>{_NAME})", re.I),
+    # Reading another application's data is not modifying it, but a migration
+    # here has no reason to, so it is refused too.
+    re.compile(rf"\b(?:FROM|JOIN|USING)\s+(?:ONLY\s+)?(?P<name>{_NAME})", re.I),
+    # The table an index or trigger is created on.
+    re.compile(rf"\bON\s+(?:ONLY\s+)?(?P<name>{_NAME})\s*(?:\(|USING\b|FOR\b|$)", re.I),
+]
+
+_CREATE_SCHEMA = re.compile(
+    rf"^\s*CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>{_IDENT})\s*(?P<rest>.*)$",
+    re.I | re.S)
+_COMMENT_ON_SCHEMA = re.compile(rf"^\s*COMMENT\s+ON\s+SCHEMA\s+(?P<name>{_IDENT})", re.I)
+
+
+def _parts(name: str) -> List[str]:
+    """Split a possibly quoted, qualified name into its identifiers, as PostgreSQL
+    resolves them: unquoted parts fold to lower case, quoted parts keep theirs."""
+    parts = re.findall(r'"((?:[^"]|"")+)"|([A-Za-z_][A-Za-z0-9_$]*)', name)
+    return [quoted.replace('""', '"') if quoted else bare.lower() for quoted, bare in parts]
+
+
+def _in_schema(name: str, schema: str, allow_bare: bool = False) -> bool:
+    parts = _parts(name)
+    if len(parts) >= 2:
+        return parts[0] == schema
+    return allow_bare
+
+
+def _strip_comments_and_literals(statement: str) -> str:
+    """The statement without comments or string literals, so neither can hide or
+    fake a name. Literals become '' — their content never names an object."""
+    text = re.sub(r"--[^\n]*", " ", statement)
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"'(?:[^']|'')*'", "''", text)
 
 
 def unqualified_objects(statement: str, schema: str) -> List[str]:
-    """Object names in a statement that are not inside ``schema``.
+    """Object names, or refusals, in a statement that are not inside ``schema``.
 
-    Used by the test suite to prove statically that no migration can touch another
-    application's tables. Returns the offending names, so a failure says which.
+    Returns an empty list only for a statement this check can vouch for. Anything
+    else comes back as a list of reasons, so a failure says what it objected to.
     """
-    if _CREATE_SCHEMA.match(statement):
-        return []
+    from backend.db.config import ConfigurationError, validate_schema
+
+    try:
+        validate_schema(schema)
+    except ConfigurationError as error:
+        return [f"schema {schema!r} refused: {error}"]
+
+    text = _strip_comments_and_literals(statement)
+
+    create_schema = _CREATE_SCHEMA.match(text)
+    if create_schema:
+        named = _parts(create_schema.group("name"))[0]
+        offenders = [] if named == schema else [create_schema.group("name")]
+        if create_schema.group("rest").strip():
+            # CREATE SCHEMA ... CREATE TABLE ... would run nested statements.
+            offenders.append("CREATE SCHEMA with embedded statements")
+        return offenders
+    comment_schema = _COMMENT_ON_SCHEMA.match(text)
+    if comment_schema:
+        named = _parts(comment_schema.group("name"))[0]
+        return [] if named == schema else [comment_schema.group("name")]
+
+    for pattern, why in _FORBIDDEN_STATEMENTS:
+        if pattern.search(text):
+            return [f"forbidden: {why}"]
+    if not _KNOWN_STATEMENT.match(text):
+        return ["forbidden: statement kind not recognised by the isolation check"]
+
     offenders: List[str] = []
-    prefix = f"{schema}."
-    for match in re.finditer(
-        r"\b(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|ALTER\s+TABLE|DROP\s+TABLE"
-        r"|INSERT\s+INTO|UPDATE|DELETE\s+FROM|REFERENCES|TRUNCATE)\s+([A-Za-z0-9_.\"]+)",
-        statement, re.IGNORECASE,
-    ):
-        name = match.group(1)
-        if not name.lower().startswith(prefix):
-            offenders.append(name)
-    # An index is created *on* a table, and that table must be ours. The index's
-    # own name is schema-scoped by the table it indexes, so it needs no prefix.
-    if re.match(r"^\s*CREATE\s+(UNIQUE\s+)?INDEX\b", statement, re.IGNORECASE):
-        target = _INDEX_ON.search(statement)
-        if target and not target.group(1).lower().startswith(prefix):
-            offenders.append(target.group(1))
-    return offenders
+    is_create_index = re.match(r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", text, re.I)
+    for site in _NAME_SITES:
+        for match in site.finditer(text):
+            names = ([match.group("name")] if "name" in site.groupindex and match.group("name")
+                     else re.findall(_NAME, match.group("list")))
+            for name in names:
+                name = name.strip()
+                # An index created *on* one of our tables lives in that table's
+                # schema, so the index's own name may be bare. Nothing else may be.
+                bare_ok = bool(is_create_index) and site is _NAME_SITES[0]
+                if not _in_schema(name, schema, allow_bare=bare_ok):
+                    offenders.append(name)
+    return list(dict.fromkeys(offenders))
 
 
 def applied_versions(conn: Any, schema: str) -> List[int]:
@@ -200,9 +308,12 @@ def migrate(url: Optional[str] = None, schema: Optional[str] = None) -> List[int
     Raises:
         PersistenceUnavailable: If the database cannot be reached.
     """
-    target_schema = schema or config.schema_name()
+    target_schema = config.validate_schema(schema) if schema else config.schema_name()
     applied: List[int] = []
     with pool.connection(url, target_schema) as conn:
+        # Before anything is created: this connection's schema is ours and its
+        # database is the one configured. A mismatch is refused, not corrected.
+        pool.verify_target(conn, target_schema, url)
         done = set(applied_versions(conn, target_schema))
         for migration in migrations(target_schema):
             if migration.version in done:

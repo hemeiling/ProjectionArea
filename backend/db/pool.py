@@ -171,6 +171,41 @@ def connection(url: Optional[str] = None, schema: Optional[str] = None) -> Itera
         ) from None
 
 
+class TargetMismatch(RuntimeError):
+    """A connection is not pointed where this application's writes must go."""
+
+
+def verify_target(conn: Any, schema: str, url: Optional[str] = None) -> None:
+    """Refuse unless ``conn`` resolves names in ``schema``, in the configured database.
+
+    Called before anything destructive — migrations, deletes. Every statement is
+    already schema-qualified; this is the independent check that the connection
+    itself agrees, so a pool built with the wrong options, or a search_path changed
+    underneath it, is caught before a row is removed rather than after.
+
+    ``current_schema()`` is NULL until the schema exists, so the check reads the
+    session's ``search_path`` itself.
+
+    Raises:
+        TargetMismatch: naming what disagreed, never the host or the credentials.
+    """
+    config.validate_schema(schema)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT current_setting('search_path'), current_schema(), current_database()")
+        search_path, current_schema, database = cursor.fetchone()
+    entries = [part.strip().strip('"') for part in (search_path or "").split(",") if part.strip()]
+    if entries != [schema]:
+        raise TargetMismatch(
+            f"refusing: this connection's search_path is not exactly {schema!r}")
+    if current_schema not in (None, schema):
+        raise TargetMismatch(f"refusing: this connection resolves names outside {schema!r}")
+    expected = config.database_name(url or config.database_url())
+    if expected and database != expected:
+        raise TargetMismatch(
+            "refusing: this connection is not to the configured database")
+
+
 #: How long a probe result is trusted. A health check runs every few seconds; the
 #: answer to "is the database up" does not change that fast, and asking every time
 #: is what makes a health check expensive.

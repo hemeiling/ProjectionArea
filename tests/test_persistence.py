@@ -241,13 +241,19 @@ def test_migrations_refuse_to_run_a_statement_that_reaches_outside(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
+        last = None
+
         def execute(self, statement, params=None):
             executed.append(statement)
-            if "information_schema" in statement:
+            _Cursor.last = statement
+            if "information_schema" in statement or "current_setting" in statement:
                 return None
             raise AssertionError(f"a migration statement was executed: {statement!r}")
 
-        def fetchone(self): return (False,)
+        def fetchone(self):
+            if "current_setting" in (_Cursor.last or ""):
+                return ("projection_area", None, "db")   # the target check passes
+            return (False,)
         def fetchall(self): return []
 
     class _Conn:
@@ -263,7 +269,8 @@ def test_migrations_refuse_to_run_a_statement_that_reaches_outside(monkeypatch):
     monkeypatch.setattr(migrations.pool, "connection", fake_connection)
     with pytest.raises(RuntimeError, match="outside"):
         migrations.migrate()
-    assert all("information_schema" in statement for statement in executed), executed
+    assert all("information_schema" in statement or "current_setting" in statement
+               for statement in executed), executed
 
 
 # ── artifacts ────────────────────────────────────────────────────────────────
