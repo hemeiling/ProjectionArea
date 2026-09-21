@@ -125,16 +125,71 @@ function altText(units) {
   return `${num(units.ft2, 2)} ft²   ·   ${num(units.mm2, 0)} mm²`;
 }
 
+/* A Response body is a stream and can be read exactly once.
+ *
+ * This used to call res.json() and, if that threw, res.text() — so any non-JSON
+ * error body replaced the real failure with "body stream already read". A 502 from
+ * a restarted instance is HTML, which is precisely when the operator most needs to
+ * be told what happened. The body is now read once, as text, and parsed from that
+ * string; the HTTP status is always preserved. */
 async function call(path, options = {}) {
-  const res = await fetch(API + path, options);
-  if (!res.ok) {
-    let detail;
-    try { detail = (await res.json()).detail; } catch (e) { detail = await res.text(); }
-    const err = new Error(typeof detail === "string" ? detail : (detail?.headline || "Request failed"));
-    err.detail = detail; err.status = res.status;
+  let res;
+  try {
+    res = await fetch(API + path, options);
+  } catch (networkError) {
+    // fetch rejects only on a network failure: the server went away mid-request,
+    // which on a small instance usually means it was restarted under memory
+    // pressure. Reported as that rather than as a mysterious TypeError.
+    const err = new Error(t("err.network"));
+    err.status = 0;
+    err.detail = { kind: "network", headline: t("err.network"),
+                   reason: String(networkError && networkError.message || networkError) };
     throw err;
   }
-  return res.json();
+
+  const body = await readBodyOnce(res);
+  if (!res.ok) {
+    const detail = (body.json && body.json.detail !== undefined)
+      ? body.json.detail
+      : (body.text || "").trim().slice(0, 300);
+    const err = new Error(
+      typeof detail === "string" && detail
+        ? detail
+        : (detail && detail.headline) || `${res.status} ${res.statusText || ""}`.trim());
+    err.detail = detail;
+    err.status = res.status;
+    throw err;
+  }
+  if (body.json === undefined) {
+    const err = new Error(t("err.badResponse"));
+    err.status = res.status;
+    err.detail = { kind: "bad_response", headline: t("err.badResponse"),
+                   reason: (body.text || "").trim().slice(0, 200) };
+    throw err;
+  }
+  return body.json;
+}
+
+/* Reads a Response body exactly once and reports both views of it.
+ *
+ * `json` is undefined when the body was not JSON — which is how a caller tells a
+ * structured error from an HTML error page, without ever touching the stream a
+ * second time. */
+async function readBodyOnce(res) {
+  let text = "";
+  try {
+    text = await res.text();
+  } catch (e) {
+    // A dropped connection mid-body. There is nothing to parse; the status still
+    // carries meaning.
+    return { text: "", json: undefined };
+  }
+  if (!text) return { text: "", json: undefined };
+  try {
+    return { text, json: JSON.parse(text) };
+  } catch (e) {
+    return { text, json: undefined };
+  }
 }
 
 /* ── screens ─────────────────────────────────────────────────────────────── */
@@ -1135,10 +1190,35 @@ async function applyCalibration() {
     known_unit: st.unit,
   };
   S.calDraft = null;
+
+  /* Recalculating a production drawing takes seconds — 3.6 s for the 101 PDF, and
+   * longer once the result is written back. With no feedback the button looks
+   * dead, which is how a working calibration gets reported as broken. So it says
+   * what it is doing, refuses a second click while it does it, and puts the reason
+   * on screen if it fails rather than leaving the panel unchanged. */
+  const button = $("applyCal");
+  const blocker = $("calBlocker");
+  const restore = button.textContent;
+  button.disabled = true;
+  button.textContent = t("cal.applying");
+  if (blocker) blocker.textContent = "";
+
+  try {
+    await computeArea();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = restore;
+    if (blocker) {
+      blocker.textContent = t("cal.applyFailed", {
+        reason: (error.detail && error.detail.headline) || error.message || "",
+      });
+    }
+    return;
+  }
+
   S.picking = false;
   $("canvasWrap").classList.remove("picking");
   $("pickHint").classList.add("hide");
-  await computeArea();
   paintAll();
 }
 
@@ -1601,6 +1681,14 @@ function adoptSaveOutcome(saved) {
   S.savedAt = null;
   if (!saved) { el.hidden = true; $("saveBtn").classList.add("hide"); $("renameBtn").classList.add("hide"); return; }
   el.hidden = false;
+  if (saved.stored === null) {
+    // A background save is running. Saying "saved" now would be claiming
+    // something the server has not done yet.
+    el.dataset.state = "";
+    el.textContent = t("ws.saving");
+    $("saveBtn").classList.add("hide");
+    return;
+  }
   if (saved.stored && saved.analysis) {
     S.analysisId = saved.analysis.id;
     S.savedAt = saved.analysis.completed_at || saved.analysis.created_at;

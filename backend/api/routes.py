@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -921,15 +922,66 @@ def area(document_id: str, page_number: int, request: AreaRequest) -> Dict[str, 
     )
     body = result.as_dict()
     if request.analysis_id:
-        saved = _persist_recalculation(
-            request.analysis_id, stored, body, operator_scale=request.scale.mode != "auto")
-        if saved is not None:
-            body = {**body, "saved": saved}
+        # Recording the new state costs a round trip to the database plus a
+        # rewrite of the stored artifact — four seconds on the 101 PDF, and more
+        # across regions. The operator is waiting on a calibration, not on a
+        # write, and persistence is observational: it happens after the answer,
+        # off the request, and cannot change it. What comes back says a save was
+        # started, not that it finished.
+        started = _persist_recalculation_async(
+            request.analysis_id, stored, body,
+            operator_scale=request.scale.mode != "auto")
+        if started is not None:
+            body = {**body, "saved": started}
     return body
 
 
-def _persist_recalculation(
+def _persist_recalculation_async(
     analysis_id: str, stored, area_payload: Dict[str, Any], operator_scale: bool
+) -> Optional[Dict[str, Any]]:
+    """Save a recalculated result on a worker thread.
+
+    Returns immediately with what is known now: that persistence is configured and
+    a save was started, or that it was not. The outcome is visible afterwards in
+    the analysis itself — a save that failed leaves the stored state as it was, and
+    the measurement the operator is looking at is unaffected either way.
+
+    Two recalculations of the same analysis in quick succession race, and the last
+    write wins. The event trail records both, so what happened stays readable; a
+    lock would serialise the interactive path again, which is what this exists to
+    avoid.
+    """
+    repository = _repository()
+    if repository is None:
+        return {"stored": False, "reason": "persistence_disabled"}
+
+    # The document's identity is read here, on the request thread, because the
+    # store sweeps by TTL and the worker must not depend on it still being there.
+    source_sha256 = getattr(stored, "source_sha256", "")
+    payload = dict(area_payload)
+
+    def work() -> None:
+        try:
+            _persist_recalculation(
+                analysis_id, _Identity(source_sha256), payload,
+                operator_scale=operator_scale, repository=repository)
+        except Exception as error:  # a background save never breaks anything
+            logger.warning("background save failed: %s", type(error).__name__)
+
+    threading.Thread(target=work, name="pa-save", daemon=True).start()
+    return {"stored": None, "reason": "saving"}
+
+
+class _Identity:
+    """Just the source hash, so the worker holds no reference to a stored document."""
+
+    def __init__(self, source_sha256: str) -> None:
+        self.source_sha256 = source_sha256
+
+
+def _persist_recalculation(
+    analysis_id: str, stored, area_payload: Dict[str, Any], operator_scale: bool,
+    repository=None,
 ) -> Optional[Dict[str, Any]]:
     """Make a recalculated result the saved state of its analysis.
 
@@ -941,7 +993,7 @@ def _persist_recalculation(
     Refuses to write unless the document is provably the same drawing: a
     calibration measured on one drawing must never land on another's record.
     """
-    repository = _repository()
+    repository = repository or _repository()
     if repository is None:
         return {"stored": False, "reason": "persistence_disabled"}
     try:

@@ -284,5 +284,9 @@
   "cache.body": "本文件在 {when} 已由相同版本的引擎完成分析。打开已有结果无需重新计算。",
   "cache.open": "打开已有分析",
   "cache.again": "仍然重新分析",
-  "saved.restored": "已打开保存的分析"
+  "saved.restored": "已打开保存的分析",
+  "err.network": "服务器未响应。实例可能已重启 — 大型图纸可能耗尽小规格实例的内存。",
+  "err.badResponse": "服务器返回了本页面无法读取的内容。",
+  "cal.applying": "正在应用标定…",
+  "cal.applyFailed": "标定未能应用 — {reason}"
 }

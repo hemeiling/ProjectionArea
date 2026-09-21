@@ -64,6 +64,8 @@ def find_code(text: str) -> Optional[str]:
         return REGION_WHOLE_PAGE
     if "printed" in lowered and "ratio" in lowered and "assum" in lowered:
         return SCALE_PRINTED_RATIO_ASSUMED
+    if "supplied by the operator" in lowered:
+        return SCALE_OPERATOR_SUPPLIED
     return None
 
 

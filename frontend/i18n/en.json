@@ -284,5 +284,9 @@
   "cache.body": "An analysis of this exact file by this exact engine version was completed on {when}. Reopening it restores the result without measuring again.",
   "cache.open": "Open previous analysis",
   "cache.again": "Re-analyse anyway",
-  "saved.restored": "Reopened a saved analysis"
+  "saved.restored": "Reopened a saved analysis",
+  "err.network": "The server did not respond. It may have restarted — large drawings can exhaust a small instance.",
+  "err.badResponse": "The server replied with something this page could not read.",
+  "cal.applying": "Applying calibration…",
+  "cal.applyFailed": "Calibration could not be applied — {reason}"
 }

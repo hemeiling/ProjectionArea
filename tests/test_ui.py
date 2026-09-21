@@ -10,6 +10,7 @@ calibrate, choose a reading, see the overlay follow it, and understand why.
 
 from __future__ import annotations
 
+import math
 import re
 
 import pytest
@@ -1233,3 +1234,414 @@ def test_every_calibration_string_exists_in_both_languages():
         assert en.get(key), f"{key} missing in English"
         assert zh.get(key), f"{key} missing in Chinese"
         assert any("一" <= c <= "鿿" for c in zh[key]), f"{key} not translated"
+
+
+# ── error handling on the wire ───────────────────────────────────────────────
+#
+# A Response body is a stream and can be read once. The fetch helper used to call
+# res.json() and, when that threw, res.text() — so every non-JSON failure was
+# replaced by "body stream already read". A 502 from a restarted instance is HTML,
+# which is exactly when the operator most needs the real reason.
+
+
+def _drive_call(page, route_handler, path="/api/analyses"):
+    """Intercept one request and return what call() threw or returned."""
+    page.route(f"**{path}*", route_handler)
+    return page.evaluate(
+        """async (p) => {
+            try {
+                const value = await call(p);
+                return { ok: true, value };
+            } catch (error) {
+                return {
+                    ok: false, message: String(error.message || ""),
+                    status: error.status, kind: (error.detail || {}).kind,
+                    detail: typeof error.detail === "string"
+                        ? error.detail : JSON.stringify(error.detail || null),
+                };
+            }
+        }""",
+        path,
+    )
+
+
+def _page(pw, viewer_url):
+    browser = _launch(pw)
+    page = browser.new_page(viewport={"width": 1500, "height": 950})
+    page.goto(viewer_url)
+    page.wait_for_selector("#dropzone", timeout=30000)
+    return browser, page
+
+
+def test_a_502_from_a_restarted_instance_surfaces_the_status(viewer_url):
+    """Render returns an HTML 502 when it restarts an instance under memory
+    pressure. That must reach the operator as a 502, not as a stream error."""
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        outcome = _drive_call(page, lambda route: route.fulfill(
+            status=502, content_type="text/html",
+            body="<html><head><title>502 Bad Gateway</title></head><body>"
+                 "<h1>Bad Gateway</h1></body></html>"))
+        browser.close()
+
+    assert outcome["ok"] is False
+    assert outcome["status"] == 502
+    assert "body stream already read" not in outcome["message"].lower(), (
+        "the real failure was replaced by a stream error"
+    )
+    assert "502" in outcome["message"] or "bad gateway" in outcome["message"].lower()
+
+
+def test_a_non_json_error_body_is_reported_not_swallowed(viewer_url):
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        outcome = _drive_call(page, lambda route: route.fulfill(
+            status=500, content_type="text/plain", body="upstream connect error"))
+        browser.close()
+
+    assert outcome["ok"] is False
+    assert outcome["status"] == 500
+    assert "body stream already read" not in outcome["message"].lower()
+    assert "upstream connect error" in outcome["message"]
+
+
+def test_an_empty_error_body_still_carries_its_status(viewer_url):
+    """A proxy can return a bare status with nothing in it."""
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        outcome = _drive_call(page, lambda route: route.fulfill(status=503, body=""))
+        browser.close()
+
+    assert outcome["ok"] is False
+    assert outcome["status"] == 503
+    assert "body stream already read" not in outcome["message"].lower()
+    assert outcome["message"].strip(), "an empty body must not produce an empty message"
+
+
+def test_a_dropped_connection_is_named_as_one(viewer_url):
+    """fetch rejects only on a network failure: the server went away mid-request,
+    which on a small instance usually means it was restarted."""
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        outcome = _drive_call(page, lambda route: route.abort("connectionreset"))
+        browser.close()
+
+    assert outcome["ok"] is False
+    assert outcome["status"] == 0
+    assert outcome["kind"] == "network"
+    assert "restart" in outcome["message"].lower() or "not respond" in outcome["message"].lower()
+    assert "body stream already read" not in outcome["message"].lower()
+
+
+def test_a_success_that_is_not_json_is_reported_rather_than_crashing(viewer_url):
+    """A 200 carrying an HTML login or error page would otherwise throw deep in
+    the caller, far from the cause."""
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        outcome = _drive_call(page, lambda route: route.fulfill(
+            status=200, content_type="text/html", body="<html>not json</html>"))
+        browser.close()
+
+    assert outcome["ok"] is False
+    assert outcome["kind"] == "bad_response"
+    assert "body stream already read" not in outcome["message"].lower()
+
+
+def test_the_response_body_is_read_at_most_once(viewer_url):
+    """The property itself, enforced by making a second read impossible: the
+    Response is wrapped so any extra call to json() or text() is recorded."""
+    with playwright_api.sync_playwright() as pw:
+        browser, page = _page(pw, viewer_url)
+        page.route("**/api/analyses*", lambda route: route.fulfill(
+            status=500, content_type="text/html", body="<html>boom</html>"))
+        reads = page.evaluate(
+            """async () => {
+                const originalFetch = window.fetch;
+                const counts = { json: 0, text: 0, body: 0 };
+                window.fetch = async (...args) => {
+                    const res = await originalFetch(...args);
+                    const wrapped = {
+                        ok: res.ok, status: res.status, statusText: res.statusText,
+                        headers: res.headers,
+                        json: () => { counts.json++; return res.json(); },
+                        text: () => { counts.text++; return res.text(); },
+                        get body() { counts.body++; return res.body; },
+                    };
+                    return wrapped;
+                };
+                try { await call("/api/analyses"); } catch (e) { /* expected */ }
+                window.fetch = originalFetch;
+                return counts;
+            }"""
+        )
+        browser.close()
+
+    total = reads["json"] + reads["text"]
+    assert total == 1, f"the body was read {total} times: {reads}"
+
+
+def test_a_job_poll_that_fails_mid_analysis_keeps_the_progress_and_explains(
+    viewer_url, drawings
+):
+    """The whole point of the fix, in the place it was reported: a poll that gets
+    a 502 must leave the bar where it was and say what happened."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        page.goto(viewer_url)
+        page.wait_for_selector("#dropzone", timeout=30000)
+
+        polls = {"n": 0}
+
+        def handler(route):
+            polls["n"] += 1
+            if polls["n"] >= 2:
+                # The instance was restarted between polls.
+                route.fulfill(status=502, content_type="text/html",
+                              body="<html>502 Bad Gateway</html>")
+            else:
+                route.continue_()
+
+        page.route("**/api/jobs/**", handler)
+        page.set_input_files("#fileInput", drawings["layout_1_100"]["path"])
+        page.wait_for_selector("#procNotice .notice", timeout=120000)
+        page.wait_for_timeout(500)
+
+        state = page.evaluate("""() => ({
+            notice: document.getElementById('procNotice').innerText,
+            pct: document.getElementById('progressPct').textContent,
+            cls: document.getElementById('progressBlock').className,
+        })""")
+        browser.close()
+
+    assert "body stream already read" not in state["notice"].lower(), (
+        "the stream error replaced the real one: " + state["notice"]
+    )
+    assert "failed" in state["cls"]
+    assert state["notice"].strip()
+
+
+def _calibrate_to_unit_scale(page):
+    """Pick two points and declare their span as the real distance.
+
+    The operator's own test: when the known distance equals the measured span the
+    scale is exactly 1 mm/unit, so area_mm2 must equal area_units2 and a wrong
+    factor — or a squared one — cannot hide.
+    """
+    box = page.locator("#canvasWrap").bounding_box()
+    cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    page.mouse.click(cx - 130, cy)
+    page.wait_for_timeout(300)
+    page.mouse.click(cx + 130, cy)
+    page.wait_for_timeout(300)
+    picks = page.evaluate("() => window.__state.picks")
+    span = math.hypot(picks[1][0] - picks[0][0], picks[1][1] - picks[0][1])
+    page.fill("#knownLength", f"{span:.4f}")
+    page.select_option("#knownUnit", "mm")
+    page.wait_for_timeout(300)
+    page.click("#applyCal")
+    page.wait_for_function(
+        "() => ((window.__state.result || {}).scale || {}).verified === true",
+        timeout=120000)
+    page.wait_for_timeout(600)
+    return span
+
+
+def test_apply_calibration_actually_applies_it(viewer_url, drawings):
+    """Reported as doing nothing. It worked, but took 7.7 seconds with no feedback
+    — indistinguishable from a dead button. This asserts the outcome and the
+    arithmetic; the busy state is covered below."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+        _calibrate_to_unit_scale(page)
+
+        state = page.evaluate("""() => ({
+            scale: (window.__state.result || {}).scale,
+            unitsArea: (window.__state.result || {}).area_pdf_units2,
+            physical: (window.__state.result || {}).projected_area,
+            badges: document.getElementById('rdBadges').textContent,
+            value: document.getElementById('rdValue').textContent,
+        })""")
+        browser.close()
+
+    assert errors == [], errors
+    assert state["scale"]["verified"] is True
+    assert state["scale"]["operator_supplied"] is True
+    assert state["scale"]["source"] == "user_two_point_calibration"
+    assert state["scale"]["mm_per_unit"] == pytest.approx(1.0, rel=1e-3), (
+        "declaring the measured span as the distance must give 1 mm/unit"
+    )
+    assert state["physical"]["verified"] is True
+    assert state["physical"]["net"]["mm2"] == pytest.approx(
+        state["unitsArea"]["net"], rel=1e-3)
+    assert "OPERATOR CALIBRATED" in state["badges"].upper()
+    assert "SCALE REQUIRES CONFIRMATION" not in state["badges"].upper()
+    assert "Not available" not in state["value"]
+
+
+def test_apply_says_it_is_working_and_refuses_a_second_click(viewer_url, drawings):
+    """Three and a half seconds of silence is what made a working button look
+    broken."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+
+        box = page.locator("#canvasWrap").bounding_box()
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.click(cx - 130, cy); page.wait_for_timeout(300)
+        page.mouse.click(cx + 130, cy); page.wait_for_timeout(300)
+        page.fill("#knownLength", "150")
+        page.wait_for_timeout(250)
+
+        # Hold the recalculation open so the in-flight state can be observed.
+        page.route("**/pages/*/area", lambda route: (
+            page.wait_for_timeout(1200), route.continue_())[1])
+        page.click("#applyCal")
+        page.wait_for_timeout(400)
+        during = page.evaluate("""() => ({
+            disabled: document.getElementById('applyCal').disabled,
+            label: document.getElementById('applyCal').textContent.trim(),
+        })""")
+        page.wait_for_function(
+            "() => ((window.__state.result || {}).scale || {}).verified === true",
+            timeout=120000)
+        browser.close()
+
+    assert during["disabled"], "a second click would start a second recalculation"
+    assert "applying" in during["label"].lower(), during["label"]
+
+
+def test_calibration_works_after_zooming(viewer_url, drawings):
+    """Zoom changes the mapping from screen to drawing coordinates. The points must
+    still be recorded in drawing units, or the scale would depend on zoom."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#zoomIn")
+        page.wait_for_timeout(400)
+        page.click("#zoomIn")
+        page.wait_for_timeout(600)
+        zoom = page.evaluate("() => window.__state.zoom")
+
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+        _calibrate_to_unit_scale(page)
+        scale = page.evaluate("() => (window.__state.result || {}).scale")
+        browser.close()
+
+    assert zoom > 1.0, "the test did not actually zoom"
+    assert scale["verified"] is True
+    assert scale["mm_per_unit"] == pytest.approx(1.0, rel=1e-3), (
+        "the scale must not depend on the zoom level"
+    )
+
+
+def test_calibration_works_after_switching_language_mid_flow(viewer_url, drawings):
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+
+        box = page.locator("#canvasWrap").bounding_box()
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.click(cx - 130, cy)
+        page.wait_for_timeout(300)
+
+        _switch(page, "zh-CN")
+        steps = page.eval_on_selector_all(
+            ".steps.four li", "els => els.map(e => e.textContent.trim())")
+        kept = page.evaluate("() => window.__state.picks.length")
+
+        page.mouse.click(cx + 130, cy)
+        page.wait_for_timeout(300)
+        picks = page.evaluate("() => window.__state.picks")
+        span = math.hypot(picks[1][0] - picks[0][0], picks[1][1] - picks[0][1])
+        page.fill("#knownLength", f"{span:.4f}")
+        page.wait_for_timeout(250)
+        page.click("#applyCal")
+        page.wait_for_function(
+            "() => ((window.__state.result || {}).scale || {}).verified === true",
+            timeout=120000)
+        scale = page.evaluate("() => (window.__state.result || {}).scale")
+        browser.close()
+
+    assert kept == 1, "switching language discarded the first point"
+    assert any("一" <= c <= "鿿" for step in steps for c in step), steps
+    assert scale["mm_per_unit"] == pytest.approx(1.0, rel=1e-3)
+
+
+def test_calibration_works_after_cancelling_and_starting_again(viewer_url, drawings):
+    """Cancel must clear the picks, and a second attempt must behave like the
+    first rather than inheriting half a state."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+
+        box = page.locator("#canvasWrap").bounding_box()
+        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.click(cx - 100, cy)
+        page.wait_for_timeout(300)
+        page.fill("#knownLength", "999")
+        page.wait_for_timeout(200)
+
+        page.click("#cancelCal")
+        page.wait_for_timeout(500)
+        cleared = page.evaluate("() => window.__state.picks.length")
+
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+        fresh_distance = page.input_value("#knownLength")
+        points_text = page.inner_text(".kv.points")
+
+        _calibrate_to_unit_scale(page)
+        scale = page.evaluate("() => (window.__state.result || {}).scale")
+        browser.close()
+
+    assert cleared == 0, "cancel left points behind"
+    assert fresh_distance == "", "the abandoned distance came back"
+    assert points_text.count("not selected") == 2
+    assert scale["mm_per_unit"] == pytest.approx(1.0, rel=1e-3)
+
+
+def test_explain_and_export_carry_the_calibration(viewer_url, drawings):
+    """The audit trail: what the operator declared has to survive into the
+    explanation and into the exported JSON."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _upload(page, viewer_url, drawings["raster_plate"]["path"])
+        page.click("#startCal")
+        page.wait_for_selector(".steps.four", timeout=30000)
+        span = _calibrate_to_unit_scale(page)
+
+        page.click("#tabs button[data-tab=explain]")
+        page.wait_for_timeout(500)
+        explain = page.inner_text("#explainFlow")
+        page.click("#tabs button[data-tab=warnings]")
+        page.wait_for_timeout(300)
+        warnings = page.inner_text("#warningsPane")
+
+        exported = page.evaluate(
+            "() => JSON.stringify(window.__state.result)")
+        browser.close()
+
+    assert "calibrat" in explain.lower() or "operator" in explain.lower(), explain[:200]
+    assert "mm/unit" in explain
+    assert "operator" in warnings.lower() or "calibrat" in warnings.lower()
+    assert "user_two_point_calibration" in exported
+    assert f"{span:.4f}"[:6] in exported or "known_length" in exported

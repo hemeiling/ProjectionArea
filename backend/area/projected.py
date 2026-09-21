@@ -125,6 +125,18 @@ def compute_projected_area(
     """
     tolerances: Tolerances = analysis.tolerances
     warnings: List[str] = list(extra_warnings or [])
+
+    # A scale the operator supplied is usable, and it is not verified from the
+    # drawing — §4. The structured scale block has always said so, but the warnings
+    # list is the human-readable caveat channel and the one an exported JSON carries
+    # as its audit record, so it says so too. The message code already existed in
+    # the catalogue, in both languages; nothing emitted it.
+    if scale.operator_supplied and scale.verified:
+        warnings.append(
+            "The scale was supplied by the operator, not derived from the drawing. "
+            "Every physical area below depends on that declared distance being right."
+        )
+
     assumptions: List[str] = []
     repairs: List[Repair] = []
     notes: List[str] = []
