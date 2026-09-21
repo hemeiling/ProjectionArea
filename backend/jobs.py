@@ -156,8 +156,45 @@ def advance(job: Job, stage: str, detail: str = "") -> None:
     job.detail = detail
 
 
+def _raised_at(error: BaseException) -> Optional[str]:
+    """Where in this application an exception was raised: ``file:function:line``.
+
+    The innermost frame inside ``backend/`` — so a failure in a library call is
+    reported at the line of ours that made the call, which is the line someone can
+    act on. Source locations only: never an argument, a local or a message, so no
+    drawing content can reach the browser this way (§35).
+    """
+    import os
+
+    location = None
+    frame = error.__traceback__
+    while frame is not None:
+        code = frame.tb_frame.f_code
+        path = code.co_filename.replace(os.sep, "/")
+        if "/backend/" in path:
+            short = path[path.rindex("/backend/") + 1:]
+            location = f"{short}:{code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return location
+
+
 def _describe(error: Exception) -> Dict[str, Any]:
-    """Turn an exception into the actionable shape the UI already renders."""
+    """Turn an exception into the actionable shape the UI already renders.
+
+    Every description carries ``error_type`` and ``raised_at``. The 102 DWG failed
+    with a UnicodeDecodeError that was reported only as "the drawing could not be
+    read" — no type, no line — and finding the throwing operation meant reasoning
+    backwards from the stage it happened in. These two fields would have named it.
+    """
+    described = _describe_kind(error)
+    described.setdefault("error_type", type(error).__name__)
+    raised_at = _raised_at(error)
+    if raised_at:
+        described.setdefault("raised_at", raised_at)
+    return described
+
+
+def _describe_kind(error: Exception) -> Dict[str, Any]:
     from backend.cad.dwg import DwgConversionFailed, DwgConversionUnavailable
 
     if isinstance(error, DwgConversionUnavailable):
@@ -195,6 +232,21 @@ def _describe(error: Exception) -> Dict[str, Any]:
                 "Run this on an instance with more memory, or upload a smaller "
                 "export — a single view, or a DXF of the relevant layers."
             ),
+        }
+    if isinstance(error, UnicodeError):
+        # UnicodeDecodeError subclasses ValueError, so without this it fell into the
+        # branch below and was reported as an unreadable drawing. It is not: every
+        # drawing reaches this application as bytes, and a failure to decode them is
+        # a defect in how this application handled text — which the operator should
+        # be told, rather than being sent to re-export a perfectly good drawing.
+        return {
+            "kind": "internal_error",
+            "headline": "The analysis failed on a text-encoding error in this application.",
+            "reason": (
+                f"{type(error).__name__} while handling the drawing's text. The drawing "
+                "itself is not at fault: CAD files routinely use a non-UTF-8 codepage."
+            ),
+            "fix": "Report this with the error location below; re-exporting will not help.",
         }
     if isinstance(error, ValueError):
         text = str(error)

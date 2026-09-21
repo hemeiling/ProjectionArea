@@ -254,6 +254,28 @@ def _is_executable(path: str) -> bool:
     return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+def _decode_output(raw: Optional[bytes]) -> str:
+    """Converter output as text, for warnings and logs only. Never raises.
+
+    A converter's stdout and stderr are **not** guaranteed to be UTF-8. A pre-2007
+    DWG stores its strings in the drawing's codepage — the production drawings
+    declare ``ANSI_936``, which is GBK — and a converter may echo those strings raw
+    in its messages. Decoding that stream with ``text=True`` raised
+    ``UnicodeDecodeError`` on byte ``0xC3`` of the 102 DWG, a GBK lead byte, and
+    failed the whole analysis over a *diagnostic* message.
+
+    ``backslashreplace`` rather than ``replace``: a byte that is not UTF-8 is shown
+    as ``\xc3`` instead of being turned into a replacement character, so nothing
+    in the converter's message is silently lost.
+
+    This is only ever applied to what the converter *says*. The DXF it *writes* is
+    never decoded here — ezdxf reads it and honours its declared ``$DWGCODEPAGE``.
+    """
+    if not raw:
+        return ""
+    return raw.decode("utf-8", errors="backslashreplace")
+
+
 #: Answers from ``dwg2dxf --version``, keyed by the binary's identity.
 _VERSION_CACHE: Dict[Tuple[str, int, int], str] = {}
 
@@ -282,8 +304,9 @@ def _dwg2dxf_version(path: str) -> str:
 
     version = "unknown"
     try:
-        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=20)
-        text = (out.stdout or out.stderr or "").strip().splitlines()
+        # Bytes, decoded safely: see _decode_output.
+        out = subprocess.run([path, "--version"], capture_output=True, timeout=20)
+        text = (_decode_output(out.stdout) or _decode_output(out.stderr)).strip().splitlines()
         if text:
             match = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", text[0])
             version = match.group(1) if match else text[0][:40]
@@ -330,9 +353,12 @@ def converter_status(reveal_paths: bool = False) -> Dict[str, Any]:
 def _run_libredwg(tool: Converter, source: str, target: str) -> List[str]:
     """Convert with ``dwg2dxf``; returns the converter's own warnings."""
     started = time.time()
+    # Captured as bytes. With text=True the interpreter decodes stdout and stderr as
+    # UTF-8 inside subprocess.run, and a GBK string echoed by the converter raises
+    # there — before this function sees the output at all.
     result = subprocess.run(
         [tool.path, "-y", "-o", target, source],
-        capture_output=True, text=True, timeout=CONVERSION_TIMEOUT_SECONDS,
+        capture_output=True, timeout=CONVERSION_TIMEOUT_SECONDS,
     )
     # A negative return code is a signal: -9 is SIGKILL, which is what an
     # out-of-memory killer leaves, and -11 is a segmentation fault. Those are
@@ -341,7 +367,7 @@ def _run_libredwg(tool: Converter, source: str, target: str) -> List[str]:
         "dwg2dxf", result.returncode, time.time() - started,
         dxf_bytes=(os.path.getsize(target) if os.path.exists(target) else 0),
     )
-    stderr = result.stderr or ""
+    stderr = _decode_output(result.stderr)
     warnings = [
         line.strip() for line in stderr.splitlines()
         if line.strip().lower().startswith(("warning", "error"))
@@ -363,15 +389,18 @@ def _run_oda(tool: Converter, source: str, target: str) -> List[str]:
     staged = os.path.join(in_dir, os.path.basename(source))
     shutil.copy2(source, staged)
 
+    started = time.time()
+    # Bytes, for the same reason as LibreDWG: see _decode_output.
     result = subprocess.run(
         [tool.path, in_dir, out_dir, "ACAD2018", "DXF", "0", "1"],
-        capture_output=True, text=True, timeout=CONVERSION_TIMEOUT_SECONDS,
+        capture_output=True, timeout=CONVERSION_TIMEOUT_SECONDS,
     )
+    diagnostics.subprocess_outcome("oda", result.returncode, time.time() - started)
     produced = [n for n in os.listdir(out_dir) if n.lower().endswith(".dxf")]
     if not produced:
+        said = (_decode_output(result.stderr) or _decode_output(result.stdout)).strip()
         raise DwgConversionFailed(
-            "ODA File Converter produced no DXF: "
-            + ((result.stderr or result.stdout or "").strip()[:200] or "no output")
+            "ODA File Converter produced no DXF: " + (said[:200] or "no output")
         )
     shutil.move(os.path.join(out_dir, produced[0]), target)
     return []
