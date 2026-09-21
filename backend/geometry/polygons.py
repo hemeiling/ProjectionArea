@@ -11,6 +11,8 @@ from typing import List, Optional, Sequence, Tuple
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
+
+from backend import diagnostics
 from shapely.validation import make_valid
 
 from backend.models import Point, ProfileComponent, Repair
@@ -57,7 +59,10 @@ def union_polygons(polygons: Sequence[Polygon], min_area: float = 0.0) -> Option
     kept = [p for p in polygons if not p.is_empty and p.area >= min_area]
     if not kept:
         return None
-    merged = unary_union(kept)
+    # A boolean union over every component. On the largest production drawing this
+    # is the single most expensive native call in the pipeline.
+    with diagnostics.stage("union", parts=len(kept)):
+        merged = unary_union(kept)
     merged, _ = ensure_valid(merged)
     return merged if not merged.is_empty else None
 

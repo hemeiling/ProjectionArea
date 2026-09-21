@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from backend.cad.dxf import CadDrawing, DxfReadError, load_dxf
+from backend import diagnostics
 from backend.progress import NULL_PROGRESS, Progress
 from backend.runtime import CONVERTER_ENV, converter_hint, is_managed_host
 
@@ -328,9 +329,17 @@ def converter_status(reveal_paths: bool = False) -> Dict[str, Any]:
 
 def _run_libredwg(tool: Converter, source: str, target: str) -> List[str]:
     """Convert with ``dwg2dxf``; returns the converter's own warnings."""
+    started = time.time()
     result = subprocess.run(
         [tool.path, "-y", "-o", target, source],
         capture_output=True, text=True, timeout=CONVERSION_TIMEOUT_SECONDS,
+    )
+    # A negative return code is a signal: -9 is SIGKILL, which is what an
+    # out-of-memory killer leaves, and -11 is a segmentation fault. Those are
+    # different diagnoses, and "conversion failed" hides both.
+    diagnostics.subprocess_outcome(
+        "dwg2dxf", result.returncode, time.time() - started,
+        dxf_bytes=(os.path.getsize(target) if os.path.exists(target) else 0),
     )
     stderr = result.stderr or ""
     warnings = [

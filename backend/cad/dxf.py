@@ -45,6 +45,7 @@ from backend.cad.provenance import (
     CadText,
 )
 from backend.models import BBox, Point, Primitive, PrimitiveKind, Scale
+from backend import diagnostics
 from backend.progress import NULL_PROGRESS, Progress
 
 #: How finely a curve is sampled. Matches the PDF path's intent: fine enough
@@ -594,7 +595,12 @@ def load_dxf(
         )
 
     try:
-        doc, auditor = recover.readfile(path)
+        # Parsing a 120 MB DXF into ezdxf's object model. Pure-Python work under
+        # the GIL: on the production DWGs this is where the event loop stalls, so it
+        # is marked on its own and not folded into "geometry" (§32).
+        with diagnostics.stage("dxf.parse",
+                               dxf_bytes=os.path.getsize(path) if os.path.exists(path) else None):
+            doc, auditor = recover.readfile(path)
     except IOError as error:
         raise DxfReadError(f"{file_name} could not be opened: {error}") from error
     except Exception as error:
@@ -655,6 +661,7 @@ def load_dxf(
         info.layers.append(entry)
         reader.layer_colors[entry.name] = entry.color
 
+    diagnostics.note("dxf.blocks.scan", blocks=len(doc.blocks))
     for block in doc.blocks:
         name = str(block.name)
         if name.lower().startswith(("*model_space", "*paper_space")):
@@ -671,7 +678,13 @@ def load_dxf(
     info.linetypes = sorted({str(lt.dxf.name) for lt in doc.linetypes})
     info.layouts = [str(name) for name in doc.layout_names()]
 
-    reader.visit(doc.modelspace(), _Context(space="model"))
+    # Walking model space, expanding every INSERT recursively and normalising each
+    # entity into primitives. The other long GIL-holding stretch.
+    with diagnostics.stage("dxf.expand_and_normalise",
+                           modelspace=reader.expected_entities) as facts:
+        reader.visit(doc.modelspace(), _Context(space="model"))
+        facts["entities_seen"] = reader._seen
+        facts["primitives"] = len(reader.primitives)
     progress.advance(reader._seen, reader.expected_entities)
     if include_paperspace:
         for name in doc.layout_names():

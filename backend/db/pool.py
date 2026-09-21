@@ -178,6 +178,7 @@ PROBE_CACHE_SECONDS = 15.0
 
 _probe_result: Optional[bool] = None
 _probe_at: float = 0.0
+_probe_refreshing = threading.Event()
 
 
 def probe(force: bool = False) -> bool:
@@ -195,8 +196,23 @@ def probe(force: bool = False) -> bool:
     if not config.is_enabled():
         return False
     now = time.monotonic()
-    if not force and _probe_result is not None and (now - _probe_at) < PROBE_CACHE_SECONDS:
+    if _probe_result is not None and (now - _probe_at) < PROBE_CACHE_SECONDS and not force:
         return _probe_result
+
+    # Refresh off the caller's thread. /health is served on the event loop, and a
+    # database round trip there would block every other request — the opposite of
+    # what a health check is for. A stale answer for a few seconds is the right
+    # trade; an unavailable database is not an emergency for a tool whose
+    # measurements do not depend on it.
+    if not _probe_refreshing.is_set():
+        _probe_refreshing.set()
+        threading.Thread(target=_refresh_probe, name="pa-db-probe", daemon=True).start()
+    return _probe_result if _probe_result is not None else False
+
+
+def _refresh_probe() -> None:
+    """Ask the database whether it is there. Runs on its own thread, never raises."""
+    global _probe_result, _probe_at
 
     result = False
     try:
@@ -217,9 +233,9 @@ def probe(force: bool = False) -> bool:
                     result = cursor.fetchone()[0] == 1
     except Exception:
         result = False
-
-    _probe_result, _probe_at = result, now
-    return result
+    finally:
+        _probe_result, _probe_at = result, time.monotonic()
+        _probe_refreshing.clear()
 
 
 def _close_locked() -> None:

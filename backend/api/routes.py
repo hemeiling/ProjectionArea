@@ -22,6 +22,7 @@ from backend.api.schemas import (
 )
 from backend.area.projected import compute_projected_area
 from backend.calibration.scale import scale_from_ratio, scale_from_two_points
+from backend import diagnostics
 from backend.config import ENGINE_VERSION, INTERPRETATION_VERSION
 from backend.cad.dwg import DwgConversionUnavailable, converter_status
 from backend.jobs import JOBS, advance
@@ -54,8 +55,20 @@ _DEMO_DOCUMENTS: Set[str] = set()
 
 
 @router.get("/health")
-def health() -> Dict[str, Any]:
+async def health() -> Dict[str, Any]:
     """Liveness plus what this instance can actually read.
+
+    **async on purpose.** A sync ``def`` endpoint runs in FastAPI's threadpool, and
+    that threadpool competes for the GIL with the analysis running on its own
+    thread. Measured during a production DWG: ``/health`` took 6.3 seconds and a
+    job poll 2.8 seconds, on a twelve-core machine — on a two-CPU instance that is
+    long enough for a platform to decide the instance is dead and restart it, in
+    the middle of an eight-minute measurement. The event loop itself stays
+    responsive, so serving from the loop is what keeps these answerable.
+
+    Everything here must therefore stay non-blocking: no query, no connection, no
+    subprocess. The converter lookup is memoised and the database state is a cached
+    value refreshed on another thread.
 
     Cheap on purpose: a health check runs every few seconds, so it opens no
     drawing and touches no disk beyond looking for the converter binary. It
@@ -446,6 +459,11 @@ def _run_analysis(
     """
     progress = job.tracker
 
+    # Every stage boundary is logged with the process's and the container's memory
+    # either side of it, so a run that is killed leaves a record of which stage it
+    # was in and what it was holding (§32).
+    diagnostics.note("analysis.start", kind=kind, size_bytes=source_size)
+
     progress.begin("validated" if kind != "pdf" else "loaded")
     if kind == "dwg":
         advance(job, "validated", f"{_signature_of(spooled) or 'DWG'} signature")
@@ -497,6 +515,12 @@ def _run_analysis(
 
     analysis = analyze(stored.id, page_number)
 
+    try:
+        diagnostics.note("stage.candidates.begin", primitives=(
+            len(stored.cad.primitives) if stored.cad is not None
+            else len(prepared.analysis.primitives)))
+    except Exception as error:  # never fail a measurement over a log line
+        logger.warning("diagnostics failed: %s", type(error).__name__)
     progress.begin("candidates")
     region = prepared.default_region()
     scale, warnings = _resolve_scale(prepared, region, ScaleSpec(), stored)
@@ -518,6 +542,21 @@ def _run_analysis(
     overlay = geometry(stored.id, page_number, roles=roles, max_primitives=8000)
     progress.finish("area", f"{result.geometry.component_count} components")
     progress.complete()
+
+    # Instrumentation must never be able to fail the measurement it observes. This
+    # line once named a field that does not exist, and every analysis then failed
+    # at 100 % — so the facts are read defensively and the whole call is guarded.
+    try:
+        watchdog = diagnostics.watchdog()
+        diagnostics.note(
+            "analysis.complete",
+            **diagnostics.facts_of(
+                result.geometry, "component_count", "holes", "face_count",
+                "segment_count", "raw_primitive_count"),
+            **(watchdog.summary() if watchdog else {}),
+        )
+    except Exception as error:  # pragma: no cover — defensive by design
+        logger.warning("diagnostics failed: %s", type(error).__name__)
 
     payload = {
         "document": summary,
@@ -684,8 +723,13 @@ def _persistence_failed(error: Exception) -> HTTPException:
 
 
 @router.get("/jobs/{job_id}")
-def job_status(job_id: str) -> Dict[str, Any]:
+async def job_status(job_id: str) -> Dict[str, Any]:
     """Progress of a background ingestion.
+
+    Also async, and for the same reason: this is the request the browser makes
+    every 700 ms while a drawing is being measured, and it is the one whose failure
+    the operator sees. It is an in-memory dictionary lookup — there is no reason
+    for it to wait behind a threadpool that the analysis is starving.
 
     A job the store has never heard of is usually not a typo. Jobs live in this
     process, so the common cause is that the process is not the one that started

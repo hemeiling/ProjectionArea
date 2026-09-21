@@ -47,6 +47,8 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize, unary_union
 from shapely.strtree import STRtree
 
+from backend import diagnostics
+
 from backend.geometry.polygons import ensure_valid, ring_to_polygon, union_polygons
 from backend.geometry.segments import SegmentNetwork
 from backend.models import Repair
@@ -85,6 +87,7 @@ def solid_faces_by_depth(faces: Sequence[Polygon]) -> Tuple[List[Polygon], List[
 
     outer_rings = [Polygon(face.exterior) for face in faces]
     points = [face.representative_point() for face in faces]
+    diagnostics.note("strtree.build", rings=len(outer_rings))
     tree = STRtree(outer_rings)
 
     solids: List[Polygon] = []
@@ -120,9 +123,19 @@ def polygonize_network(network: SegmentNetwork, min_polygon_area: float) -> Cont
 
     faces: List[Polygon] = []
     if network.segments:
-        lines = MultiLineString([list(segment) for segment in network.segments])
-        noded = unary_union(lines)
-        faces = [face for face in polygonize(noded) if face.area >= min_polygon_area]
+        # The two calls below are where a production drawing spends its time and
+        # its memory: noding 1.7 million segments and polygonizing the result are
+        # single native operations that hold the GIL, so nothing else in the
+        # process runs while they do — including the health check a platform uses
+        # to decide the instance is alive. Marked so a log shows which one a
+        # restart interrupted (§32).
+        with diagnostics.stage("noding", segments=len(network.segments)) as facts:
+            lines = MultiLineString([list(segment) for segment in network.segments])
+            noded = unary_union(lines)
+            facts["noded_parts"] = getattr(noded, "geom_type", "?")
+        with diagnostics.stage("polygonize") as facts:
+            faces = [face for face in polygonize(noded) if face.area >= min_polygon_area]
+            facts["faces"] = len(faces)
 
     if not faces and not network.filled_rings:
         return ContourResult(

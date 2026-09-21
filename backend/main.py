@@ -10,6 +10,7 @@ so there is no CORS hop and no ``file://`` restrictions.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend import diagnostics
 from backend.api.routes import health as api_health, router
 from backend.config import ENGINE_VERSION
 from backend.db import config as db_config
@@ -53,6 +55,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     to boot. Either way the state is stated in the log, so "why was nothing saved"
     has an answer on the first line rather than after an investigation.
     """
+    # Watching from inside: a platform cannot see that a process stopped being
+    # able to answer, only that it stopped answering. This reports how long the
+    # Python threads were stalled, which is the difference between "the instance
+    # ran out of memory" and "the instance was restarted while it was working".
+    diagnostics.start_watchdog()
     db_config.load_local_env()
     # Before anything connects: the driver logs its own connection failures, and
     # those messages name the host.
@@ -76,6 +83,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("%s", settings.summary)
     yield
+    watchdog = diagnostics.watchdog()
+    if watchdog and watchdog.stalls:
+        logger.info("thread stalls over this process's life: %s", watchdog.summary())
+    diagnostics.stop_watchdog()
     if settings.enabled:
         from backend.db import pool as db_pool
 
@@ -123,18 +134,50 @@ if os.path.isdir(FRONTEND_DIR):
 
 
 @app.get("/health", include_in_schema=False)
-def health() -> Any:
+async def health() -> Any:
     """The same report as ``/api/health``, at the path a platform expects.
 
     Render, and most other hosts, want a health check at the root. Rather than
-    two implementations that can disagree, this is the same function.
+    two implementations that can disagree, this is the same function — awaited, and
+    async itself, because this is the path the platform actually polls and it must
+    be served from the event loop rather than the threadpool the analysis starves.
     """
-    return api_health()
+    return await api_health()
+
+
+#: Cache-busting token for the page's own assets, computed once at start from the
+#: bytes actually being served. A browser keeps /static/app.js across a deploy
+#: otherwise, so a fixed bug keeps being reported from a cached copy — which is
+#: exactly what happened with the fetch error handler.
+def _asset_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("app.js", "styles.css"):
+        path = os.path.join(FRONTEND_DIR, name)
+        try:
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        except OSError:
+            digest.update(name.encode())
+    return digest.hexdigest()[:12]
+
+
+_ASSET_VERSION = _asset_version()
 
 
 @app.get("/", include_in_schema=False)
 def viewer() -> Any:
-    """Serve the analysis application."""
+    """Serve the analysis application, with its assets versioned.
+
+    The version is a hash of the assets themselves, so it changes exactly when
+    they do: a deploy invalidates the browser's copy, and an unchanged deploy does
+    not.
+    """
+    if os.path.exists(APP_HTML):
+        with open(APP_HTML, encoding="utf-8") as handle:
+            page = handle.read()
+        page = page.replace('"/static/app.js"', f'"/static/app.js?v={_ASSET_VERSION}"')
+        page = page.replace('"/static/styles.css"', f'"/static/styles.css?v={_ASSET_VERSION}"')
+        return Response(content=page, media_type="text/html")
     if not os.path.exists(APP_HTML):
         # No path in the message: this is served to a browser, and where the
         # file was expected is a fact about the host (§35). The log line below

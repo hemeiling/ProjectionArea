@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Sequence, Set
 
 from shapely.geometry.base import BaseGeometry
 
+from backend import diagnostics
 from backend.config import ENGINE_VERSION, SILHOUETTE, Tolerances
 from backend.confidence.model import evaluate as evaluate_confidence
 from backend.geometry.contours import polygonize_network
@@ -443,9 +444,16 @@ def _reconstruct_vector(contributing, tolerances, roles, close_gaps, ink_bbox, r
 
     for step, multiplier in enumerate(_CLOSURE_ESCALATION):
         widened = replace(tolerances, closure=tolerances.closure * multiplier)
-        network = build_network(
-            contributing, widened, roles=roles, close_gaps=close_gaps, role_of=role_of
-        )
+        # Snapping, de-duplication and gap bridging over every contributing
+        # primitive. Marked per closure step, because a drawing that needs the
+        # escalation runs this more than once and each pass costs the same again.
+        with diagnostics.stage("segments", step=step,
+                               primitives=len(contributing)) as facts:
+            network = build_network(
+                contributing, widened, roles=roles, close_gaps=close_gaps, role_of=role_of
+            )
+            facts["segments"] = len(network.segments)
+            facts["repairs"] = len(network.repairs)
         last_network = network
         exact = polygonize_network(network, widened.min_polygon_area)
         if step == 0:
