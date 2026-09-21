@@ -25,6 +25,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.demo.drawings import build_all  # noqa: E402
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_production_database_for_the_session():
+    """The same guard, for the whole session.
+
+    The per-test fixture below cannot cover a server started by a module-scoped
+    fixture: that server's lifespan runs outside any test's patches, reads ``.env``
+    and puts the production ``DATABASE_URL`` back into the process environment —
+    where every later test would find it. On a machine whose ``DATABASE_URL`` is
+    reachable, the browser tests would then write into live data.
+
+    Session-scoped and autouse, so there is no ordering to get right.
+    """
+    from backend.db import config as db_config
+
+    patch = pytest.MonkeyPatch()
+    patch.delenv(db_config.URL_ENV, raising=False)
+    patch.setattr(db_config, "load_local_env", lambda: None)
+    yield
+    patch.undo()
+
+
 @pytest.fixture(autouse=True)
 def _no_production_database(monkeypatch) -> None:
     """Make every test run as though no database were configured.

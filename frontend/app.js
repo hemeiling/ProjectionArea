@@ -91,7 +91,7 @@ const S = {
   scaleSpec: { mode: "auto" },
   fpType: null,
   zoom: 1, fitZoom: 1,
-  picking: false, picks: [],
+  picking: false, picks: [], calDraft: null,
   layers: {
     source: true, counted: true, excluded: true, dimensions: true, holes: true,
     footprint: true, boundary: false, internal: false, envelope: false,
@@ -692,10 +692,26 @@ function paintOverlay() {
     }
   }
 
+  /* Calibration endpoints, labelled A and B to match the panel. The letters are
+   * what makes the panel's "First point: selected" checkable against the drawing:
+   * an engineer can see *which* two points the scale will be derived from, which
+   * is the difference between trusting the number and hoping. */
+  if (S.picks.length === 2) {
+    const [qa, qb] = [px(S.picks[0]), px(S.picks[1])];
+    out.push(`<line x1="${qa[0]}" y1="${qa[1]}" x2="${qb[0]}" y2="${qb[1]}"
+      stroke="#9A3412" stroke-width="1.8" stroke-dasharray="6 4"/>`);
+    const mx = (qa[0] + qb[0]) / 2, my = (qa[1] + qb[1]) / 2;
+    const span = Math.hypot(S.picks[1][0] - S.picks[0][0], S.picks[1][1] - S.picks[0][1]);
+    out.push(`<text x="${mx}" y="${my - 8}" font-size="11" fill="#9A3412"
+      font-weight="600" text-anchor="middle"
+      paint-order="stroke" stroke="#fff" stroke-width="3">${num(span, 1)}</text>`);
+  }
   for (const [i, p] of S.picks.entries()) {
     const q = px(p);
-    out.push(`<circle cx="${q[0]}" cy="${q[1]}" r="4.5" fill="#9A3412" stroke="#fff" stroke-width="1.5"/>`);
-    out.push(`<text x="${q[0] + 8}" y="${q[1] - 6}" font-size="11" fill="#9A3412" font-weight="600">${i + 1}</text>`);
+    const letter = String.fromCharCode(65 + i);   // A, B
+    out.push(`<circle cx="${q[0]}" cy="${q[1]}" r="6" fill="#9A3412" stroke="#fff" stroke-width="2"/>`);
+    out.push(`<text x="${q[0]}" y="${q[1] + 3.5}" font-size="9" fill="#fff"
+      font-weight="700" text-anchor="middle">${letter}</text>`);
   }
   svg.innerHTML = out.join("");
 }
@@ -939,46 +955,159 @@ function renderCalibration() {
     return;
   }
 
-  const step = S.picking ? (S.picks.length < 2 ? S.picks.length + 1 : 3) : 0;
   host.innerHTML = `<div class="calib">
     <div class="badges"><span class="badge warn">${esc(t("scale.requiresConfirmation"))}</span></div>
     <p style="margin:8px 0 0;font-size:11.5px;color:var(--ink-2)">
       ${esc(scale?.detail || t("cal.noScaleDetail"))}</p>
-    ${S.picking ? `
-      <ol class="steps">
-        <li class="${step === 1 ? "active" : ""}">${esc(t("cal.step1"))}</li>
-        <li class="${step === 2 ? "active" : ""}">${esc(t("cal.step2"))}</li>
-        <li class="${step === 3 ? "active" : ""}">${esc(t("cal.step3"))}</li>
-      </ol>
-      <p class="picked">${S.picks.map((p, i) =>
-        `P${i + 1} ${num(p[0], 2)}, ${num(p[1], 2)}`).join("   ") || esc(t("cal.noPicks"))}</p>
-      ${S.picks.length === 2 ? `<div class="result" id="calPreview"></div>` : ""}
-      <div class="fields">
-        <input type="number" id="knownLength" placeholder="${esc(t("cal.knownDistance"))}" step="any">
-        <select id="knownUnit">
-          <option value="mm">mm</option><option value="cm">cm</option>
-          <option value="m">m</option><option value="in">in</option><option value="ft">ft</option>
-        </select>
-      </div>
-      <button class="primary" id="applyCal" ${S.picks.length === 2 ? "" : "disabled"}
-        style="width:100%">${esc(t("cal.apply"))}</button>
-      <button class="ghost" id="cancelCal" style="width:100%;margin-top:5px">${
-        esc(t("cal.cancel"))}</button>
-    ` : `<button class="primary" id="startCal" style="width:100%;margin-top:9px">${
+    ${S.picking ? calibrationForm() : `
+      <button class="primary" id="startCal" style="width:100%;margin-top:9px">${
         esc(t("cta.calibrate"))}</button>`}
   </div>`;
 
   if (S.picking) {
-    $("applyCal").onclick = applyCalibration;
-    $("cancelCal").onclick = () => { S.picking = false; S.picks = [];
-      $("canvasWrap").classList.remove("picking"); $("pickHint").classList.add("hide");
-      renderCalibration(); paintOverlay(); };
-    $("knownLength").oninput = updateCalPreview;
-    $("knownUnit").onchange = updateCalPreview;
-    updateCalPreview();
+    bindCalibrationForm();
   } else {
     $("startCal").onclick = startCalibration;
   }
+}
+
+/* The calibration state, as four facts rather than a hint.
+ *
+ * Previously this showed three steps and one line of picked coordinates, and the
+ * Apply button was enabled on two points whatever the distance field held. Two
+ * points and no distance therefore looked ready and did nothing; a distance and no
+ * points showed a disabled button and no reason. Both are now stated: every step
+ * carries its own state, and when Apply is unavailable the panel says which thing
+ * is missing. */
+function calibrationState() {
+  const raw = parseFloat(($("knownLength") || {}).value);
+  const unit = ($("knownUnit") || {}).value || "mm";
+  const factor = { mm: 1, cm: 10, m: 1000, in: 25.4, ft: 304.8 }[unit] || 1;
+  const span = S.picks.length === 2
+    ? Math.hypot(S.picks[1][0] - S.picks[0][0], S.picks[1][1] - S.picks[0][1])
+    : null;
+  const distanceOk = Number.isFinite(raw) && raw > 0;
+  /* A zero-length span would divide by zero; two clicks in the same place is a
+   * misclick, not a dimension. */
+  const spanOk = span !== null && span > 1e-9;
+  return {
+    raw, unit, span, spanOk, distanceOk,
+    mmPerUnit: spanOk && distanceOk ? (raw * factor) / span : null,
+    ready: spanOk && distanceOk,
+    /* Exactly what is missing, in the order the operator should fix it. */
+    blocker: S.picks.length === 0 ? "cal.blockFirst"
+      : S.picks.length === 1 ? "cal.blockSecond"
+      : !spanOk ? "cal.blockSamePoint"
+      : !distanceOk ? "cal.blockDistance"
+      : null,
+  };
+}
+
+function calibrationForm() {
+  const st = calibrationState();
+  const done = (ok) => ok ? "done" : "";
+  /* The one step the operator should act on next. A step that is already complete
+   * is never also "active", or its tick disappears under the active styling. */
+  const activeStep = S.picks.length === 0 ? 0
+    : S.picks.length === 1 ? 1
+    : !st.distanceOk ? 2 : 3;
+  const active = (index, complete) => (index === activeStep && !complete) ? "active" : "";
+  const point = (index) => {
+    const picked = S.picks[index];
+    return picked
+      ? `<span class="ok">${esc(t("cal.selected"))}</span>
+         <span class="at mono">${num(picked[0], 1)}, ${num(picked[1], 1)}</span>`
+      : `<span class="missing">${esc(t("cal.notSelected"))}</span>`;
+  };
+  return `
+    <ol class="steps four">
+      <li class="${done(S.picks.length >= 1)} ${active(0, S.picks.length >= 1)}">
+        ${esc(t("cal.step1"))}</li>
+      <li class="${done(S.picks.length >= 2)} ${active(1, S.picks.length >= 2)}">
+        ${esc(t("cal.step2"))}</li>
+      <li class="${done(st.distanceOk)} ${active(2, st.distanceOk)}">
+        ${esc(t("cal.step3"))}</li>
+      <li class="${done(st.ready)} ${active(3, st.ready)}">${esc(t("cal.step4"))}</li>
+    </ol>
+
+    <div class="kv points">
+      <div class="r"><span class="k">${esc(t("cal.firstPoint"))}</span>
+        <span class="v">${point(0)}</span></div>
+      <div class="r"><span class="k">${esc(t("cal.secondPoint"))}</span>
+        <span class="v">${point(1)}</span></div>
+    </div>
+
+    <div class="fields">
+      <input type="number" id="knownLength" placeholder="${esc(t("cal.knownDistance"))}"
+        step="any" min="0" value="${S.calDraft?.value ?? ""}">
+      <select id="knownUnit">
+        ${["mm", "cm", "m", "in", "ft"].map((u) =>
+          `<option value="${u}"${(S.calDraft?.unit || "mm") === u ? " selected" : ""}>${u}</option>`
+        ).join("")}
+      </select>
+    </div>
+
+    <div class="kv figures" id="calFigures">${calibrationFigures(st)}</div>
+
+    <button class="primary" id="applyCal" ${st.ready ? "" : "disabled"}
+      style="width:100%">${esc(t("cal.apply"))}</button>
+    <p class="blocker" id="calBlocker">${st.blocker ? esc(t(st.blocker)) : ""}</p>
+    <button class="ghost" id="cancelCal" style="width:100%">${esc(t("cal.cancel"))}</button>`;
+}
+
+/* The three numbers that let an operator check the calibration before applying it:
+ * what the drawing measures, what they said it is, and what that makes the scale.
+ * Shown as soon as each is known, so the arithmetic is visible rather than implied. */
+function calibrationFigures(st) {
+  const rows = [];
+  if (st.span !== null) {
+    rows.push(`<div class="r"><span class="k">${esc(t("cal.spanLabel"))}</span>
+      <span class="v mono">${num(st.span, 2)} ${esc(t("cal.units"))}</span></div>`);
+  }
+  if (st.distanceOk) {
+    rows.push(`<div class="r"><span class="k">${esc(t("cal.knownLabel"))}</span>
+      <span class="v mono">${num(st.raw, 2)} ${esc(st.unit)}</span></div>`);
+  }
+  if (st.mmPerUnit !== null) {
+    rows.push(`<div class="r"><span class="k">${esc(t("cal.scaleLabel"))}</span>
+      <span class="v mono strong">${num(st.mmPerUnit, 4)} mm/${esc(t("cal.unit"))}</span></div>`);
+  }
+  return rows.join("");
+}
+
+function bindCalibrationForm() {
+  const refresh = () => {
+    /* The typed value survives a re-render: the panel redraws on every keystroke
+     * and on every click, and losing the distance each time would be its own bug. */
+    S.calDraft = { value: $("knownLength").value, unit: $("knownUnit").value };
+    const st = calibrationState();
+    $("calFigures").innerHTML = calibrationFigures(st);
+    $("applyCal").disabled = !st.ready;
+    $("calBlocker").textContent = st.blocker ? t(st.blocker) : "";
+    /* Both classes, every time. Toggling only `done` left the previously active
+     * step still marked active, and the two styles collide — an accent tick on an
+     * accent background is an invisible tick. */
+    const complete = [
+      S.picks.length >= 1, S.picks.length >= 2, st.distanceOk, st.ready,
+    ];
+    const activeStep = S.picks.length === 0 ? 0
+      : S.picks.length === 1 ? 1
+      : !st.distanceOk ? 2 : 3;
+    for (const [index, li] of [...document.querySelectorAll(".steps.four li")].entries()) {
+      li.classList.toggle("done", complete[index]);
+      li.classList.toggle("active", index === activeStep && !complete[index]);
+    }
+  };
+  $("applyCal").onclick = applyCalibration;
+  $("cancelCal").onclick = () => {
+    S.picking = false; S.picks = []; S.calDraft = null;
+    $("canvasWrap").classList.remove("picking");
+    $("pickHint").classList.add("hide");
+    renderCalibration(); paintOverlay();
+  };
+  $("knownLength").oninput = refresh;
+  $("knownUnit").onchange = refresh;
+  refresh();
 }
 
 function startCalibration() {
@@ -990,25 +1119,22 @@ function startCalibration() {
 
 /* Shown before applying so the operator can sanity-check the implied scale.
  * The authoritative value still comes back from the backend. */
-function updateCalPreview() {
-  const box = $("calPreview"); if (!box || S.picks.length !== 2) return;
-  const [a, b] = S.picks;
-  const span = Math.hypot(b[0] - a[0], b[1] - a[1]);
-  const raw = parseFloat($("knownLength").value);
-  const factor = { mm: 1, cm: 10, m: 1000, in: 25.4, ft: 304.8 }[$("knownUnit").value] || 1;
-  box.innerHTML = esc(t("cal.span", { span: num(span, 2) })) +
-    (raw > 0 ? `<br>${esc(t("cal.computed", { mm: num((raw * factor) / span, 4) }))}` : "");
-}
-
 async function applyCalibration() {
-  const raw = parseFloat($("knownLength").value);
-  if (!(raw > 0)) { $("knownLength").focus(); return; }
+  /* The same state the button's enabled-ness came from, so the two cannot
+   * disagree: previously the button could be enabled with no distance entered and
+   * clicking it silently focused the field instead. */
+  const st = calibrationState();
+  if (!st.ready) {
+    if (!st.distanceOk) $("knownLength").focus();
+    return;
+  }
   S.scaleSpec = {
     mode: "two_point",
     points: [S.picks[0], S.picks[1]],
-    known_length: raw,
-    known_unit: $("knownUnit").value,
+    known_length: st.raw,
+    known_unit: st.unit,
   };
+  S.calDraft = null;
   S.picking = false;
   $("canvasWrap").classList.remove("picking");
   $("pickHint").classList.add("hide");

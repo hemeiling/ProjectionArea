@@ -80,6 +80,10 @@ def health() -> Dict[str, Any]:
         # a health endpoint is public, and a connection string is a credential.
         "database": db_config.is_enabled(),
         "persistence": _persistence_ready(),
+        # Whether the link to the database is encrypted. A boolean, because the
+        # question "is my password crossing the internet in clear text" deserves an
+        # answer that does not require quoting the host it travels to.
+        "database_tls": db_config.settings().tls,
     }
 
 

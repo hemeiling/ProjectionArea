@@ -434,3 +434,41 @@ table.grid td .sw { display: inline-block; width: 9px; height: 9px; border-radiu
 /* The cached-analysis offer: two explicit choices, never a silent substitution. */
 .cache-offer { display: flex; flex-direction: column; gap: 8px; }
 .cache-offer .row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ── calibration: four steps, each with its own state ─────────────────────── */
+
+.calib .steps.four { counter-reset: calstep; }
+.calib .steps.four li {
+  position: relative; padding-left: 22px; margin: 3px 0; list-style: none;
+  font-size: 11.5px; color: var(--ink-3);
+}
+.calib .steps.four li::before {
+  counter-increment: calstep; content: counter(calstep);
+  position: absolute; left: 0; top: 0;
+  width: 15px; height: 15px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--surface);
+  font-size: 9.5px; line-height: 13px; text-align: center; font-weight: 700;
+}
+/* Done is stated, not implied by position: a step the operator has completed
+ * reads as complete even when they have scrolled past it. */
+.calib .steps.four li.done { color: var(--ink-2); }
+.calib .steps.four li.done::before {
+  content: "\2713"; border-color: var(--accent);
+  background: var(--accent); color: #fff;
+}
+.calib .steps.four li.active { color: var(--ink); font-weight: 600; }
+.calib .steps.four li.active::before { border-color: var(--accent); color: var(--accent); }
+
+.calib .kv.points, .calib .kv.figures { margin: 8px 0 0; }
+.calib .kv.points .ok { color: var(--accent); font-weight: 600; }
+.calib .kv.points .missing { color: var(--ink-3); }
+.calib .kv.points .at { margin-left: 6px; font-size: 10.5px; color: var(--ink-3); }
+.calib .kv.figures .strong { font-weight: 700; }
+.calib .kv.figures:empty { display: none; }
+
+/* Why the button is unavailable, which is the thing the old panel never said. */
+.calib .blocker {
+  margin: 6px 0 8px; font-size: 11.5px; color: var(--amber-ink, var(--ink-2));
+  min-height: 1em;
+}
+.calib .blocker:empty { margin: 0 0 8px; min-height: 0; }

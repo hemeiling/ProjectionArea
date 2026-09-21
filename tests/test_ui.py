@@ -178,11 +178,13 @@ def test_scale_warning_then_operator_calibration(viewer_url, drawings):
         click_at((500.0, 300.0))
         assert page.evaluate("() => window.__state.picks.length") == 2
 
-        preview = page.inner_text("#calPreview")
+        # The figures block replaced the old single-line preview: same three
+        # numbers, each labelled, so the arithmetic can be checked before applying.
+        preview = page.inner_text("#calFigures")
         page.fill("#knownLength", "600")
         page.select_option("#knownUnit", "mm")
         page.wait_for_timeout(300)
-        preview_with_length = page.inner_text("#calPreview")
+        preview_with_length = page.inner_text("#calFigures")
 
         page.click("#applyCal")
         page.wait_for_timeout(6000)
@@ -436,7 +438,8 @@ def test_calibrate_is_offered_beside_the_result(viewer_url, drawings):
     assert "Calibrate Scale" in cta
     assert "calibrated against a known distance" in cta
     assert picking, "the CTA must start point picking, not just scroll somewhere"
-    assert "Click the first point" in steps
+    assert "Click the first endpoint" in steps, (
+        "the step list names the endpoint the operator is to click")
 
 
 def test_a_calibrated_drawing_reports_its_confidence(viewer_url, drawings):
@@ -1002,3 +1005,231 @@ def test_every_saved_analysis_string_exists_in_both_languages():
         assert zh.get(key), f"{key} missing in Chinese"
         assert zh[key] != en[key], f"{key} is untranslated"
         assert any("一" <= c <= "鿿" for c in zh[key]), f"{key} has no Chinese"
+
+
+# ── manual calibration ───────────────────────────────────────────────────────
+
+
+def _open_calibration(page, url, drawing):
+    """Upload a drawing with no derivable scale and open the calibration panel."""
+    _upload(page, url, drawing)
+    page.wait_for_selector("#startCal", timeout=60000)
+    page.click("#startCal")
+    page.wait_for_selector(".steps.four", timeout=30000)
+
+
+def _pick(page, x, y):
+    """Click a point on the drawing canvas, in canvas coordinates."""
+    box = page.locator("#canvasWrap").bounding_box()
+    page.mouse.click(box["x"] + x, box["y"] + y)
+    page.wait_for_timeout(250)
+
+
+def test_calibration_shows_four_steps_with_their_own_state(viewer_url, drawings):
+    """The panel previously showed three steps and one line of coordinates, so
+    "distance entered but nothing happens" had no explanation on screen."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+
+        steps = page.eval_on_selector_all(
+            ".steps.four li", "els => els.map(e => e.textContent.trim())")
+        points = page.inner_text(".kv.points")
+        browser.close()
+
+    assert len(steps) == 4, steps
+    assert "first endpoint" in steps[0].lower()
+    assert "second endpoint" in steps[1].lower()
+    assert "known distance" in steps[2].lower()
+    assert "apply" in steps[3].lower()
+    # Each point's state is stated separately, not as one "no points yet" line.
+    assert "First point" in points and "Second point" in points
+    assert points.count("not selected") == 2
+
+
+def test_entering_a_distance_before_picking_says_what_is_missing(viewer_url, drawings):
+    """The reported confusion, exactly: the field accepts a value while Apply stays
+    disabled. The panel must now say why."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+
+        page.fill("#knownLength", "22000")
+        page.wait_for_timeout(300)
+        state = page.evaluate("""() => ({
+            disabled: document.getElementById('applyCal').disabled,
+            blocker: document.getElementById('calBlocker').textContent.trim(),
+            figures: document.getElementById('calFigures').textContent.trim(),
+        })""")
+        browser.close()
+
+    assert state["disabled"], "no points are picked, so it cannot be applied"
+    assert state["blocker"], "the panel must say why it is unavailable"
+    assert "first endpoint" in state["blocker"].lower()
+    # The distance the operator typed is acknowledged rather than ignored.
+    assert "22,000" in state["figures"] or "22000" in state["figures"]
+
+
+def test_apply_stays_disabled_with_two_points_and_no_distance(viewer_url, drawings):
+    """The other half of the old bug: two points enabled the button, and clicking
+    it silently focused the empty field."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        _pick(page, 200, 200)
+        _pick(page, 400, 200)
+
+        state = page.evaluate("""() => ({
+            disabled: document.getElementById('applyCal').disabled,
+            blocker: document.getElementById('calBlocker').textContent.trim(),
+            points: document.querySelector('.kv.points').textContent,
+            figures: document.getElementById('calFigures').textContent,
+            markers: [...document.querySelectorAll('#overlay text')]
+                .map(t => t.textContent).filter(t => t === 'A' || t === 'B'),
+        })""")
+        browser.close()
+
+    assert state["disabled"], "a scale cannot be derived without a known distance"
+    assert "known distance" in state["blocker"].lower() or "real distance" in state["blocker"].lower()
+    assert state["points"].count("selected ✓") == 2
+    assert state["points"].count("not selected") == 0
+    # The drawing span is shown as soon as it is known, before any distance.
+    assert "Drawing span" in state["figures"]
+    # And the two points are labelled A and B on the drawing itself.
+    assert state["markers"] == ["A", "B"], state["markers"]
+
+
+def test_the_arithmetic_is_shown_before_it_is_applied(viewer_url, drawings):
+    """Span, known distance and the resulting scale — so the operator can check
+    the calibration rather than trust it."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        _pick(page, 200, 220)
+        _pick(page, 500, 220)
+        page.fill("#knownLength", "150")
+        page.wait_for_timeout(300)
+
+        state = page.evaluate("""() => {
+            const rows = [...document.querySelectorAll('#calFigures .r')].map(r => ({
+                k: r.querySelector('.k').textContent.trim(),
+                v: r.querySelector('.v').textContent.trim(),
+            }));
+            return { rows, disabled: document.getElementById('applyCal').disabled,
+                     blocker: document.getElementById('calBlocker').textContent.trim() };
+        }""")
+        browser.close()
+
+    labels = [row["k"] for row in state["rows"]]
+    assert "Drawing span" in labels
+    assert "Known distance" in labels
+    assert "Calculated scale" in labels
+    assert not state["disabled"], "two points and a valid distance is ready"
+    assert state["blocker"] == "", "nothing is missing, so nothing is explained"
+
+    # The scale shown is the known distance over the measured span, in mm per unit.
+    span = _number(next(r["v"] for r in state["rows"] if r["k"] == "Drawing span"))
+    scale = _number(next(r["v"] for r in state["rows"] if r["k"] == "Calculated scale"))
+    assert scale == pytest.approx(150.0 / span, rel=0.01)
+
+
+def test_two_clicks_in_the_same_place_are_refused_with_a_reason(viewer_url, drawings):
+    """A zero span would divide by zero. That is a misclick, not a dimension."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        _pick(page, 300, 300)
+        _pick(page, 300, 300)
+        page.fill("#knownLength", "500")
+        page.wait_for_timeout(300)
+        state = page.evaluate("""() => ({
+            disabled: document.getElementById('applyCal').disabled,
+            blocker: document.getElementById('calBlocker').textContent.trim(),
+        })""")
+        browser.close()
+
+    assert state["disabled"]
+    assert "same place" in state["blocker"].lower()
+
+
+def test_the_typed_distance_survives_picking_another_point(viewer_url, drawings):
+    """The panel redraws on every click; losing the distance each time would be
+    its own bug."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        page.fill("#knownLength", "22000")
+        _pick(page, 220, 240)
+        _pick(page, 520, 240)
+        kept = page.input_value("#knownLength")
+        browser.close()
+    assert kept == "22000", "the operator's number was discarded by a re-render"
+
+
+def test_a_completed_calibration_produces_an_operator_supplied_scale(
+    viewer_url, drawings
+):
+    """End to end: the measurement becomes physical, and is labelled as coming
+    from the operator rather than from the drawing."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        _pick(page, 210, 230)
+        _pick(page, 510, 230)
+        page.fill("#knownLength", "300")
+        page.wait_for_timeout(250)
+        page.click("#applyCal")
+        page.wait_for_timeout(2500)
+
+        state = page.evaluate("""() => ({
+            value: document.getElementById('rdValue').textContent.trim(),
+            badges: document.getElementById('rdBadges').textContent,
+            scale: (window.__state.result || {}).scale || {},
+        })""")
+        browser.close()
+
+    assert state["scale"]["operator_supplied"] is True
+    assert state["scale"]["verified"] is True
+    assert state["scale"]["calibration"], "the two points and the distance are recorded"
+    assert state["scale"]["calibration"]["known_length"] == 300
+    assert "Not available" not in state["value"], "an area is now reportable"
+
+
+def test_calibration_never_prefills_a_distance_from_the_drawing(viewer_url, drawings):
+    """A stroked-text PDF carries no readable dimension, and guessing one would be
+    fabricating the scale (§3). The field starts empty and stays the operator's."""
+    with playwright_api.sync_playwright() as pw:
+        browser = _launch(pw)
+        page = browser.new_page(viewport={"width": 1500, "height": 950})
+        _open_calibration(page, viewer_url, drawings["raster_plate"]["path"])
+        empty_before = page.input_value("#knownLength")
+        _pick(page, 240, 260)
+        _pick(page, 540, 260)
+        empty_after = page.input_value("#knownLength")
+        browser.close()
+    assert empty_before == "", "a distance was pre-filled"
+    assert empty_after == "", "picking points must not suggest a distance"
+
+
+def test_every_calibration_string_exists_in_both_languages():
+    import json as _json
+    import os as _os
+
+    root = _os.path.join(_os.path.dirname(__file__), "..", "frontend", "i18n")
+    en = _json.load(open(_os.path.join(root, "en.json"), encoding="utf-8"))
+    zh = _json.load(open(_os.path.join(root, "zh-CN.json"), encoding="utf-8"))
+    for key in ("cal.step1", "cal.step2", "cal.step3", "cal.step4",
+                "cal.firstPoint", "cal.secondPoint", "cal.selected", "cal.notSelected",
+                "cal.spanLabel", "cal.knownLabel", "cal.scaleLabel",
+                "cal.blockFirst", "cal.blockSecond", "cal.blockSamePoint",
+                "cal.blockDistance"):
+        assert en.get(key), f"{key} missing in English"
+        assert zh.get(key), f"{key} missing in Chinese"
+        assert any("一" <= c <= "鿿" for c in zh[key]), f"{key} not translated"

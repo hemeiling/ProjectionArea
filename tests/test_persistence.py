@@ -693,3 +693,58 @@ def test_a_recalculation_names_its_analysis_without_changing_the_result(
         plain.pop(volatile, None)
         named.pop(volatile, None)
     assert named == plain, "naming an analysis must not alter the measurement"
+
+
+# ── transport security ───────────────────────────────────────────────────────
+
+
+def test_an_external_connection_requires_tls_even_if_the_url_omits_it():
+    """An internal URL stays inside the platform's network. An external one crosses
+    the public internet carrying a password, and libpq will send it in clear text if
+    the server permits — so sslmode is not left to whoever pasted the URL."""
+    external = "postgresql://u:p@dpg-abc-a.oregon-postgres.render.com:5432/pa"
+    hardened = db_config.ensure_tls(external)
+    assert hardened.endswith("?sslmode=require")
+    assert hardened.startswith(external)
+
+
+def test_an_existing_query_string_is_preserved():
+    url = "postgresql://u:p@host.example.com/pa?application_name=projected-area"
+    hardened = db_config.ensure_tls(url)
+    assert "application_name=projected-area" in hardened
+    assert "sslmode=require" in hardened
+    assert hardened.count("?") == 1
+
+
+@pytest.mark.parametrize("mode", ["verify-full", "verify-ca", "require", "prefer"])
+def test_an_explicit_sslmode_is_respected_not_overridden(mode):
+    """verify-full is stronger than the default; silently rewriting it would be
+    downgrading someone's deliberate choice."""
+    url = f"postgresql://u:p@host.example.com/pa?sslmode={mode}"
+    assert db_config.ensure_tls(url) == url
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])
+def test_a_local_database_is_not_forced_through_tls(host):
+    """Its traffic never leaves the machine, and demanding TLS would only break
+    development against a plain local server."""
+    url = f"postgresql://u:p@{host}:5432/pa"
+    assert db_config.ensure_tls(url) == url
+
+
+def test_the_url_the_pool_receives_has_tls_applied(monkeypatch):
+    """Not just the helper: what the application actually connects with."""
+    monkeypatch.setenv(
+        db_config.URL_ENV, "postgresql://u:p@dpg-x-a.oregon-postgres.render.com/pa")
+    assert "sslmode=require" in (db_config.database_url() or "")
+    assert db_config.settings().tls is True
+
+
+def test_health_reports_whether_the_link_is_encrypted_without_naming_the_host(
+    client, monkeypatch
+):
+    body = client.get("/health").json()
+    assert body["database_tls"] is False, "nothing configured, so nothing encrypted"
+    rendered = json.dumps(body).lower()
+    for forbidden in ("oregon", "ohio", "render.com", "sslmode", "dpg-"):
+        assert forbidden not in rendered, f"{forbidden} leaked into /health"

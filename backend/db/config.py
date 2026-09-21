@@ -98,14 +98,56 @@ def schema_name(default: str = DEFAULT_SCHEMA) -> str:
     return raw
 
 
+#: Hosts for which an unencrypted connection is reasonable, because the traffic
+#: never leaves the machine.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", ""})
+
+
+def _host_of(url: str) -> str:
+    match = re.match(r"^[a-z+]+://(?:[^@/]*@)?([^/:?]*)", url)
+    return (match.group(1) if match else "").lower()
+
+
+def ensure_tls(url: str) -> str:
+    """The connection string with transport encryption required.
+
+    An *internal* database URL stays inside the platform's network. An **external**
+    one crosses the public internet carrying a password, and libpq will happily send
+    it in clear text if the server allows it — so ``sslmode`` is not left to whoever
+    pasted the URL. Absent, it becomes ``require``.
+
+    A locally hosted database is exempt: its traffic never leaves the machine, and
+    demanding TLS there would only break development against a plain local server.
+
+    An explicit ``sslmode`` is respected rather than overridden — including
+    ``verify-full``, which is stronger than this default because it authenticates
+    the server as well as encrypting the link. It is not the default only because it
+    needs a CA bundle configured, and a connection that fails closed at startup is
+    a worse first experience than one that is encrypted but unauthenticated.
+    """
+    if not url:
+        return url
+    if "sslmode=" in url.lower():
+        return url
+    if _host_of(url) in _LOCAL_HOSTS:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}sslmode=require"
+
+
 def database_url() -> Optional[str]:
-    """The connection string, or ``None`` when persistence is not configured."""
-    return (os.environ.get(URL_ENV) or "").strip() or None
+    """The connection string, or ``None`` when persistence is not configured.
+
+    Returned with TLS required for any non-local host: see :func:`ensure_tls`.
+    """
+    raw = (os.environ.get(URL_ENV) or "").strip()
+    return ensure_tls(raw) if raw else None
 
 
 def test_database_url() -> Optional[str]:
     """The connection string for database tests, which is never ``DATABASE_URL``."""
-    return (os.environ.get(TEST_URL_ENV) or "").strip() or None
+    raw = (os.environ.get(TEST_URL_ENV) or "").strip()
+    return ensure_tls(raw) if raw else None
 
 
 def is_enabled() -> bool:
@@ -139,11 +181,17 @@ class Settings:
     redacted_url: str
     pool_max_size: int = POOL_MAX_SIZE
 
+    #: Whether the link is encrypted. Reported so an operator can see it without
+    #: seeing the URL.
+    tls: bool = False
+
     @property
     def summary(self) -> str:
         if not self.enabled:
             return "persistence disabled (no DATABASE_URL); analyses will not be saved"
-        return f"persistence enabled · schema {self.schema} · {self.redacted_url}"
+        transport = "TLS" if self.tls else "no TLS (local)"
+        return (f"persistence enabled · schema {self.schema} · {transport} · "
+                f"{self.redacted_url}")
 
 
 def settings() -> Settings:
@@ -153,4 +201,6 @@ def settings() -> Settings:
         enabled=url is not None,
         schema=schema_name(),
         redacted_url=redact(url),
+        tls=bool(url) and "sslmode=disable" not in (url or "").lower()
+        and _host_of(url or "") not in _LOCAL_HOSTS,
     )
